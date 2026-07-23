@@ -1,0 +1,94 @@
+# generated: 2026-07-23
+# last_updated: 2026-07-23
+# project: ai_practice_project
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: {project-root}/_bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+
+generated: 2026-07-23
+last_updated: 2026-07-23
+project: ai_practice_project
+project_key: NOKEY
+tracking_system: file-system
+story_location: {project-root}/_bmad-output/implementation-artifacts
+
+development_status:
+  # Epic 1: Foundation & Account Access
+  epic-1: done
+  1-1-project-scaffold-theme-foundation: done
+  1-2-register-with-email-password: done
+  1-3-log-in-session: done
+  1-4-fail-closed-per-user-data-isolation: done
+  epic-1-retrospective: optional
+
+  # Epic 2: Connect Schwab & See Your Portfolio
+  epic-2: backlog
+  2-1-broker-port-schwab-oauth-link: backlog
+  2-2-session-status-graceful-re-auth-degraded-mode: backlog
+  2-3-import-cache-portfolio-single-writer-projection: backlog
+  2-4-plain-english-portfolio-dashboard: backlog
+  2-5-index-core-mapping: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: See the Record (Precedent Engine + Calming Views)
+  epic-3: backlog
+  3-1-market-data-ingestion-market-daily: backlog
+  3-2-drawdown-matching-evidence-record-contract: backlog
+  3-3-recovery-precedent-view: backlog
+  3-4-missed-growth-meter: backlog
+  3-5-headline-contextualizer: backlog
+  epic-3-retrospective: optional
+
+  # Epic 4: The Coach — Propose, Approve, Execute, Co-sign & Replay
+  epic-4: backlog
+  4-1-llm-gateway: backlog
+  4-2-recommendation-object-validation-gate: backlog
+  4-3-coach-pipeline-default-plan-fallback: backlog
+  4-4-just-in-time-teaching: backlog
+  4-5-self-destructive-move-warnings: backlog
+  4-6-propose-and-approve-execution: backlog
+  4-7-order-outcomes-reconciliation: backlog
+  4-8-approval-placement-integrity: backlog
+  4-9-co-signed-immutable-decision-record: backlog
+  4-10-decisions-history-replay: backlog
+  epic-4-retrospective: optional
+
+  # Epic 5: Weekly Digest
+  epic-5: backlog
+  5-1-opt-in-calm-weekly-email-digest: backlog
+  epic-5-retrospective: optional

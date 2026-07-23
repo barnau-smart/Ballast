@@ -1,0 +1,41 @@
+.ballast-wordmark {
+  font-family: var(--ballast-font-display);
+  font-size: var(--ballast-text-hero);
+  color: var(--ballast-color-brand-red);
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+  animation-name: ballast-flicker;
+  animation-duration: 4s;
+  animation-timing-function: steps(1, end);
+  animation-iteration-count: infinite;
+}
+
+/* Static variant used when reduced motion is requested (hook-driven). */
+.ballast-wordmark--static {
+  animation: none;
+}
+
+@keyframes ballast-flicker {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  47% {
+    opacity: 1;
+  }
+  48% {
+    opacity: 0.72;
+  }
+  49% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  93% {
+    opacity: 0.82;
+  }
+  94% {
+    opacity: 1;
+  }
+}

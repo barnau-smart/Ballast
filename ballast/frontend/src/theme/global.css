@@ -1,0 +1,40 @@
+/* Global base styles — tokens only, no raw values. */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--ballast-color-bg);
+  color: var(--ballast-color-text);
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+}
+
+a {
+  color: var(--ballast-color-accent-pink);
+}
+
+:focus-visible {
+  outline-style: solid;
+  outline-width: var(--ballast-space-4);
+  outline-color: var(--ballast-color-accent-pink);
+  outline-offset: var(--ballast-space-4);
+}
+
+/*
+ * Reduced-motion: disable the wordmark flicker AND the cursor blink.
+ * These render static under prefers-reduced-motion: reduce.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .ballast-wordmark,
+  .ballast-cursor {
+    animation: none;
+  }
+}

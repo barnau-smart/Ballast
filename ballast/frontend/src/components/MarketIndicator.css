@@ -1,0 +1,19 @@
+.ballast-market-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ballast-space-4);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+}
+
+.ballast-market-indicator--up {
+  color: var(--ballast-color-market-up);
+}
+
+.ballast-market-indicator--down {
+  color: var(--ballast-color-market-down);
+}
+
+.ballast-market-indicator__label {
+  color: var(--ballast-color-muted);
+}

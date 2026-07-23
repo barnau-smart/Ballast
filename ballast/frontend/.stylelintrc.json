@@ -1,0 +1,21 @@
+{
+  "rules": {
+    "color-no-hex": [
+      true,
+      { "message": "Raw hex colors are banned outside tokens.css — use var(--ballast-color-*)." }
+    ],
+    "declaration-property-value-disallowed-list": {
+      "/^font(-size)?$/": ["/\\d+px/"],
+      "/^font-size$/": ["/\\d/"]
+    }
+  },
+  "overrides": [
+    {
+      "files": ["src/theme/tokens.css"],
+      "rules": {
+        "color-no-hex": null,
+        "declaration-property-value-disallowed-list": null
+      }
+    }
+  ]
+}

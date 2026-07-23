@@ -1,0 +1,26 @@
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+
+# --- Vendored BMad / Claude Code tooling (framework machinery, not the project) ---
+# The project itself is ballast/ + docker-compose.yml + _bmad-output/ (planning
+# & story artifacts). The installed skill/agent framework below is regenerable
+# tooling and is kept out of the project history to stay reviewable.
+.agents/
+.bmad-loop/
+.claude/
+_bmad/
+
+# --- Ballast app artifacts ---
+# Python
+**/__pycache__/
+*.py[cod]
+**/.venv/
+.pytest_cache/
+# Node / Vite
+**/node_modules/
+**/dist/
+# Environment secrets (never commit real env files; .env.example is tracked)
+.env
+**/.env
+!**/.env.example

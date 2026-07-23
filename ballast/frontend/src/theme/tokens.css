@@ -1,0 +1,59 @@
+/*
+ * Ballast design tokens — the ONLY place raw values (hex, px font-sizes) may appear.
+ * Everything else in the app must reference var(--ballast-*).
+ * stylelint enforces this (see .stylelintrc.json).
+ */
+[data-theme="ballast-terminal"] {
+  /* ---- Colors ---- */
+  --ballast-color-bg: #05060a;
+  --ballast-color-bg-2: #080b10;
+  --ballast-color-surface: #0a0d12;
+  --ballast-color-surface-2: #0e121a;
+
+  --ballast-color-line: #1c2733;
+  --ballast-color-line-red: #4a1119;
+
+  --ballast-color-text: #e9edf2;
+  --ballast-color-muted: #7b8a90;
+
+  --ballast-color-phosphor: #5dff8a;
+  --ballast-color-phosphor-dim: #2f9f5c;
+
+  --ballast-color-brand-red: #ff2b3a;
+  --ballast-color-brand-red-deep: #c01522;
+
+  --ballast-color-accent-pink: #ff5cae;
+
+  --ballast-color-market-up: #5dff8a;
+  --ballast-color-market-down: #6ad0ff;
+
+  --ballast-color-uncertainty: #c77dff;
+
+  /* ---- Typography ---- */
+  --ballast-font-display: Benguiat, 'Bookman Old Style', Georgia, serif;
+  --ballast-font-terminal: 'VT323', 'Space Mono', ui-monospace, monospace;
+  --ballast-font-body: Inter, system-ui, sans-serif;
+
+  --ballast-text-xs: 11px;
+  --ballast-text-sm: 13px;
+  --ballast-text-base: 15px;
+  --ballast-text-lg: 19px;
+  --ballast-text-xl: 26px;
+  --ballast-text-hero: 42px;
+
+  --ballast-line-height-body: 1.6;
+
+  /* ---- Spacing (base unit 4px) ---- */
+  --ballast-space-4: 4px;
+  --ballast-space-8: 8px;
+  --ballast-space-12: 12px;
+  --ballast-space-16: 16px;
+  --ballast-space-20: 20px;
+  --ballast-space-24: 24px;
+  --ballast-space-32: 32px;
+  --ballast-space-44: 44px;
+
+  /* ---- Radii ---- */
+  --ballast-radius-base: 6px;
+  --ballast-radius-pill: 999px;
+}

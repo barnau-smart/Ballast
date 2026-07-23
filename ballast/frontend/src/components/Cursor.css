@@ -1,0 +1,27 @@
+.ballast-cursor {
+  display: inline-block;
+  width: var(--ballast-space-12);
+  height: var(--ballast-text-lg);
+  background-color: var(--ballast-color-phosphor);
+  font-family: var(--ballast-font-terminal);
+  vertical-align: text-bottom;
+  animation-name: ballast-blink;
+  animation-duration: 1.1s;
+  animation-timing-function: steps(2, start);
+  animation-iteration-count: infinite;
+}
+
+/* Static variant used when reduced motion is requested (hook-driven). */
+.ballast-cursor--static {
+  animation: none;
+}
+
+@keyframes ballast-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}

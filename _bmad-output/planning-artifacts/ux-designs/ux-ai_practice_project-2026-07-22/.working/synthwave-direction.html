@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ballast — Synthwave Direction (v1)</title>
+<style>
+  /* ---- THEME AS TOKENS (this is the whole theme; swap this block = swap the theme) ---- */
+  :root{
+    --bg:#0e0f1e;
+    --bg-2:#141631;
+    --surface:#191b38;
+    --surface-2:#1f2246;
+    --line:#2c2f5c;
+    --text:#e9e7f7;
+    --muted:#9b99c4;
+    --magenta:#ff6ac1;   /* primary accent (soft) */
+    --cyan:#67e8ff;      /* secondary accent (soft) */
+    --amber:#ffce7a;     /* warmth / co-sign */
+    --term:#7cffb0;      /* calm CRT green */
+    --down:#e58fb0;      /* muted, non-alarmist */
+    --radius:6px;
+    --glow-mag:0 0 12px rgba(255,106,193,.35);
+    --glow-cy:0 0 12px rgba(103,232,255,.30);
+    --font-display:"Orbitron","Space Mono",ui-monospace,monospace; /* retro display */
+    --font-mono:"Space Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --font-body:"Inter",system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:radial-gradient(1200px 600px at 50% -10%,#1a1c3d 0%,var(--bg) 60%);
+    color:var(--text);font-family:var(--font-body);line-height:1.55;
+    padding:40px 20px 80px;
+  }
+  /* subtle CRT scanlines — very low opacity, calm */
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:99;
+    background:repeating-linear-gradient(to bottom,rgba(255,255,255,.025) 0 1px,transparent 1px 3px);}
+  .wrap{max-width:900px;margin:0 auto}
+  h1{font-family:var(--font-display);letter-spacing:3px;font-weight:700;font-size:26px;
+     color:#fff;text-shadow:var(--glow-mag);margin:0 0 4px}
+  .sub{color:var(--muted);font-family:var(--font-mono);font-size:13px;letter-spacing:1px;margin-bottom:28px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px}
+  .label{font-family:var(--font-mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+  /* palette */
+  .swatches{display:flex;flex-wrap:wrap;gap:8px}
+  .sw{width:64px;height:44px;border-radius:4px;border:1px solid var(--line);display:flex;align-items:flex-end;justify-content:center;font-family:var(--font-mono);font-size:9px;color:#0e0f1e;padding-bottom:2px}
+  /* type specimen */
+  .spec-d{font-family:var(--font-display);font-size:22px;letter-spacing:2px;color:var(--cyan);text-shadow:var(--glow-cy)}
+  .spec-m{font-family:var(--font-mono);color:var(--term)}
+  .spec-b{font-family:var(--font-body);color:var(--text)}
+  /* coach card */
+  .coach{grid-column:1 / -1;background:linear-gradient(180deg,var(--surface-2),var(--surface));
+    border:1px solid var(--line);border-left:3px solid var(--magenta);border-radius:var(--radius);padding:22px;margin-top:20px}
+  .ask{color:var(--muted);font-style:italic;border-left:2px solid var(--line);padding-left:12px;margin-bottom:16px}
+  .rec{font-family:var(--font-display);font-size:18px;letter-spacing:1px;color:#fff;text-shadow:var(--glow-mag);margin-bottom:14px}
+  .row{margin:12px 0}
+  .k{font-family:var(--font-mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--cyan);display:block;margin-bottom:4px}
+  .precedent{background:#0e0f1e;border:1px solid var(--line);border-radius:4px;padding:12px;font-family:var(--font-mono);font-size:13px;color:var(--term)}
+  .uncertain{color:var(--amber)}
+  .cosign{margin-top:18px;padding-top:16px;border-top:1px dashed var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .cosign-note{font-family:var(--font-mono);font-size:12px;color:var(--amber)}
+  .btn{font-family:var(--font-mono);font-size:13px;letter-spacing:1px;padding:10px 16px;border-radius:4px;border:1px solid;cursor:pointer;background:transparent}
+  .btn-primary{color:#0e0f1e;background:var(--magenta);border-color:var(--magenta);box-shadow:var(--glow-mag)}
+  .btn-ghost{color:var(--muted);border-color:var(--line)}
+  .foot{margin-top:26px;color:var(--muted);font-family:var(--font-mono);font-size:11px;letter-spacing:1px;text-align:center}
+  .chip{display:inline-block;font-family:var(--font-mono);font-size:11px;color:var(--cyan);border:1px solid var(--line);border-radius:999px;padding:3px 10px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BALLAST</h1>
+  <div class="sub">v1 visual direction · synthwave / retro-terminal · tuned calm</div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="label">Palette (tokens)</div>
+      <div class="swatches">
+        <div class="sw" style="background:#0e0f1e;color:#e9e7f7">bg</div>
+        <div class="sw" style="background:#191b38;color:#e9e7f7">surface</div>
+        <div class="sw" style="background:#ff6ac1">magenta</div>
+        <div class="sw" style="background:#67e8ff">cyan</div>
+        <div class="sw" style="background:#ffce7a">amber</div>
+        <div class="sw" style="background:#7cffb0">term</div>
+        <div class="sw" style="background:#e58fb0">down</div>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin-top:12px">Muted neon on deep indigo — glow, not glare. Soft scanlines overlay the whole screen.</div>
+    </div>
+
+    <div class="panel">
+      <div class="label">Type</div>
+      <div class="spec-d">DISPLAY · Orbitron</div>
+      <div class="spec-m" style="margin-top:8px">mono · Space Mono — data & labels</div>
+      <div class="spec-b" style="margin-top:8px">Body · Inter — the coach speaks here, in plain, warm language that's easy to read for a long time.</div>
+    </div>
+  </div>
+
+  <!-- the emotional centerpiece -->
+  <div class="coach">
+    <div class="label">Coach card — the propose &amp; co-sign moment</div>
+    <div class="ask">"Should I invest my $500 paycheck? The market feels scary right now with everything going on…"</div>
+
+    <div class="rec">→ Invest your $500 into your index core today.</div>
+
+    <div class="row">
+      <span class="k">Why</span>
+      When nothing special is happening, the proven move is the steady one. Waiting for the coast to feel clear usually costs more than it saves — and today there's no signal worth breaking your plan for.
+    </div>
+
+    <div class="row">
+      <span class="k">What the record shows</span>
+      <div class="precedent">S&amp;P is ~7% below its recent peak.<br>Of the 12 times it fell about this much, this fast, since 1950:<br>→ back to even in a median of ~2 months<br>→ higher 12 months later in 11 of 12</div>
+    </div>
+
+    <div class="row">
+      <span class="k">What I can't know</span>
+      <span class="uncertain">Whether next week is up or down — nobody can. This isn't a prediction; it's the base rate.</span>
+    </div>
+
+    <div class="cosign">
+      <span class="cosign-note">✎ I'll put my name on this with you.</span>
+      <button class="btn btn-primary">APPROVE &amp; CO-SIGN</button>
+      <button class="btn btn-ghost">Not now</button>
+    </div>
+    <span class="chip">↺ if it dips, I'll replay this reasoning back to you</span>
+  </div>
+
+  <div class="foot">theme = one token set · swap the :root block and the whole app re-skins · scary-moment screens stay this calm</div>
+</div>
+</body>
+</html>
