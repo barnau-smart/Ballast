@@ -29,6 +29,30 @@ class Settings(BaseSettings):
     # non-local environment. Never commit a real value.
     USER_MANAGER_SECRET: str = "dev-only-insecure-user-manager-secret-change-me"
 
+    # --- Brokerage / Story 2.1 ------------------------------------------------
+
+    # Fernet key used to encrypt brokerage OAuth tokens at the application layer
+    # (AD-10 / NFR1). The key lives HERE in the environment, never in the DB.
+    # This dev default is a syntactically-valid Fernet key that is PUBLIC and
+    # therefore INSECURE — it exists only so the fake flow runs locally out of
+    # the box. A real, secret key MUST be supplied via env in any non-local
+    # environment (generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # ). NEVER commit a real key.
+    # (decodes to the ASCII marker "INSECURE-dev-key-do-not-use!!!\x00\x00").
+    TOKEN_ENCRYPTION_KEY: str = "SU5TRUNVUkUtZGV2LWtleS1kby1ub3QtdXNlISEhAAA="
+
+    # Which broker adapter the factory returns. "fake" for dev/test (no creds),
+    # "schwab" when the three SCHWAB_* values below are set.
+    BROKER_ADAPTER: str = "fake"
+
+    # Schwab developer app credentials. Empty by default — the SchwabAdapter is
+    # code-complete but gated: using it without these raises a clear
+    # "Schwab not configured" error (it never crashes at import).
+    SCHWAB_CLIENT_ID: str = ""
+    SCHWAB_CLIENT_SECRET: str = ""
+    SCHWAB_CALLBACK_URL: str = ""
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

@@ -1,0 +1,75 @@
+/*
+ * reauth-banner — calm, neutral, NEVER red (DESIGN.md hard color rule). Muted
+ * surface + line border + soft-white body copy; the action is a green-outline
+ * ghost button (the "not-alarming" affordance), not the red primary button.
+ * The ~weekly Schwab reconnect is normal, so nothing here reads as an error.
+ */
+.ballast-reauth {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ballast-space-16);
+  padding: var(--ballast-space-12) var(--ballast-space-24);
+  background-color: var(--ballast-color-surface-2);
+  border-bottom-style: solid;
+  border-bottom-width: var(--ballast-space-4);
+  border-bottom-color: var(--ballast-color-line);
+  animation: ballast-reauth-in 240ms ease-out;
+}
+
+/* Reduced-motion: skip the entrance animation (belt-and-suspenders alongside
+ * the media query below and the --static class the component adds). */
+.ballast-reauth--static {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ballast-reauth {
+    animation: none;
+  }
+}
+
+@keyframes ballast-reauth-in {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-1 * var(--ballast-space-8)));
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ballast-reauth__copy {
+  margin: 0;
+  max-width: 640px;
+  color: var(--ballast-color-muted);
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+}
+
+.ballast-reauth__action {
+  flex-shrink: 0;
+  background-color: transparent;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-16);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-phosphor);
+  cursor: pointer;
+}
+
+.ballast-reauth__action:hover {
+  border-color: var(--ballast-color-phosphor-dim);
+}
+
+.ballast-reauth__action:disabled {
+  color: var(--ballast-color-muted);
+  cursor: default;
+}

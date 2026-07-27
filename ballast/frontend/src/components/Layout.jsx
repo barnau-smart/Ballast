@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { Wordmark } from './Wordmark.jsx'
 import { Cursor } from './Cursor.jsx'
+import { ReauthBanner } from './ReauthBanner.jsx'
 import { useSession } from '../hooks/useSession.js'
 import { apiFetch, clearToken } from '../lib/session.js'
 import './Layout.css'
@@ -74,6 +75,9 @@ export function Layout() {
           )}
         </nav>
       </header>
+      {/* Degraded-mode invite: shown app-wide only when the brokerage session
+          has expired. Self-hides otherwise (and never blocks read/coach). */}
+      {signedIn && <ReauthBanner />}
       <main className="ballast-main">
         <Outlet />
       </main>

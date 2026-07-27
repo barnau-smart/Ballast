@@ -1,0 +1,155 @@
+/*
+ * PortfolioPanel — the plain-English portfolio (Story 2.4). Calm, legible.
+ * Body prose in soft white; data labels/values in green mono. NEVER red/pink
+ * for a holding (loss uses the sky-blue ▼ market-indicator). Tokens only.
+ */
+
+.ballast-portfolio__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ballast-space-24);
+  padding: var(--ballast-space-20);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+}
+
+.ballast-portfolio__stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+}
+
+.ballast-portfolio__stat-label {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+}
+
+.ballast-portfolio__stat-value {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xl);
+  color: var(--ballast-color-phosphor);
+}
+
+.ballast-portfolio__group {
+  margin-top: var(--ballast-space-24);
+}
+
+.ballast-portfolio__group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-portfolio__group-title {
+  margin: 0;
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-lg);
+  color: var(--ballast-color-text);
+}
+
+.ballast-portfolio__group-total {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-muted);
+}
+
+.ballast-portfolio__list {
+  list-style: none;
+  margin: var(--ballast-space-12) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-portfolio__holding {
+  padding: var(--ballast-space-16) var(--ballast-space-20);
+  background-color: var(--ballast-color-surface);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+}
+
+.ballast-portfolio__holding-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-portfolio__symbol {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-phosphor);
+  letter-spacing: var(--ballast-space-4);
+}
+
+.ballast-portfolio__value {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-text);
+}
+
+.ballast-portfolio__desc {
+  margin: var(--ballast-space-8) 0 0;
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+}
+
+.ballast-portfolio__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ballast-space-16);
+  margin-top: var(--ballast-space-8);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+}
+
+.ballast-portfolio__empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  align-items: flex-start;
+  padding: var(--ballast-space-24);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+}
+
+.ballast-portfolio__empty-title {
+  margin: 0;
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-lg);
+  color: var(--ballast-color-text);
+}
+
+.ballast-portfolio__cta {
+  padding: var(--ballast-space-8) var(--ballast-space-16);
+  background-color: transparent;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-phosphor-dim);
+  border-radius: var(--ballast-radius-base);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-phosphor);
+  text-decoration: none;
+}
+
+.ballast-portfolio__cta:hover {
+  border-color: var(--ballast-color-phosphor);
+}

@@ -1,30 +1,37 @@
 import { useEffect, useState } from 'react'
-import { MarketIndicator } from '../components/MarketIndicator.jsx'
+import { PortfolioPanel } from '../components/PortfolioPanel.jsx'
+import { apiFetch } from '../lib/session.js'
 import './screen.css'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
-
 /**
- * The calm home. On mount it fetches the backend health check and renders
- * the result — the concrete proof of SPA <-> backend connectivity.
- * Presentation-only: fetch + render, no business logic. Degrades gracefully
- * if the backend is unreachable.
+ * The calm home. Fetches the user's cached portfolio (Story 2.3
+ * `GET /api/portfolio`) and shows it in plain English (Story 2.4). In degraded
+ * mode the cached holdings still render — the reauth-banner (Story 2.2) owns the
+ * reconnect prompt. Presentation-only (AD-1): fetch + render, no business logic.
+ * Degrades to the calm empty/invite state if the backend is unreachable.
  */
 export function Dashboard() {
-  const [health, setHealth] = useState({ state: 'loading' })
+  const [status, setStatus] = useState('loading')
+  const [portfolio, setPortfolio] = useState(null)
 
   useEffect(() => {
     let active = true
-    fetch(`${API_BASE_URL}/api/health`)
+    apiFetch('/api/portfolio')
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         return res.json()
       })
       .then((data) => {
-        if (active) setHealth({ state: 'ok', data })
+        if (!active) return
+        setPortfolio(data)
+        setStatus('ready')
       })
       .catch(() => {
-        if (active) setHealth({ state: 'error' })
+        if (!active) return
+        // Fail quiet: fall back to the calm empty/invite state rather than an
+        // error screen (consistent with the app's degrade-gracefully posture).
+        setPortfolio({ holdings: [], cash: 0, as_of: null })
+        setStatus('ready')
       })
     return () => {
       active = false
@@ -36,26 +43,10 @@ export function Dashboard() {
       <p className="ballast-screen__eyebrow">dashboard</p>
       <h1 className="ballast-screen__title">Steady as she goes</h1>
       <p className="ballast-screen__prose">
-        Your calm home base. Nothing here needs your attention right now — and
-        that is a good thing.
+        Your calm home base — here’s everything you hold, in plain English.
       </p>
 
-      <div className="ballast-card" data-testid="health-card">
-        {health.state === 'loading' && <span>checking backend…</span>}
-        {health.state === 'ok' && (
-          <span className="ballast-status--ok">
-            backend: {health.data?.status ?? 'unknown'} · db:{' '}
-            {health.data?.db ?? 'unknown'}
-          </span>
-        )}
-        {health.state === 'error' && (
-          <span className="ballast-status--error">backend unreachable</span>
-        )}
-      </div>
-
-      <div className="ballast-card">
-        <MarketIndicator direction="up" label="portfolio (sample)" />
-      </div>
+      <PortfolioPanel status={status} portfolio={portfolio} />
     </section>
   )
 }

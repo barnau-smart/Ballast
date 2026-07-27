@@ -11,6 +11,8 @@ dependencies = [
     "fastapi-users[sqlalchemy]==15.*",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg",
+    "cryptography",
+    "schwab-py==1.5.1",
 ]
 
 [project.optional-dependencies]

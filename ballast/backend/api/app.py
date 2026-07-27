@@ -19,7 +19,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.brokerage import router as brokerage_router
 from api.config import get_settings
+from api.portfolio import router as portfolio_router
 from api.logging_config import configure_logging
 from api.schemas import UserCreate, UserRead
 from api.users import auth_backend, fastapi_users
@@ -149,6 +151,14 @@ def create_app() -> FastAPI:
         prefix="/api/auth/jwt",
         tags=["auth"],
     )
+
+    # Brokerage link flow (Story 2.1): authorize / callback / status. All
+    # authenticated + scoped; tokens stored encrypted via the scoped repo.
+    app.include_router(brokerage_router)
+
+    # Portfolio read + refresh (Story 2.3): the AD-14 single-writer projection.
+    # Read-only cache read + on-demand reconcile from the authoritative broker.
+    app.include_router(portfolio_router)
 
     # --- Routes --------------------------------------------------------------
 
