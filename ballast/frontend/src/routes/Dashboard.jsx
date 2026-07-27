@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { PortfolioPanel } from '../components/PortfolioPanel.jsx'
+import { MissedGrowthMeter } from '../components/MissedGrowthMeter.jsx'
 import { apiFetch } from '../lib/session.js'
 import './screen.css'
 
@@ -47,6 +48,7 @@ export function Dashboard() {
       </p>
 
       <PortfolioPanel status={status} portfolio={portfolio} />
+      <MissedGrowthMeter />
     </section>
   )
 }

@@ -70,7 +70,7 @@ development_status:
   3-1-market-data-ingestion-market-daily: done
   3-2-drawdown-matching-evidence-record-contract: done
   3-3-recovery-precedent-view: done
-  3-4-missed-growth-meter: backlog
+  3-4-missed-growth-meter: done
   3-5-headline-contextualizer: backlog
   epic-3-retrospective: optional
 

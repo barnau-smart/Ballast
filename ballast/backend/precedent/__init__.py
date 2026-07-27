@@ -11,5 +11,12 @@ these records by their deterministic ``id``.
 
 from precedent.engine import find_precedent
 from precedent.evidence import EvidenceKind, EvidenceRecord
+from precedent.missed_growth import MissedGrowthEstimate, estimate_missed_growth
 
-__all__ = ["find_precedent", "EvidenceRecord", "EvidenceKind"]
+__all__ = [
+    "find_precedent",
+    "EvidenceRecord",
+    "EvidenceKind",
+    "estimate_missed_growth",
+    "MissedGrowthEstimate",
+]

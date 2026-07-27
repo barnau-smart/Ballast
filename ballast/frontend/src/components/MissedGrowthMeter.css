@@ -1,0 +1,91 @@
+/*
+ * Missed-growth meter (Story 3.4). Calm, low-contrast information block — NEVER
+ * red/pink for a negative figure; direction color comes exclusively from the
+ * reused MarketIndicator (--ballast-color-market-up / --down). Nothing here opts
+ * a loss into a brand-red / accent-pink / line-red treatment.
+ */
+
+.ballast-missed-growth {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-missed-growth__note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-missed-growth__eyebrow {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-missed-growth__headline {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-lg);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-missed-growth__body {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-missed-growth__figure {
+  margin: 0;
+}
+
+.ballast-missed-growth__window {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-missed-growth__source {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+/* Motion only when the user has NOT requested reduced motion. The JS
+ * `useReducedMotion` hook gates the animated class; the CSS media guard mirrors
+ * the app-wide convention (see theme/global.css, RecoveryPrecedent.css) as
+ * defense-in-depth. */
+.ballast-missed-growth--animated {
+  animation: ballast-missed-growth-reveal 160ms ease-out;
+}
+
+@keyframes ballast-missed-growth-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ballast-missed-growth--animated {
+    animation: none;
+  }
+}
