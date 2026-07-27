@@ -19,7 +19,15 @@ import uuid
 from decimal import Decimal
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
-from sqlalchemy import DateTime, ForeignKey, Numeric, String
+from sqlalchemy import (
+    BigInteger,
+    Date,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -143,5 +151,64 @@ class PortfolioCache(OwnedEntityMixin, Base):
 
     # The broker's snapshot timestamp — the reconcile-wins key (AD-14).
     as_of: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class MarketDaily(Base):
+    """One end-of-day bar per (symbol, day) — GLOBAL market reference data
+    (table: ``market_daily``).
+
+    GLOBAL, NOT per-user (AD-10). Unlike ``brokerage_token`` / ``portfolio_cache``
+    (owned, per-user, reached only through the fail-closed ``ScopedRepository``),
+    ``market_daily`` is shared reference data with NO owner. It is therefore
+    deliberately NOT an :class:`OwnedEntityMixin` and has NO ``owner_id`` column,
+    and it is NOT routed through the :class:`ScopedRepository` — that repo exists
+    specifically to enforce per-user isolation on OWNED entities, and market data
+    has no owner to isolate. The ingestion job (``marketdata.ingest``) is the
+    "non-user SYSTEM context" AD-10 anticipates: it writes this table globally, by
+    construction, without any user scope. This is intentional and is NOT a scoping
+    bypass — do not add an ``owner_id`` or route it through the scoped repo.
+
+    Keyed by (``symbol``, ``day``) with a UNIQUE constraint so ingestion can UPSERT
+    and stay idempotent: repeated / overlapping runs converge to exactly one row
+    per symbol/day (AC2). Money columns are ``Numeric`` (Python ``Decimal``) —
+    NEVER binary float. ``volume`` is a ``BigInteger`` (share counts exceed 32-bit
+    for liquid names over decades). ``day`` is a calendar ``date``. These are
+    DERIVED analytics (OHLC + adjusted close needed for drawdown / forward-return
+    math), NOT a raw redistribution of the vendor feed (data-sourcing rule).
+    ``source`` records which adapter produced the row (e.g. "fake", "tiingo") and
+    ``ingested_at`` is a tz-aware UTC timestamp of when the row was written.
+    """
+
+    __tablename__ = "market_daily"
+    __table_args__ = (
+        UniqueConstraint("symbol", "day", name="uq_market_daily_symbol_day"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # The instrument symbol (e.g. "VTI") and the calendar day of the bar.
+    symbol: Mapped[str] = mapped_column(String(length=32), nullable=False, index=True)
+    day: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
+
+    # OHLC + adjusted close — Decimal, never float. Precision is generous for
+    # decades of price history across instruments.
+    open: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=8), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=8), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=8), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=8), nullable=False)
+    adj_close: Mapped[Decimal] = mapped_column(
+        Numeric(precision=20, scale=8), nullable=False
+    )
+
+    # Share volume — BigInteger (liquid names over decades exceed 32-bit).
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # Which adapter produced this row (e.g. "fake", "tiingo") — provenance.
+    source: Mapped[str] = mapped_column(String(length=32), nullable=False)
+
+    # When this row was ingested/last upserted (timezone-aware UTC).
+    ingested_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

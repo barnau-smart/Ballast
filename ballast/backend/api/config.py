@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     SCHWAB_CLIENT_SECRET: str = ""
     SCHWAB_CALLBACK_URL: str = ""
 
+    # --- Market data / Story 3.1 ---------------------------------------------
+
+    # Which market-data adapter the factory returns. "fake" for dev/test (no
+    # creds, no network, deterministic), "tiingo" when TIINGO_API_KEY is set.
+    MARKETDATA_ADAPTER: str = "fake"
+
+    # Tiingo API key. Empty by default — the TiingoAdapter is code-shaped but
+    # gated: using it without this raises a clear "Tiingo not configured" error
+    # (it never crashes at import, and the fake adapter needs no creds).
+    TIINGO_API_KEY: str = ""
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

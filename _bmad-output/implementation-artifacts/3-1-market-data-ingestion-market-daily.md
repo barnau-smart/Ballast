@@ -1,10 +1,12 @@
 ---
 baseline_commit: 2a1a25e35ca7dd0d208a672a828c00ad875c548e
+baseline_revision: 35f8d01299fd1bbe22f0c6d649057aa9b8990d5c
+status: in-progress
 ---
 
 # Story 3.1: Market-data ingestion → `market_daily`
 
-Status: ready-for-dev
+Status: in-progress
 
 ## Story
 
