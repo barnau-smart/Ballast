@@ -1,4 +1,5 @@
 import { RecoveryPrecedent } from '../components/RecoveryPrecedent.jsx'
+import { HeadlineContextualizer } from '../components/HeadlineContextualizer.jsx'
 import './screen.css'
 
 export function Coach() {
@@ -11,6 +12,7 @@ export function Coach() {
         jargon, no pressure.
       </p>
       <RecoveryPrecedent />
+      <HeadlineContextualizer />
     </section>
   )
 }

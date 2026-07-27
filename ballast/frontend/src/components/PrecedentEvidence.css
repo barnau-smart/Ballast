@@ -1,8 +1,15 @@
 /*
- * Recovery-precedent view (Story 3.3). Calm, low-contrast data-block — NEVER
- * red/pink for a drop; direction color comes exclusively from the reused
- * MarketIndicator (--ballast-color-market-up / --down). Nothing here opts a
- * loss into a brand-red / accent-pink / line-red treatment.
+ * Precedent evidence data-block (Story 3.5; shared styles extracted from Story
+ * 3.3's RecoveryPrecedent.css). This is the single stylesheet for the shared
+ * `PrecedentEvidence` renderer AND the `.ballast-precedent*` markup used by its
+ * consumers' loading/fallback states (RecoveryPrecedent, HeadlineContextualizer),
+ * so the shared renderer owns its own styling rather than depending on a
+ * sibling's CSS import order.
+ *
+ * Calm, low-contrast data-block — NEVER red/pink for a drop; direction color
+ * comes exclusively from the reused MarketIndicator (--ballast-color-market-up /
+ * --down). Nothing here opts a loss into a brand-red / accent-pink / line-red
+ * treatment.
  */
 
 .ballast-precedent {

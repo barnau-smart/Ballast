@@ -66,12 +66,12 @@ development_status:
   epic-2-retrospective: optional
 
   # Epic 3: See the Record (Precedent Engine + Calming Views)
-  epic-3: in-progress
+  epic-3: done
   3-1-market-data-ingestion-market-daily: done
   3-2-drawdown-matching-evidence-record-contract: done
   3-3-recovery-precedent-view: done
   3-4-missed-growth-meter: done
-  3-5-headline-contextualizer: backlog
+  3-5-headline-contextualizer: done
   epic-3-retrospective: optional
 
   # Epic 4: The Coach — Propose, Approve, Execute, Co-sign & Replay

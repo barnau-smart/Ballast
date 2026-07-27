@@ -20,7 +20,7 @@ is Epic 4. This is one endpoint over the existing engine.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_scope
@@ -66,6 +66,46 @@ async def recovery_precedent(
     per-user data, so ``scope`` is not used to filter the query.
     """
     records = await find_precedent(session, symbol=symbol)
+    return RecoveryPrecedentOut(**records[0].to_dict())
+
+
+class ContextualizeIn(BaseModel):
+    """Request body for the on-demand headline contextualizer (Story 3.5).
+
+    The ``headline`` is accepted and length-bounded but is deliberately INERT:
+    it is never read, parsed, classified, logged, or passed to the engine. It
+    exists only so the user story is honest ("a headline I submit") and to give
+    a clean seam for a future event-taxonomy enrichment. ``symbol`` mirrors the
+    ``/recovery`` bounded global-reference lookup so tests can seed a throwaway
+    symbol; the frontend omits ``symbol`` and relies on this server default.
+    """
+
+    headline: str = Field(min_length=1, max_length=500)
+    symbol: str = Field(default=DEFAULT_BENCHMARK, min_length=1, max_length=32)
+
+
+@router.post("/contextualize", response_model=RecoveryPrecedentOut)
+async def contextualize(
+    body: ContextualizeIn,
+    scope: Scope = Depends(get_scope),
+    session: AsyncSession = Depends(get_async_session),
+) -> RecoveryPrecedentOut:
+    """Return drawdown-keyed precedent for a headline the user submits (READ-ONLY).
+
+    Read-only and engine-only (AD-3): the response is obtained exclusively via
+    ``find_precedent`` — the API layer never reads ``market_daily`` or a vendor
+    source directly, computes no figure (AD-1), and returns the engine's
+    ``EvidenceRecord`` verbatim in the AD-12 6-field shape.
+
+    NEVER classifies the event (FR20): the submitted ``body.headline`` is inert
+    — it is not read, parsed, or passed to the engine, so the same market state
+    with any two different headlines yields a byte-identical record (identical
+    ``id`` included). v1 matching is drawdown-band only; event-taxonomy tagging
+    is a later enrichment. The ``scope`` dependency is the auth gate (401 for an
+    unauthenticated request); precedent is global reference data, so ``scope``
+    does not filter the query.
+    """
+    records = await find_precedent(session, symbol=body.symbol)
     return RecoveryPrecedentOut(**records[0].to_dict())
 
 
