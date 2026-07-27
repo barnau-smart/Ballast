@@ -1,0 +1,156 @@
+/*
+ * Recovery-precedent view (Story 3.3). Calm, low-contrast data-block — NEVER
+ * red/pink for a drop; direction color comes exclusively from the reused
+ * MarketIndicator (--ballast-color-market-up / --down). Nothing here opts a
+ * loss into a brand-red / accent-pink / line-red treatment.
+ */
+
+.ballast-precedent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-precedent__note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-precedent__headline {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-lg);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-precedent__body {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-precedent__stats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  margin: 0;
+}
+
+.ballast-precedent__stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+}
+
+.ballast-precedent__stat-term {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+}
+
+.ballast-precedent__stat-value {
+  margin: 0;
+}
+
+.ballast-precedent__source {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-precedent__disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-precedent__toggle {
+  align-self: flex-start;
+  background-color: var(--ballast-color-surface);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-12);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  cursor: pointer;
+}
+
+.ballast-precedent__windows {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  margin: 0;
+  padding: 0;
+}
+
+/* Motion only when the user has NOT requested reduced motion. The JS
+ * `useReducedMotion` hook already gates the animated class, but we mirror the
+ * app-wide convention (see theme/global.css, ReauthBanner.css) with a CSS
+ * media guard as defense-in-depth in case the hook's initial state is wrong. */
+.ballast-precedent__windows--animated {
+  animation: ballast-precedent-reveal 160ms ease-out;
+}
+
+@keyframes ballast-precedent-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ballast-precedent__windows--animated {
+    animation: none;
+  }
+}
+
+.ballast-precedent__window {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-12);
+}
+
+.ballast-precedent__window-dates {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-precedent__window-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-precedent__window-recovery {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+}

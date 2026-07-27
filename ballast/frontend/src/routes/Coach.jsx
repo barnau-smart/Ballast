@@ -1,3 +1,4 @@
+import { RecoveryPrecedent } from '../components/RecoveryPrecedent.jsx'
 import './screen.css'
 
 export function Coach() {
@@ -9,7 +10,7 @@ export function Coach() {
         A calm, plain-spoken guide. Ask a question and think out loud — no
         jargon, no pressure.
       </p>
-      <div className="ballast-card">placeholder — coach surface</div>
+      <RecoveryPrecedent />
     </section>
   )
 }

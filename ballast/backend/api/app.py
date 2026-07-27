@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from api.brokerage import router as brokerage_router
 from api.config import get_settings
 from api.portfolio import router as portfolio_router
+from api.precedent import router as precedent_router
 from api.logging_config import configure_logging
 from api.schemas import UserCreate, UserRead
 from api.users import auth_backend, fastapi_users
@@ -159,6 +160,11 @@ def create_app() -> FastAPI:
     # Portfolio read + refresh (Story 2.3): the AD-14 single-writer projection.
     # Read-only cache read + on-demand reconcile from the authoritative broker.
     app.include_router(portfolio_router)
+
+    # Recovery-precedent read (Story 3.3, FR15): one auth-gated, read-only
+    # surface over the Precedent Engine (AD-3). Returns the AD-12 evidence shape
+    # verbatim; the Coach surface renders it.
+    app.include_router(precedent_router)
 
     # --- Routes --------------------------------------------------------------
 
