@@ -65,8 +65,16 @@ class TiingoAdapter(MarketDataPort):
         Money is parsed as ``Decimal`` (never float). The API key is never logged.
         """
         self._require_configured()
-        # Lazy import: selecting the fake adapter never loads the tiingo SDK.
-        from tiingo import TiingoClient
+        # Lazy import: selecting the fake adapter never loads the tiingo SDK. A
+        # missing SDK fails loud and clear like the rest of the adapter.
+        try:
+            from tiingo import TiingoClient
+        except ImportError as exc:
+            raise TiingoNotConfiguredError(
+                "The 'tiingo' package is not installed. Install it (and set "
+                "TIINGO_API_KEY, MARKETDATA_ADAPTER=tiingo) to use the Tiingo "
+                "adapter."
+            ) from exc
 
         client = TiingoClient({"api_key": self._api_key, "session": True})
         raw = client.get_ticker_price(
@@ -92,7 +100,7 @@ class TiingoAdapter(MarketDataPort):
                     # Tiingo exposes split/dividend adjusted fields prefixed
                     # ``adj*``; fall back to raw close if absent.
                     adj_close=_to_decimal(row.get("adjClose", row["close"])),
-                    volume=int(row.get("volume", 0) or 0),
+                    volume=int(Decimal(str(row.get("volume", 0) or 0))),
                 )
             )
         bars.sort(key=lambda b: b.day)

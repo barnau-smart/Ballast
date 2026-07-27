@@ -21,13 +21,21 @@ from db.connection import get_connection
 from db.models import MarketDaily
 from db.session import async_session_maker, engine
 from marketdata.factory import get_market_data
-from marketdata.fake_adapter import FAKE_SYMBOLS, FakeMarketDataAdapter
+from marketdata.fake_adapter import FakeMarketDataAdapter
 from marketdata.ingest import ingest_market_daily
 from marketdata.port import DailyBar, MarketDataPort
 
 START = date(2024, 1, 1)
 END = date(2024, 1, 10)  # 10 inclusive calendar days
 DAYS_IN_RANGE = 10
+
+# Test-only symbols with a clearly-fake unique prefix so the real-DB (DB-writing)
+# tests can never collide with a real ingest run over the global universe. The
+# FakeMarketDataAdapter serves any symbol (it has a default base price), so these
+# are safe. The pure fake-adapter determinism tests keep using "VTI".
+TEST_SYMBOLS = ["TEST_VTI", "TEST_VXUS", "TEST_BND"]
+TEST_BROKEN = "TEST_BROKEN"
+TEST_UPSERT = "TEST_UPSERT"
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -87,9 +95,15 @@ def test_fake_bars_are_deterministic_and_decimal():
     for field in ("open", "high", "low", "close", "adj_close"):
         assert isinstance(getattr(bar0, field), Decimal)
     assert isinstance(bar0.volume, int)
-    # OHLC internally consistent.
+    # OHLC internally consistent — high/low bracket open, close AND adj_close.
     assert bar0.low <= bar0.open <= bar0.high
     assert bar0.low <= bar0.close <= bar0.high
+    assert bar0.low <= bar0.adj_close <= bar0.high
+    # The full invariant holds across the whole series, not just bar0.
+    for bar in a:
+        assert bar.low <= bar.open <= bar.high
+        assert bar.low <= bar.close <= bar.high
+        assert bar.low <= bar.adj_close <= bar.high
 
 
 def test_fake_bars_exact_values():
@@ -99,9 +113,9 @@ def test_fake_bars_exact_values():
     assert bar.symbol == "VTI"
     assert bar.day == date(2024, 1, 1)
     assert bar.close == Decimal("198.01")
-    assert bar.open == Decimal("197.59")
-    assert bar.high == Decimal("198.43")
-    assert bar.low == Decimal("197.59")
+    assert bar.open == Decimal("199.50")
+    assert bar.high == Decimal("199.98")
+    assert bar.low == Decimal("197.53")
     assert bar.adj_close == Decimal("198.01")
     assert bar.volume == 2306686
 
@@ -115,7 +129,7 @@ def test_fake_reversed_range_is_empty():
 
 @pytest.mark.asyncio
 async def test_ingest_writes_one_row_per_symbol_day():
-    symbols = list(FAKE_SYMBOLS)
+    symbols = list(TEST_SYMBOLS)
     _clean(symbols)
     try:
         async with async_session_maker() as session:
@@ -128,8 +142,11 @@ async def test_ingest_writes_one_row_per_symbol_day():
         assert _count(symbols) == len(symbols) * DAYS_IN_RANGE
 
         # Values round-trip as Decimal, source recorded.
-        expected = FakeMarketDataAdapter().fetch_eod("VTI", START, START)[0]
-        open_, high, low, close, adj_close, volume, source = _row("VTI", START)
+        sym = TEST_SYMBOLS[0]
+        expected = FakeMarketDataAdapter().fetch_eod(sym, START, START)[0]
+        row = _row(sym, START)
+        assert row is not None, f"expected a market_daily row for {sym}/{START}"
+        open_, high, low, close, adj_close, volume, source = row
         assert Decimal(str(close)) == expected.close
         assert Decimal(str(open_)) == expected.open
         assert Decimal(str(adj_close)) == expected.adj_close
@@ -144,7 +161,7 @@ async def test_ingest_writes_one_row_per_symbol_day():
 
 @pytest.mark.asyncio
 async def test_ingest_is_idempotent_on_rerun():
-    symbols = list(FAKE_SYMBOLS)
+    symbols = list(TEST_SYMBOLS)
     _clean(symbols)
     try:
         async with async_session_maker() as session:
@@ -175,7 +192,7 @@ async def test_ingest_is_idempotent_on_rerun():
 
 @pytest.mark.asyncio
 async def test_changed_bar_updates_in_place():
-    symbol = "TESTUPSERT"
+    symbol = TEST_UPSERT
     _clean([symbol])
 
     class _FixedAdapter(MarketDataPort):
@@ -204,7 +221,9 @@ async def test_changed_bar_updates_in_place():
                 session, _FixedAdapter(Decimal("10.00")), [symbol], START, START
             )
         assert _count([symbol]) == 1
-        assert Decimal(str(_row(symbol, START)[3])) == Decimal("10.00")
+        row = _row(symbol, START)
+        assert row is not None, f"expected a market_daily row for {symbol}/{START}"
+        assert Decimal(str(row[3])) == Decimal("10.00")
 
         # Same (symbol, day), changed close → updates in place, no new row.
         async with async_session_maker() as session:
@@ -212,7 +231,9 @@ async def test_changed_bar_updates_in_place():
                 session, _FixedAdapter(Decimal("99.99")), [symbol], START, START
             )
         assert _count([symbol]) == 1  # still ONE row
-        assert Decimal(str(_row(symbol, START)[3])) == Decimal("99.99")
+        row = _row(symbol, START)
+        assert row is not None, f"expected a market_daily row for {symbol}/{START}"
+        assert Decimal(str(row[3])) == Decimal("99.99")
     finally:
         _clean([symbol])
 
@@ -237,20 +258,21 @@ class _OneSymbolFailsAdapter(MarketDataPort):
 
 @pytest.mark.asyncio
 async def test_source_hiccup_does_not_abort_run():
-    symbols = ["VTI", "BROKEN", "BND"]
+    good_a, good_b = "TEST_VTI", "TEST_BND"
+    symbols = [good_a, TEST_BROKEN, good_b]
     _clean(symbols)
     try:
         async with async_session_maker() as session:
             result = await ingest_market_daily(
-                session, _OneSymbolFailsAdapter("BROKEN"), symbols, START, END
+                session, _OneSymbolFailsAdapter(TEST_BROKEN), symbols, START, END
             )
         # The run continued: the good symbols are ingested, the bad one reported.
         assert not result.ok
-        assert "BROKEN" in result.symbols_failed
-        assert set(result.symbols_ingested) == {"VTI", "BND"}
-        assert _count(["VTI"]) == DAYS_IN_RANGE
-        assert _count(["BND"]) == DAYS_IN_RANGE
-        assert _count(["BROKEN"]) == 0  # nothing written for the failed symbol
+        assert TEST_BROKEN in result.symbols_failed
+        assert set(result.symbols_ingested) == {good_a, good_b}
+        assert _count([good_a]) == DAYS_IN_RANGE
+        assert _count([good_b]) == DAYS_IN_RANGE
+        assert _count([TEST_BROKEN]) == 0  # nothing written for the failed symbol
     finally:
         _clean(symbols)
 
@@ -260,10 +282,15 @@ async def test_source_hiccup_does_not_abort_run():
 
 def test_market_daily_has_no_owner_id():
     """market_daily is GLOBAL reference data — it must have no owner_id column."""
+    from db.models import Base
+
     columns = set(MarketDaily.__table__.columns.keys())
     assert "owner_id" not in columns
     assert {"symbol", "day", "open", "high", "low", "close", "adj_close",
             "volume", "source", "ingested_at"} <= columns
+    # The model is registered on the app's metadata, so the real startup path
+    # (create_all) would create the table.
+    assert "market_daily" in Base.metadata.tables
 
 
 def test_factory_returns_fake_by_default():

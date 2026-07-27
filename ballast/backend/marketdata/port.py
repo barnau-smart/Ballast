@@ -61,6 +61,7 @@ class MarketDataPort(ABC):
         ``start`` and ``end`` are inclusive calendar dates. The result is ordered
         by ``day`` ascending and contains one bar per trading day in range
         (weekends/holidays may simply be absent — the store is keyed by the days
-        that exist, not a dense calendar). Money is ``Decimal``.
+        that exist, not a dense calendar). If ``end < start`` the result is an
+        empty list. Money is ``Decimal``.
         """
         raise NotImplementedError

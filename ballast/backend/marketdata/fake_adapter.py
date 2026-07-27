@@ -52,27 +52,33 @@ def _seed(symbol: str, day: date) -> int:
 def _bar_for(symbol: str, day: date) -> DailyBar:
     """Compute the one deterministic :class:`DailyBar` for a symbol/day.
 
-    Pure function of (symbol, day): no wall-clock, no RNG global state. The
-    oscillation is a bounded deterministic offset so OHLC stay internally
-    consistent (low <= open/close <= high) and money stays ``Decimal``.
+    Pure function of (symbol, day): no wall-clock, no RNG global state. Every
+    value is derived from distinct slices of the sha256 seed and money stays
+    ``Decimal`` quantized to cents. The bar is constructed so the OHLC invariant
+    holds for EVERY seed: ``high`` is the max of (open, close, adj_close) plus a
+    non-negative pad and ``low`` is the min minus that same pad, which guarantees
+    ``low <= open/close/adj_close <= high``.
     """
     base = _BASE_PRICE.get(symbol, _DEFAULT_BASE_PRICE)
     seed = _seed(symbol, day)
 
-    # A bounded deterministic offset in cents, in roughly [-500, +500] cents.
+    # close: a bounded deterministic offset in cents, in roughly [-500, +500].
     offset_cents = (seed % 1001) - 500
     close = (base + Decimal(offset_cents) * _CENTS).quantize(_CENTS)
 
-    # Intraday spread derived deterministically from a different slice of the seed.
-    spread_cents = (seed // 1001) % 300  # 0..299 cents
-    half = (Decimal(spread_cents) * _CENTS / 2).quantize(_CENTS)
+    # open: a distinct seed slice as a bounded offset around close (±150 cents).
+    open_offset_cents = ((seed // 1001) % 301) - 150
+    open_ = (close + Decimal(open_offset_cents) * _CENTS).quantize(_CENTS)
 
-    open_ = (close - half).quantize(_CENTS)
-    high = (close + half).quantize(_CENTS)
-    low = (close - half).quantize(_CENTS)
-    # adj_close is the (deterministically) adjusted close — a small, stable
-    # per-symbol/day adjustment so it differs from raw close but round-trips.
+    # adj_close: a small, stable downward adjustment from close (0..6 cents) so it
+    # differs from raw close but round-trips deterministically.
     adj_close = (close - (Decimal(seed % 7) * _CENTS)).quantize(_CENTS)
+
+    # pad: a small non-negative deterministic amount (0..49 cents) so high/low
+    # bracket the three price points with a little intraday headroom.
+    pad = (Decimal((seed // 7) % 50) * _CENTS).quantize(_CENTS)
+    high = (max(open_, close, adj_close) + pad).quantize(_CENTS)
+    low = (min(open_, close, adj_close) - pad).quantize(_CENTS)
 
     # Deterministic whole-share volume in a realistic band.
     volume = 1_000_000 + (seed % 9_000_000)

@@ -80,11 +80,14 @@ async def ingest_market_daily(
     directly (no user scope, no ``ScopedRepository``). For each symbol it fetches
     via the port and UPSERTs each bar on (``symbol``, ``day``) so re-runs never
     duplicate (AC2). Each symbol is isolated in try/except so one failure logs a
-    warning and the run continues (AC3). Commits once at the end and returns an
+    warning and the run continues (AC3). Commits per symbol so one symbol's
+    failure cannot discard an already-ingested symbol's rows (AC3), and returns an
     :class:`IngestResult`.
     """
     result = IngestResult()
-    provider = getattr(source, "provider", source.__class__.__name__)
+    # Dedupe preserving order so a repeated symbol isn't ingested / counted twice.
+    symbols = list(dict.fromkeys(symbols))
+    provider = getattr(source, "provider", None) or source.__class__.__name__
     ingested_at = datetime.now(timezone.utc)
 
     for symbol in symbols:
@@ -136,13 +139,22 @@ async def ingest_market_daily(
             )
         except Exception as exc:  # noqa: BLE001 — tolerate per-symbol hiccups (AC3)
             # Roll back only THIS symbol's partial (uncommitted) writes so a
-            # mid-symbol error can't poison the transaction; then continue.
-            await session.rollback()
-            result.symbols_failed[symbol] = type(exc).__name__
+            # mid-symbol error can't poison the transaction; then continue. The
+            # rollback itself can fail on a dead connection — guard it so it can't
+            # abort the whole run (AC3).
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001 — a failed rollback must not abort the run
+                logger.warning(
+                    "market_daily_ingest_rollback_failed symbol=%s", symbol
+                )
+            # Keep the full error text (our own / vendor message — no secrets).
+            error = f"{type(exc).__name__}: {exc}"
+            result.symbols_failed[symbol] = error
             logger.warning(
-                "market_daily_ingest_symbol_failed symbol=%s error_type=%s",
+                "market_daily_ingest_symbol_failed symbol=%s error=%s",
                 symbol,
-                type(exc).__name__,
+                error,
             )
 
     logger.info(
@@ -198,10 +210,29 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    start = date.fromisoformat(args.start)
-    end = date.fromisoformat(args.end)
+    if not symbols:
+        parser.error("no symbols given")
+
+    try:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    except ValueError as exc:
+        parser.error(f"invalid date: {exc}")
+    if start > end:
+        parser.error("start date is after end date")
 
     result = asyncio.run(_run_cli(symbols, start, end))
+    # A one-line human summary to stdout regardless of log level, so a shell /
+    # scheduler run always shows the outcome.
+    print(
+        f"market_daily ingest: rows_written={result.rows_written} "
+        f"symbols_ok={len(result.symbols_ingested)} "
+        f"symbols_failed={len(result.symbols_failed)}"
+    )
+    if result.symbols_failed:
+        print("failed symbols:")
+        for sym, err in result.symbols_failed.items():
+            print(f"  {sym}: {err}")
     # Non-zero exit if any symbol failed, so a scheduler can alert.
     return 0 if result.ok else 1
 
