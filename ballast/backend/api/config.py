@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     # (it never crashes at import, and the fake adapter needs no creds).
     TIINGO_API_KEY: str = ""
 
+    # --- LLM / Story 4.1 ------------------------------------------------------
+
+    # Which LLM gateway adapter the factory returns. "fake" for dev/test (no
+    # creds, no network, deterministic — the tested path), "anthropic" when
+    # ANTHROPIC_API_KEY is set.
+    LLM_ADAPTER: str = "fake"
+
+    # Anthropic API key. Empty by default — the AnthropicGateway is code-shaped
+    # but gated: constructing it without this raises a clear "LLM not configured"
+    # error (it never crashes at import, never imports the SDK at import time,
+    # and the fake adapter needs no creds). The key is never logged.
+    ANTHROPIC_API_KEY: str = ""
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

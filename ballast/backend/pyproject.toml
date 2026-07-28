@@ -13,6 +13,7 @@ dependencies = [
     "asyncpg",
     "cryptography",
     "schwab-py==1.5.1",
+    "anthropic",
 ]
 
 [project.optional-dependencies]
