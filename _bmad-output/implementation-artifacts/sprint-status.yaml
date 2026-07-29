@@ -78,7 +78,7 @@ development_status:
   epic-4: in-progress
   4-1-llm-gateway: done
   4-2-recommendation-object-validation-gate: done
-  4-3-coach-pipeline-default-plan-fallback: backlog
+  4-3-coach-pipeline-default-plan-fallback: ready-for-dev
   4-4-just-in-time-teaching: backlog
   4-5-self-destructive-move-warnings: backlog
   4-6-propose-and-approve-execution: backlog
