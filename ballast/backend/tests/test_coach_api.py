@@ -53,7 +53,7 @@ from coach.execution import (
 )
 from coach.recommendation import OrderIntent, OrderSide
 from db.connection import get_connection
-from db.models import BrokerageToken, MarketDaily, PortfolioCache
+from db.models import BrokerageToken, DecisionRecord, MarketDaily, PortfolioCache
 from db.session import engine
 
 PASSWORD = "supersecret123"
@@ -74,6 +74,7 @@ async def ensure_tables():
         await conn.run_sync(BrokerageToken.__table__.create, checkfirst=True)
         await conn.run_sync(PortfolioCache.__table__.create, checkfirst=True)
         await conn.run_sync(MarketDaily.__table__.create, checkfirst=True)
+        await conn.run_sync(DecisionRecord.__table__.create, checkfirst=True)
     yield
 
 
@@ -105,6 +106,34 @@ def _login(client: TestClient, email: str) -> str:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["access_token"]
+
+
+def _recommend_decision_id(client: TestClient, headers: dict) -> str:
+    """POST a minimal /recommend and return the persisted ``decision_id`` (4.9).
+
+    Every /approve now requires a real decision_id from a prior /recommend; this
+    threads one in with a minimal body (the fake pipeline always blesses a
+    default plan, so no market seeding is needed).
+    """
+    resp = client.post("/api/coach/recommend", json={}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["decision_id"]
+    return body["decision_id"]
+
+
+def _decision_rows(owner: uuid.UUID) -> list[dict]:
+    """Read this owner's decision_record rows (sync psycopg) for assertions."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, schema_version, recommendation_snapshot, status, "
+                "created_at, co_signed_at, idempotency_key, cosign_snapshot "
+                "FROM decision_record WHERE owner_id = %s",
+                (str(owner),),
+            )
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def _user_id_for(email: str) -> uuid.UUID:
@@ -312,10 +341,14 @@ def test_approve_in_scope_places_order_exactly_once(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 200, resp.text
@@ -350,15 +383,22 @@ def test_approve_out_of_scope_symbol_rejected_broker_never_called(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "AAPL", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "AAPL", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 422, resp.text
         assert resp.json()["error"]["type"]  # error envelope shape
         assert spy.calls == []  # broker NEVER called
+        # A refusal (422) leaves the referenced record PROPOSED (no co-sign).
+        rows = _decision_rows(_user_id_for(email))
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
@@ -374,10 +414,14 @@ def test_approve_non_positive_amount_rejected_broker_never_called(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "0"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "0"},
+            },
             headers=headers,
         )
         assert resp.status_code == 422, resp.text
@@ -397,15 +441,24 @@ def test_approve_expired_session_returns_409_no_order(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _expired())
+        # Recommend works in degraded mode (AD-11) even on an expired session, so
+        # a proposed record + decision_id exist before the approve entry gate.
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 409, resp.text
         assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
         assert spy.calls == []  # broker NEVER called
+        # The entry-gate 409 leaves the referenced record PROPOSED (no co-sign).
+        rows = _decision_rows(_user_id_for(email))
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
@@ -420,11 +473,16 @@ def test_approve_unlinked_session_returns_409_no_order(client):
         _register(client, email)
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
-        # No token inserted → session "unlinked" → not live.
+        # No token inserted → session "unlinked" → not live. Recommend still works
+        # (degraded, no session required) so a decision_id exists.
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 409, resp.text
@@ -452,16 +510,23 @@ def test_approve_provider_mismatch_returns_409_no_order(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 409, resp.text
         assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
         assert spy.calls == []  # broker NEVER called on a provider mismatch
         assert spy.status_calls == []
+        # The integrity 409 leaves the referenced record PROPOSED (no co-sign).
+        rows = _decision_rows(_user_id_for(email))
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         client.app.dependency_overrides.pop(require_live_broker_session, None)
@@ -490,10 +555,14 @@ def test_approve_live_matched_session_places_once_and_reconciles(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 200, resp.text
@@ -513,7 +582,10 @@ def test_approve_unauthenticated_returns_401(client):
     try:
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": str(uuid.uuid4()),
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
         )
         assert resp.status_code == 401, resp.text
         assert spy.calls == []
@@ -802,15 +874,20 @@ def test_approve_malformed_body_rejected_broker_never_called(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
-        # Missing order_intent entirely.
+        # Missing order_intent (and decision_id) entirely.
         r1 = client.post("/api/coach/approve", json={}, headers=headers)
         assert r1.status_code == 422, r1.text
 
-        # An order side outside the closed buy/sell enum.
+        # An order side outside the closed buy/sell enum (with a real decision_id
+        # so the failure is the side enum, not the missing decision_id).
         r2 = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "hold", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "hold", "amount": "500"},
+            },
             headers=headers,
         )
         assert r2.status_code == 422, r2.text
@@ -833,10 +910,14 @@ def test_approve_normalizes_symbol_before_placing(client):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "  vti  ", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "  vti  ", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         assert resp.status_code == 200, resp.text
@@ -864,9 +945,13 @@ def _approve_with_scripted(client: TestClient, adapter: BrokerPort):
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
         _insert_token_sync(_user_id_for(email), _live())
+        decision_id = _recommend_decision_id(client, headers)
         resp = client.post(
             "/api/coach/approve",
-            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
             headers=headers,
         )
         return resp
@@ -1055,3 +1140,295 @@ async def test_schwab_get_order_status_stub_raises_without_creds(monkeypatch):
     adapter._client_id = ""
     with pytest.raises(SchwabNotConfiguredError):
         await adapter.get_order_status("k")
+
+
+# =============================================================================
+# STORY 4.9 — CO-SIGNED IMMUTABLE DECISION RECORD
+# =============================================================================
+
+
+def test_recommend_persists_one_proposed_record_scoped(client):
+    # (a) A /recommend writes EXACTLY ONE proposed DecisionRecord — owner-scoped,
+    # carrying the immutable snapshot (action_label/reasoning/evidence/
+    # uncertainties/order_intent) + schema_version — and returns decision_id.
+    email = _unique_email()
+    _clean_market([SYM])
+    _insert_series(SYM, [Decimal("100"), Decimal("92")])
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+
+        resp = client.post(
+            "/api/coach/recommend",
+            json={"symbol": SYM, "question": "Should I invest now?"},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        decision_id = body["decision_id"]
+        assert decision_id
+
+        rows = _decision_rows(uid)
+        assert len(rows) == 1  # EXACTLY one proposed record
+        row = rows[0]
+        assert str(row["id"]) == decision_id
+        assert row["status"] == "proposed"
+        assert row["schema_version"] == 1
+        assert row["co_signed_at"] is None
+        assert row["idempotency_key"] is None
+        assert row["cosign_snapshot"] is None
+        snap = row["recommendation_snapshot"]
+        # Snapshot mirrors what the user saw (backend-blessed, not client-authored).
+        assert snap["action_label"] == body["action_label"]
+        assert snap["reasoning"] == body["reasoning"]
+        assert "order_intent" in snap
+        assert len(snap["evidence"]) == len(body["evidence"]) >= 1
+        assert snap["uncertainties"] == body["uncertainties"]
+    finally:
+        _clean_market([SYM])
+        _delete_user(email)
+
+
+def test_approve_cosigns_referenced_record_immutably(client):
+    # (b) Happy-path approve co-signs the referenced record: it becomes cosigned
+    # with co_signed_at, executed order_intent, idempotency_key, and the reconciled
+    # outcome — while recommendation_snapshot/schema_version are BYTE-IDENTICAL to
+    # the proposed snapshot (immutability).
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        proposed = _decision_rows(uid)[0]
+        proposed_snapshot = proposed["recommendation_snapshot"]
+        proposed_version = proposed["schema_version"]
+        proposed_created = proposed["created_at"]
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "filled"
+        assert len(spy.calls) == 1
+
+        cosigned = _decision_rows(uid)[0]
+        assert cosigned["status"] == "cosigned"
+        assert cosigned["co_signed_at"] is not None
+        assert cosigned["idempotency_key"]
+        cosign_snap = cosigned["cosign_snapshot"]
+        # Executed order_intent captured (money fixed-point string).
+        assert cosign_snap["order_intent"] == {
+            "symbol": "VTI",
+            "side": "buy",
+            "amount": "500",
+        }
+        # Reconciled outcome captured honestly.
+        assert cosign_snap["outcome"]["status"] == "filled"
+        assert cosign_snap["outcome"]["broker_ref"]
+        # IMMUTABILITY: the proposed snapshot/version/created_at are untouched.
+        assert cosigned["recommendation_snapshot"] == proposed_snapshot
+        assert cosigned["schema_version"] == proposed_version
+        assert cosigned["created_at"] == proposed_created
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cosigned_record_is_replay_ready(client):
+    # (c) Replay-readiness: the cosigned record's immutable snapshot carries
+    # reasoning, the evidence list, uncertainties, and schema_version.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    _clean_market([SYM])
+    _insert_series(SYM, [Decimal("100"), Decimal("92")])
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        # A seeded recommend so the evidence list is non-trivial.
+        rec = client.post(
+            "/api/coach/recommend",
+            json={"symbol": SYM, "question": "Should I invest now?"},
+            headers=headers,
+        )
+        decision_id = rec.json()["decision_id"]
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+
+        row = _decision_rows(uid)[0]
+        assert row["status"] == "cosigned"
+        assert row["schema_version"] == 1
+        snap = row["recommendation_snapshot"]
+        assert snap["reasoning"].strip()
+        assert isinstance(snap["evidence"], list) and len(snap["evidence"]) >= 1
+        # Each evidence record keeps the AD-12 six-field shape.
+        for record in snap["evidence"]:
+            assert set(record) == {
+                "id",
+                "kind",
+                "statement",
+                "stats",
+                "source",
+                "as_of",
+            }
+        assert any(u.strip() for u in snap["uncertainties"])
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _clean_market([SYM])
+        _delete_user(email)
+
+
+def test_double_approve_is_idempotent_no_double_place(client):
+    # (d) A second /approve with the SAME decision_id returns the RECORDED outcome
+    # and the broker spy shows place_order called EXACTLY once total (no double
+    # placement across requests).
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+        body = {
+            "decision_id": decision_id,
+            "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+        }
+
+        first = client.post("/api/coach/approve", json=body, headers=headers)
+        assert first.status_code == 200, first.text
+        second = client.post("/api/coach/approve", json=body, headers=headers)
+        assert second.status_code == 200, second.text
+
+        # Same recorded outcome on the replay; broker NEVER re-invoked.
+        assert second.json() == first.json()
+        assert len(spy.calls) == 1  # place_order called exactly once TOTAL
+        assert spy.status_calls == []
+        # Still exactly one cosigned record (co-sign is one-shot).
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "cosigned"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_unknown_decision_id_returns_404(client):
+    # (e) An unknown decision_id → 404; broker untouched, nothing persisted.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": str(uuid.uuid4()),  # never persisted
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 404, resp.text
+        assert spy.calls == []  # broker NEVER called
+        assert _decision_rows(uid) == []  # nothing persisted
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_foreign_decision_id_returns_404(client):
+    # (e, foreign variant) A decision_id owned by ANOTHER user is invisible under
+    # the caller's scope → 404; broker untouched, the foreign record stays proposed.
+    owner_email = _unique_email()
+    attacker_email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        # Owner recommends → a proposed record owned by them.
+        _register(client, owner_email)
+        owner_token = _login(client, owner_email)
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+        owner_uid = _user_id_for(owner_email)
+        foreign_decision_id = _recommend_decision_id(client, owner_headers)
+
+        # Attacker (different user) tries to approve the owner's decision_id.
+        _register(client, attacker_email)
+        attacker_token = _login(client, attacker_email)
+        attacker_headers = {"Authorization": f"Bearer {attacker_token}"}
+        _insert_token_sync(_user_id_for(attacker_email), _live())
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": foreign_decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=attacker_headers,
+        )
+        assert resp.status_code == 404, resp.text  # foreign row invisible
+        assert spy.calls == []  # broker NEVER called
+        # The owner's record is untouched (still proposed).
+        owner_rows = _decision_rows(owner_uid)
+        assert len(owner_rows) == 1 and owner_rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(owner_email)
+        _delete_user(attacker_email)
+
+
+def test_decision_record_sole_writer_canary():
+    # (g) AD-6: DecisionRecord(...) CONSTRUCTION appears ONLY in
+    # coach/decision_record.py (its model is DEFINED in db/models.py). No other
+    # module — API handlers included — may construct or persist the model.
+    import pathlib
+
+    backend = pathlib.Path(__file__).resolve().parent.parent
+    offenders: list[str] = []
+    for path in backend.rglob("*.py"):
+        rel = path.relative_to(backend)
+        parts = rel.parts
+        if parts and parts[0] in {"tests", ".venv"}:
+            continue
+        if rel.as_posix() in {
+            "db/models.py",  # the model DEFINITION (class DecisionRecord)
+            "coach/decision_record.py",  # the SOLE writer
+        }:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "DecisionRecord(" in text:
+            offenders.append(rel.as_posix())
+    assert offenders == [], (
+        "DecisionRecord(...) must be constructed ONLY by coach.decision_record "
+        f"(AD-6). Unexpected constructors: {offenders}"
+    )

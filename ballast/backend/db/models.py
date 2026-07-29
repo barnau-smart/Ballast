@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Date,
     DateTime,
@@ -212,3 +213,65 @@ class MarketDaily(Base):
     ingested_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class DecisionRecord(OwnedEntityMixin, Base):
+    """A co-signed, IMMUTABLE decision record (table: ``decision_record``).
+
+    The on-the-record memory of a coach decision (FR16, AD-5/AD-6): the single
+    per-user, insert-then-co-sign immutable table that backs recommend/co-sign
+    (and, later, replay). One row is inserted **proposed** at ``/recommend`` time
+    and — on a successful execution — transitions ONCE to **cosigned** at
+    ``/approve`` time.
+
+    IMMUTABILITY: the snapshot columns are WRITE-ONCE at propose —
+    ``schema_version``, ``recommendation_snapshot`` (the blessed
+    action_label/reasoning/full evidence records/uncertainties/proposed
+    order_intent), and ``created_at`` are NEVER mutated after insert. Co-sign
+    fills the previously-NULL co-sign columns (``co_signed_at``,
+    ``idempotency_key``, ``cosign_snapshot``) EXACTLY once, guarded on
+    ``status == "proposed"``; a cosigned record is only ever READ afterward. The
+    recommendation snapshot is never re-derived or re-touched (AD-5).
+
+    SOLE WRITER: ``coach/decision_record.py`` is the ONLY module that constructs
+    or persists this model (AD-6). ``api/coach.py`` and everything else delegate
+    to it and never write this table directly (a grep canary locks this).
+
+    Conventions: UUID primary key; ``created_at``/``co_signed_at`` are tz-aware
+    UTC; money inside the JSON snapshots is fixed-point decimal STRING (never
+    binary float, never ``E+`` exponent notation). ``owner_id`` comes from the
+    mixin (per-user isolation via the fail-closed ``ScopedRepository``, AD-10).
+    """
+
+    __tablename__ = "decision_record"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # Stamps the snapshot shape for durable replay (AD-5). Write-once at propose.
+    schema_version: Mapped[int] = mapped_column(nullable=False)
+
+    # The immutable blessed snapshot of what was PROPOSED (action_label,
+    # reasoning, full evidence records, uncertainties, proposed order_intent).
+    # Write-once at propose; never mutated.
+    recommendation_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    # "proposed" at insert; transitions ONCE to "cosigned" on a successful
+    # execution (guarded in coach/decision_record.cosign).
+    status: Mapped[str] = mapped_column(
+        String(length=16), nullable=False, default="proposed"
+    )
+
+    # When the proposed record was written (tz-aware UTC). Write-once.
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # Co-sign columns — NULL until co-sign fills them EXACTLY once.
+    co_signed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(length=64), nullable=True
+    )
+    # The executed order_intent + reconciled OrderOutcome (what was EXECUTED).
+    cosign_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
