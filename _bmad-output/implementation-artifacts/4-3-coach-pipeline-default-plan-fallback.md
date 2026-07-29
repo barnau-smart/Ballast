@@ -2,12 +2,14 @@
 title: 'Story 4.3 — Coach Pipeline & Default-Plan Fallback'
 type: 'feature'
 created: '2026-07-28'
-status: 'draft'
+status: 'done'
+baseline_revision: '5975048f339fb3262c021c044f7f6437bebf1431'
+final_revision: '57526f85dd7bcc3b86c7bb2e43bf5ec21b12413f'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
-warnings: []
+warnings: ['oversized']
 ---
 
 <intent-contract>
@@ -56,37 +58,57 @@ warnings: []
 ## Code Map
 
 - `ballast/backend/precedent/engine.py` -- REFERENCE: `async find_precedent(session, symbol=DEFAULT_BENCHMARK, as_of=None) -> list[EvidenceRecord]` (always length ≥1; strategy fallback guarantees non-empty). `DEFAULT_BENCHMARK = "VTI"`. Exported via `precedent` package (`find_precedent`, `EvidenceRecord`, `EvidenceKind`).
-- `ballast/backend/coach/recommendation.py` -- REFERENCE: `Recommendation`, `RECOMMENDATION_OUTPUT_SCHEMA`, tolerant `recommendation_from_output(dict)`.
-- `ballast/backend/coach/validation.py` -- REFERENCE: `validate_recommendation(candidate, retrieved) -> BlessedRecommendation`, `RecommendationValidationError`. Gate is the sole producer of a blessed object.
-- `ballast/backend/llm/{port,factory}.py` -- REFERENCE: `LLMMessage`/`LLMRequest`/`LLMResponse`, `LLMGateway` ABC, `get_llm_gateway()`.
+- `ballast/backend/precedent/__init__.py` -- REFERENCE: exports `find_precedent`, `EvidenceRecord` (frozen: `id, kind, statement, stats, source, as_of` + JSON-safe `to_dict()`), `EvidenceKind` (`EVENT_PRECEDENT = "event-precedent"`, `STRATEGY = "strategy"`).
+- `ballast/backend/coach/recommendation.py` -- REFERENCE: frozen `Recommendation(action_label, reasoning, evidence: tuple[str,...], uncertainties: tuple[str,...], order_intent=None)`, `RECOMMENDATION_OUTPUT_SCHEMA` (required: action_label/reasoning/evidence/uncertainties), tolerant `recommendation_from_output(dict) -> Recommendation` (never raises).
+- `ballast/backend/coach/validation.py` -- REFERENCE: `validate_recommendation(candidate, retrieved: Sequence[EvidenceRecord]) -> BlessedRecommendation` (frozen; sole producer via gate sentinel), `RecommendationValidationError` (base of MissingReasoning/MissingUncertainties/UnbackedEvidence). Rejects empty reasoning, empty/blank uncertainties, or evidence citing an ID not in the retrieved set.
+- `ballast/backend/llm/port.py` -- REFERENCE: frozen `LLMMessage(role, content)`, `LLMRequest(messages: tuple, output_schema: dict, system: str|None, hard_reasoning: bool, max_tokens=4096)`, `LLMResponse(output: dict, model, provider)`, `LLMGateway` ABC with **synchronous** `complete(request) -> LLMResponse`.
+- `ballast/backend/llm/factory.py` -- REFERENCE: `get_llm_gateway() -> LLMGateway` (default `FakeLLMGateway`, `provider="fake"`; `LLM_ADAPTER=anthropic` selects the live adapter).
 - `ballast/backend/coach/pipeline.py` -- NEW: `CoachDecision` input, `COACH_SYSTEM_PROMPT`, `is_hard_reasoning`, `compose_request`, `build_default_plan`, `surface`, `async run_coach_pipeline`.
-- `ballast/backend/coach/__init__.py` -- export the pipeline's public entrypoints.
-- `ballast/backend/tests/test_coach_pipeline.py` -- NEW: every I/O-matrix row (mostly pure/offline with in-memory `EvidenceRecord` fixtures + stub/fake gateways) plus one async DB-backed end-to-end test (mirrors `tests/test_precedent.py` harness).
+- `ballast/backend/coach/__init__.py` -- MODIFY (currently empty): export the pipeline's public entrypoints.
+- `ballast/backend/tests/test_coach_pipeline.py` -- NEW: every I/O-matrix row (mostly pure/offline with in-memory `EvidenceRecord` fixtures + stub/fake gateways) plus one async DB-backed end-to-end test (mirrors `tests/test_precedent.py` harness: `async_session_maker()` + seed `market_daily`).
 
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `ballast/backend/coach/pipeline.py` -- add: frozen `CoachDecision(symbol: str = DEFAULT_BENCHMARK, question: str = "", amount: Decimal | None = None, as_of: date | None = None)`; `COACH_SYSTEM_PROMPT` (coach voice + "cite only the evidence IDs provided, never invent numbers, always state what's uncertain"); pure `is_hard_reasoning(retrieved) -> bool` (`True` iff any record kind is `EVENT_PRECEDENT`); pure `compose_request(decision, retrieved) -> LLMRequest` (user message embeds the decision + each retrieved record via `to_dict()`; `output_schema=RECOMMENDATION_OUTPUT_SCHEMA`, `system=COACH_SYSTEM_PROMPT`, `hard_reasoning=is_hard_reasoning(retrieved)`); pure `build_default_plan(retrieved) -> BlessedRecommendation` (constructs a `Recommendation` citing every retrieved ID, coach-voice "stick to your plan" reasoning + ≥1 uncertainty, `order_intent=None`, then returns `validate_recommendation(candidate, retrieved)`); `surface(gateway, decision, retrieved) -> BlessedRecommendation` (compose → `gateway.complete` → `recommendation_from_output` → `validate_recommendation`; on `RecommendationValidationError` or any gateway `Exception`, return `build_default_plan(retrieved)`); `async run_coach_pipeline(session, decision, *, gateway=None) -> BlessedRecommendation` (`retrieved = tuple(await find_precedent(session, symbol=decision.symbol, as_of=decision.as_of))`; `gateway = gateway or get_llm_gateway()`; `return surface(gateway, decision, retrieved)`).
-- [ ] `ballast/backend/coach/__init__.py` -- export `CoachDecision`, `run_coach_pipeline`, `build_default_plan`, `surface`, `compose_request`, `is_hard_reasoning`.
-- [ ] `ballast/backend/tests/test_coach_pipeline.py` -- cover every I/O-matrix row. Pure/offline tests with in-memory `EvidenceRecord` fixtures (event-precedent + strategy) and small `LLMGateway` stubs: LLM-valid → LLM rec surfaced (not default); gate-reject → default plan; gateway-raises → default plan; default-plan blesses + cites all retrieved IDs + `order_intent=None` + non-empty reasoning/uncertainty; determinism (equal on repeat); `is_hard_reasoning`/`compose_request` routing both tiers; the real `FakeLLMGateway` falls back to the default plan (placeholder IDs don't match). Plus one `@pytest.mark.asyncio` end-to-end test seeding `market_daily` and running `run_coach_pipeline` with the fake gateway (mirror `tests/test_precedent.py` via `async_session_maker()`), asserting a `BlessedRecommendation` is returned with zero network/credentials.
+- [x] `ballast/backend/coach/pipeline.py` -- add: frozen `CoachDecision(symbol: str = DEFAULT_BENCHMARK, question: str = "", amount: Decimal | None = None, as_of: date | None = None)`; `COACH_SYSTEM_PROMPT` (coach voice + "cite only the evidence IDs provided, never invent numbers, always state what's uncertain"); pure `is_hard_reasoning(retrieved) -> bool` (`True` iff any record kind is `EVENT_PRECEDENT`); pure `compose_request(decision, retrieved) -> LLMRequest` (user message embeds the decision + each retrieved record via `to_dict()`; `output_schema=RECOMMENDATION_OUTPUT_SCHEMA`, `system=COACH_SYSTEM_PROMPT`, `hard_reasoning=is_hard_reasoning(retrieved)`); pure `build_default_plan(retrieved) -> BlessedRecommendation` (constructs a `Recommendation` citing every retrieved ID, coach-voice "stick to your plan" reasoning + ≥1 uncertainty, `order_intent=None`, then returns `validate_recommendation(candidate, retrieved)`); `surface(gateway, decision, retrieved) -> BlessedRecommendation` (compose → `gateway.complete` → `recommendation_from_output` → `validate_recommendation`; on any `Exception`, return `build_default_plan(retrieved)`); `async run_coach_pipeline(session, decision, *, gateway=None) -> BlessedRecommendation` (`retrieved = tuple(await find_precedent(session, symbol=decision.symbol, as_of=decision.as_of))`; `gateway = gateway or get_llm_gateway()`; `return surface(gateway, decision, retrieved)`).
+- [x] `ballast/backend/coach/__init__.py` -- export `CoachDecision`, `run_coach_pipeline`, `build_default_plan`, `surface`, `compose_request`, `is_hard_reasoning`.
+- [x] `ballast/backend/tests/test_coach_pipeline.py` -- cover every I/O-matrix row. Pure/offline tests with in-memory `EvidenceRecord` fixtures (event-precedent + strategy) and small `LLMGateway` stubs: LLM-valid → LLM rec surfaced (not default); gate-reject → default plan; gateway-raises → default plan; default-plan blesses + cites all retrieved IDs + `order_intent=None` + non-empty reasoning/uncertainty; determinism (equal on repeat); `is_hard_reasoning`/`compose_request` routing both tiers; the real `FakeLLMGateway` falls back to the default plan (placeholder IDs don't match). Plus one `@pytest.mark.asyncio` end-to-end test seeding `market_daily` and running `run_coach_pipeline` with the fake gateway (mirror `tests/test_precedent.py` via `async_session_maker()`), asserting a `BlessedRecommendation` is returned with zero network/credentials.
 
 **Acceptance Criteria:**
 - Given a user initiates a decision, when `run_coach_pipeline` executes `retrieve → compose → validate → surface`, then it returns a `BlessedRecommendation` — the LLM's when it validates against the retrieved evidence, otherwise the strategy-backed default plan — and never raises or returns nothing (FR7, AD-4).
 - Given the LLM path fails (gateway error, unparseable output, or gate rejection), when `surface` runs, then the deterministic code-authored default plan is returned, citing the retrieved evidence with a plain coach-voice reason and an explicit uncertainty — proving the coach is never a dead-end.
 - Given the default configuration (fake gateway, offline), when the whole suite runs, then all coach-pipeline ACs pass with zero credentials and zero network, and prompt assembly / evidence citation remain owned by the Coach Engine (the Gateway stays generic over schema).
 
+## Spec Change Log
+
+## Review Triage Log
+
+### 2026-07-28 — Review pass
+- intent_gap: 0
+- bad_spec: 0
+- patch: 6: (high 0, medium 1, low 5)
+- defer: 0
+- reject: 7
+- addressed_findings:
+  - `[medium]` `[patch]` `surface` swallowed every exception and fell back silently — added a structured `logger.warning` (provider + error type only; no secrets/tokens) on the fallback branch, matching `find_precedent`'s degrade-warning style, so a coach that has quietly stopped making special calls is observable.
+  - `[low]` `[patch]` Moved `import json` from inside `_render_evidence` to module top.
+  - `[low]` `[patch]` Annotated `run_coach_pipeline(session: AsyncSession, ...)` to match collaborators (`find_precedent`).
+  - `[low]` `[patch]` Strengthened the LLM-primary test with a call-count spy (`gateway.calls == 1`), proving the gateway is actually consulted rather than relying on an `action_label` inequality proxy.
+  - `[low]` `[patch]` Added a test that an LLM-emitted `order_intent` is carried through to the blessed recommendation unchanged (spec: carry through unvalidated; semantics deferred to 4.6).
+  - `[low]` `[patch]` Added coverage for `compose_request` `amount`/`as_of` rendering (both explicit values and the default phrasings).
+
 ## Design Notes
 
-The fake gateway is schema-driven and emits placeholder evidence IDs (`"fake-evidence[0]"`) that never match a real retrieved ID, so offline the LLM path *always* fails the gate and the default plan is returned. This is by design: the same fallback that guarantees FR7 on gateway/validation failure also delivers "no confident special call → default plan," and it makes never-a-dead-end fully testable offline. The LLM happy path is proven with a tiny in-test `LLMGateway` stub that cites the real retrieved ID (dependency injection via `run_coach_pipeline(..., gateway=...)`).
+The fake gateway is schema-driven and emits placeholder evidence IDs (e.g. `"fake-evidence"`) that never match a real retrieved ID, so offline the LLM path *always* fails the gate and the default plan is returned. This is by design: the same fallback that guarantees FR7 on gateway/validation failure also delivers "no confident special call → default plan," and it makes never-a-dead-end fully testable offline. The LLM happy path is proven with a tiny in-test `LLMGateway` stub that cites the real retrieved ID (dependency injection via `run_coach_pipeline(..., gateway=...)`).
 
-The `surface` broad-`Exception` catch is the intentional resilience boundary — it wraps only the LLM-happy-path (compose/complete/map/validate); `build_default_plan` runs outside the `try`, so a bug there still surfaces rather than being masked.
+`LLMGateway.complete` is **synchronous**, so `surface` is a plain function; `run_coach_pipeline` is `async` only because `find_precedent` is. The `surface` broad-`except Exception` catch is the intentional resilience boundary — it wraps only the LLM-happy-path (compose/complete/map/validate); `build_default_plan` runs *outside* the `try`, so a bug there still surfaces rather than being masked. `RecommendationValidationError` is a subclass of `Exception`, so a single `except Exception` covers both gate rejection and gateway failure.
 
 ```python
 def surface(gateway, decision, retrieved):
     try:
         resp = gateway.complete(compose_request(decision, retrieved))
         return validate_recommendation(recommendation_from_output(resp.output), retrieved)
-    except (RecommendationValidationError, Exception):
+    except Exception:
         return build_default_plan(retrieved)   # never a dead-end
 ```
 
@@ -96,3 +118,25 @@ def surface(gateway, decision, retrieved):
 - `cd ballast/backend && python -m pytest tests/test_coach_pipeline.py -q` -- expected: all pass; pure tests need no network/credentials; the one async test needs only the local DB (no network, no Anthropic key).
 - `cd ballast/backend && python -m pytest -q` -- expected: full suite still green (no regressions; was 184 passing after 4.2).
 - `cd ballast/backend && python -c "import coach.pipeline, sys; assert 'anthropic' not in sys.modules"` -- expected: exits 0 (the pipeline never imports the SDK on the fake/default path).
+
+## Auto Run Result
+
+Status: done
+
+**Summary of implemented change:** Added the Coach Engine pipeline (`retrieve → compose → validate → surface`) that turns a user `CoachDecision` into a blessed, surfaceable recommendation and guarantees the coach is *never a dead-end* (FR7/AD-4). Retrieval goes only through `find_precedent`, the LLM call only through the injected `LLMGateway` (default `get_llm_gateway()`), and blessing only through `validate_recommendation` — no owner is bypassed. When the LLM path fails for any reason (gateway error, unparseable output, or gate rejection — including the fake adapter's non-matching placeholder IDs), `surface` returns a deterministic, code-authored, strategy-backed default plan that cites every retrieved evidence ID with plain coach-voice reasoning and an explicit uncertainty. Model-tier routing (`hard_reasoning`) is a pure function of the retrieved set. All ACs pass offline with the fake gateway (zero network, zero credentials).
+
+**Files changed:**
+- `ballast/backend/coach/pipeline.py` (NEW) — `CoachDecision`, `COACH_SYSTEM_PROMPT`, `is_hard_reasoning`, `compose_request`, `build_default_plan`, `surface`, `async run_coach_pipeline`; structured warning on the fallback branch.
+- `ballast/backend/coach/__init__.py` (MODIFIED) — exports the pipeline's public entrypoints.
+- `ballast/backend/tests/test_coach_pipeline.py` (NEW) — 16 tests covering every I/O-matrix row (LLM-valid surfaced, order_intent pass-through, gate-reject/gateway-raise → default, determinism, hard-reasoning routing both tiers, compose_request schema/prompt/evidence + amount/as_of, real FakeLLMGateway → default) plus two `@pytest.mark.asyncio` DB-backed end-to-end tests.
+
+**Review findings breakdown:** 6 patches applied (1 medium — structured logging on the silent-fallback branch; 5 low — `import json` to module top, `session: AsyncSession` annotation, LLM-primary call-count spy, order_intent pass-through test, compose_request amount/as_of coverage). 0 deferred. 7 rejected: `build_default_plan([])`/empty-retrieved crash (unreachable — `find_precedent` guarantees ≥1 and a zero-evidence recommendation *must* be un-blessable); DB-error escaping `run_coach_pipeline` (infra outage ≠ dead-end; masking it would violate the trust invariant); prompt ID-vs-stats isolation (gate structurally rejects non-matching IDs); weak determinism fixture (holds by frozen-dataclass value equality); wide public exports (spec-mandated); order_intent symbol cross-check and `symbol=None` (deferred to 4.6 / typed `str`).
+
+**Verification performed:**
+- `python -m pytest tests/test_coach_pipeline.py -q` → 16 passed.
+- `python -m pytest -q` (full suite) → 200 passed, 0 failed (was 184 after 4.2; +14 in the initial implementation, +2 from review patches; zero regressions).
+- `python -c "import coach.pipeline, sys; assert 'anthropic' not in sys.modules"` → exit 0 (no SDK import on the fake/default path).
+
+**Follow-up review recommendation:** false — the review patches were a handful of localized, low-consequence fixes plus one additive observability log; no behavior/API/security/data change to the core logic.
+
+**Residual risks:** The "never a dead-end" guarantee rests on `find_precedent` always returning ≥1 record (documented invariant); the pipeline does not independently defend an empty retrieved set (by design — a zero-evidence recommendation cannot be blessed). Order-intent *semantics* validation and any symbol cross-check are intentionally left to Story 4.6.
