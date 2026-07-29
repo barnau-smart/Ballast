@@ -125,6 +125,14 @@ class BrokerPort(ABC):
     idempotency key. Callers keep depending on one interface.
     """
 
+    #: The brokerage this adapter places through — a contract-level attribute
+    #: (``"fake"`` / ``"schwab"``). Every concrete adapter sets it; declaring it
+    #: on the port makes ``broker.provider`` a guaranteed part of the contract
+    #: rather than an incidental attribute, so placement-time integrity can assert
+    #: the authenticated session's ``provider`` matches the placing adapter
+    #: (Story 4.8, AD-11). It is non-secret metadata, never a token.
+    provider: str
+
     @abstractmethod
     def authorization_url(self, state: str) -> str:
         """Return the brokerage authorization URL the user should visit.

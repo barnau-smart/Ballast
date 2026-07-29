@@ -34,7 +34,7 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from api.deps import RECONNECT_MESSAGE
+from api.deps import RECONNECT_MESSAGE, require_live_broker_session
 from brokers.crypto import encrypt_token
 from brokers.factory import get_broker
 from brokers.fake_adapter import FAKE_FILL_PRICE, FakeBrokerAdapter
@@ -45,7 +45,12 @@ from brokers.port import (
     OrderStatus,
     PortfolioSnapshot,
 )
-from coach.execution import OrderScopeError, execute_approved_order
+from brokers.session import BrokerageSession
+from coach.execution import (
+    OrderScopeError,
+    SessionIntegrityError,
+    execute_approved_order,
+)
 from coach.recommendation import OrderIntent, OrderSide
 from db.connection import get_connection
 from db.models import BrokerageToken, MarketDaily, PortfolioCache
@@ -190,6 +195,16 @@ def _live() -> datetime:
 
 def _expired() -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=1)
+
+
+def _live_session(provider: str = "fake") -> BrokerageSession:
+    """A live, provider-matched brokerage session for direct execution-owner calls.
+
+    Placement-time integrity (Story 4.8) requires the owner be handed a live
+    session whose ``provider`` matches the placing adapter. The fake adapters used
+    in these tests expose ``provider = "fake"``, so the default matches.
+    """
+    return BrokerageSession(state="live", expires_at=_live(), provider=provider)
 
 
 class _SpyAdapter(BrokerPort):
@@ -419,6 +434,78 @@ def test_approve_unlinked_session_returns_409_no_order(client):
         _delete_user(email)
 
 
+def test_approve_provider_mismatch_returns_409_no_order(client):
+    # (c, 4.8) The entry gate PASSES with a live session, but that session's
+    # provider ("schwab") disagrees with the placing adapter ("fake"). The
+    # execution owner's placement-time integrity check must refuse: calm 409
+    # RECONNECT_MESSAGE, broker never touched. Override require_live_broker_session
+    # directly (approve() depends on it by name) so the entry gate returns a
+    # live-but-mismatched session; the fake spy proves the broker stays untouched.
+    email = _unique_email()
+    spy = _SpyAdapter()  # provider == "fake"
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    client.app.dependency_overrides[require_live_broker_session] = (
+        lambda: _live_session(provider="schwab")
+    )
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            headers=headers,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        assert spy.calls == []  # broker NEVER called on a provider mismatch
+        assert spy.status_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        client.app.dependency_overrides.pop(require_live_broker_session, None)
+        _delete_user(email)
+
+
+def test_approve_live_matched_session_places_once_and_reconciles(client):
+    # (d, 4.8 regression) The happy path is unregressed by the integrity gate: a
+    # live, provider-matched session + in-scope intent still places EXACTLY once
+    # and reconciles per 4.7. A scripted `timeout` placement reconciles to filled,
+    # proving both the single-place and the 4.7 reconciliation survive 4.8.
+    email = _unique_email()
+    placement = OrderOutcome(
+        status=OrderStatus.TIMEOUT, filled_qty=Decimal("0"), avg_price=None
+    )
+    reconciled = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+        broker_ref="scripted-ref",
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "filled"  # reconciled true state (4.7)
+        assert len(adapter.calls) == 1  # placed EXACTLY once (no double-place)
+        assert len(adapter.status_calls) == 1  # reconciled once
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
 def test_approve_unauthenticated_returns_401(client):
     # (e) no token → 401 before the handler; no scope built, no broker call.
     spy = _SpyAdapter()
@@ -590,7 +677,9 @@ async def test_execution_owner_out_of_scope_never_calls_broker():
     spy = _SpyAdapter()
     intent = OrderIntent(symbol="AAPL", side=OrderSide.BUY, amount=Decimal("500"))
     with pytest.raises(OrderScopeError):
-        await execute_approved_order(intent, broker=spy)
+        await execute_approved_order(
+            intent, broker=spy, broker_session=_live_session()
+        )
     assert spy.calls == []
 
 
@@ -599,11 +688,73 @@ async def test_execution_owner_places_exactly_once_and_mints_key():
     # (a, unit level) the sole caller places exactly once and mints a key.
     spy = _SpyAdapter()
     intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
-    outcome = await execute_approved_order(intent, broker=spy)
+    outcome = await execute_approved_order(
+        intent, broker=spy, broker_session=_live_session()
+    )
     assert outcome.status is OrderStatus.FILLED
     assert len(spy.calls) == 1
     _, key = spy.calls[0]
     assert key  # minted
+
+
+@pytest.mark.asyncio
+async def test_execution_owner_non_live_session_raises_broker_untouched():
+    # (a, 4.8 unit) a non-live (expired) broker_session → SessionIntegrityError
+    # BEFORE any broker call; neither place_order nor get_order_status is reached.
+    spy = _SpyAdapter()
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+    session = BrokerageSession(
+        state="expired", expires_at=_expired(), provider="fake"
+    )
+    with pytest.raises(SessionIntegrityError):
+        await execute_approved_order(intent, broker=spy, broker_session=session)
+    assert spy.calls == []
+    assert spy.status_calls == []
+
+
+@pytest.mark.asyncio
+async def test_execution_owner_provider_mismatch_raises_broker_untouched():
+    # (b, 4.8 unit) a LIVE session whose provider ("schwab") disagrees with the
+    # placing adapter ("fake") → SessionIntegrityError; broker never touched.
+    spy = _SpyAdapter()  # provider == "fake"
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+    session = _live_session(provider="schwab")
+    with pytest.raises(SessionIntegrityError):
+        await execute_approved_order(intent, broker=spy, broker_session=session)
+    assert spy.calls == []
+    assert spy.status_calls == []
+
+
+@pytest.mark.asyncio
+async def test_execution_owner_provider_match_is_case_whitespace_insensitive():
+    # (review patch, 4.8 unit) provider agreement is compared normalized: a live
+    # session whose stored provider differs only by case/whitespace (" FAKE ")
+    # from the adapter's ("fake") still MATCHES and places once — so a benign
+    # stored-provider casing drift never false-refuses a legitimate live session.
+    spy = _SpyAdapter()  # provider == "fake"
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+    session = _live_session(provider=" FAKE ")
+    outcome = await execute_approved_order(
+        intent, broker=spy, broker_session=session
+    )
+    assert outcome.status is OrderStatus.FILLED
+    assert len(spy.calls) == 1  # normalized match → placed exactly once
+
+
+@pytest.mark.asyncio
+async def test_execution_owner_integrity_before_scope():
+    # (e, 4.8 unit) integrity-before-scope: a non-live session AND an out-of-scope
+    # symbol → the integrity check fails FIRST (SessionIntegrityError, not
+    # OrderScopeError); the scope check is never reached and the broker untouched.
+    spy = _SpyAdapter()
+    intent = OrderIntent(symbol="AAPL", side=OrderSide.BUY, amount=Decimal("500"))
+    session = BrokerageSession(
+        state="expired", expires_at=_expired(), provider="fake"
+    )
+    with pytest.raises(SessionIntegrityError):
+        await execute_approved_order(intent, broker=spy, broker_session=session)
+    assert spy.calls == []
+    assert spy.status_calls == []
 
 
 @pytest.mark.parametrize("broker_method", [".place_order(", ".get_order_status("])
@@ -820,7 +971,9 @@ async def test_reconciliation_reuses_same_idempotency_key():
     adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
     intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
 
-    outcome = await execute_approved_order(intent, broker=adapter)
+    outcome = await execute_approved_order(
+        intent, broker=adapter, broker_session=_live_session()
+    )
 
     assert outcome.status is OrderStatus.FILLED
     assert len(adapter.calls) == 1
@@ -842,7 +995,9 @@ async def test_definitive_placement_never_reconciles_unit():
     adapter = _ScriptedAdapter(placement=placement)  # no reconciled outcome
     intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
 
-    outcome = await execute_approved_order(intent, broker=adapter)
+    outcome = await execute_approved_order(
+        intent, broker=adapter, broker_session=_live_session()
+    )
 
     assert outcome == placement
     assert len(adapter.calls) == 1

@@ -31,12 +31,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.deps import get_scope, require_live_broker_session
+from api.deps import RECONNECT_MESSAGE, get_scope, require_live_broker_session
 from brokers.factory import get_broker
 from brokers.port import BrokerPort, OrderOutcome
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
-from coach.execution import OrderScopeError, execute_approved_order
+from coach.execution import (
+    OrderScopeError,
+    SessionIntegrityError,
+    execute_approved_order,
+)
 from coach.pipeline import CoachDecision, run_coach_pipeline
 from coach.recommendation import OrderIntent, OrderSide
 from coach.validation import BlessedRecommendation
@@ -209,9 +213,14 @@ async def approve(
     (:func:`require_live_broker_session` raises the calm 409 reconnect response
     otherwise — no order attempted, AD-11). Delegates to the Coach Engine
     execution owner (the SOLE caller of the Broker Port); this handler never
-    calls ``broker.place_order`` directly (AD-7). An out-of-v1-scope intent
-    raises :class:`OrderScopeError`, mapped to a 422 through the app error
-    envelope BEFORE any broker call. Returns the reconciled order outcome (the
+    calls ``broker.place_order`` directly (AD-7). The execution owner re-asserts
+    placement-time integrity (Story 4.8): the session must still be live AND its
+    ``provider`` must match the placing adapter, else it raises
+    :class:`SessionIntegrityError`, mapped HERE to the same calm 409
+    ``RECONNECT_MESSAGE`` as the entry gate — the broker is never touched. An
+    out-of-v1-scope intent raises :class:`OrderScopeError`, mapped to a 422
+    through the app error envelope BEFORE any broker call. Returns the reconciled
+    order outcome (the
     true state, Story 4.7), money as decimal strings. Any of the five resolved
     statuses (``filled``/``partial``/``rejected``/``timeout``/``pending``) is
     returned at HTTP 200 with the honest body — a broker ``rejected``/``pending``
@@ -224,7 +233,15 @@ async def approve(
         amount=body.order_intent.amount,
     )
     try:
-        outcome = await execute_approved_order(intent, broker=broker)
+        outcome = await execute_approved_order(
+            intent, broker=broker, broker_session=broker_session
+        )
+    except SessionIntegrityError as exc:
+        # Session lapsed or provider mismatched at placement time; refuse with the
+        # same calm reconnect envelope as the entry gate — broker never touched.
+        raise HTTPException(
+            status_code=409, detail=RECONNECT_MESSAGE
+        ) from exc
     except OrderScopeError as exc:
         # Rejected before any broker call; surface through the app envelope.
         raise HTTPException(status_code=422, detail=str(exc)) from exc

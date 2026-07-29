@@ -83,7 +83,7 @@ development_status:
   4-5-self-destructive-move-warnings: done
   4-6-propose-and-approve-execution: done
   4-7-order-outcomes-reconciliation: done
-  4-8-approval-placement-integrity: backlog
+  4-8-approval-placement-integrity: done
   4-9-co-signed-immutable-decision-record: backlog
   4-10-decisions-history-replay: backlog
   epic-4-retrospective: optional

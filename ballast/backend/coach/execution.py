@@ -10,6 +10,14 @@ orders or reconciles them.
 
 What this owner guarantees:
 
+- **Placement-time session + provider integrity (Story 4.8, FR23/AD-11):** as its
+  FIRST action — before the v1-scope gate, key minting, or ``place_order`` — the
+  owner asserts the handed :class:`~brokers.session.BrokerageSession` is live AND
+  its ``provider`` matches the placing adapter's ``provider``. On either failure
+  it raises :class:`SessionIntegrityError` and the broker is NEVER touched (no
+  stale/partial order, no phantom key). This is a placement-time self-defense on
+  top of the request-entry live-session gate, not a replacement for it; the API
+  maps the error to the calm 409 reconnect envelope.
 - **v1 order scope (FR10/AD-7):** an order is placed only for a broad index
   fund/ETF (:func:`strategy.index_core.is_index_core` is true) with ``amount > 0``
   (``side`` is already foreclosed to buy/sell by :class:`~coach.recommendation.OrderSide`).
@@ -31,8 +39,8 @@ What this owner is NOT (deliberately deferred):
 
 - No wait-until-terminal poll: reconciliation is a SINGLE read; a still-``pending``
   state is surfaced honestly (Story 4.7 scope).
-- No approval→placement session-integrity or cross-request key reuse (Story 4.8);
-  the live-session gate is enforced upstream at request time (AD-11).
+- No cross-request persisted idempotency key (Story 4.9); the placement-time
+  session + provider integrity check lands HERE as of Story 4.8.
 - No decision-record persistence, co-sign, or snapshot (Story 4.9): this places
   the order, reconciles it, and returns the outcome; it writes nothing.
 """
@@ -43,6 +51,7 @@ import uuid
 from dataclasses import replace
 
 from brokers.port import BrokerPort, OrderOutcome, OrderStatus
+from brokers.session import BrokerageSession
 from coach.recommendation import OrderIntent
 from strategy.index_core import is_index_core
 
@@ -66,6 +75,19 @@ class OrderScopeError(ValueError):
     """
 
 
+class SessionIntegrityError(ValueError):
+    """Raised when the brokerage session cannot back a placement (FR23/AD-11).
+
+    Signalled when the handed :class:`~brokers.session.BrokerageSession` is NOT
+    live, OR its ``provider`` does not match the placing adapter's ``provider``.
+    This is checked as the FIRST action in :func:`execute_approved_order` —
+    BEFORE the v1-scope gate, key minting, or any ``place_order`` call — so the
+    Broker Port is NEVER reached on an integrity failure: no stale/partial order,
+    no phantom idempotency key. The API layer maps it to the same calm 409
+    reconnect envelope the request-entry live-session gate uses.
+    """
+
+
 def mint_idempotency_key() -> str:
     """Mint a fresh client idempotency key for a single execution.
 
@@ -79,14 +101,20 @@ async def execute_approved_order(
     order_intent: OrderIntent,
     *,
     broker: BrokerPort,
+    broker_session: BrokerageSession,
     idempotency_key: str | None = None,
 ) -> OrderOutcome:
-    """Validate v1 scope, place the approved order, then reconcile the outcome.
+    """Assert session integrity, validate v1 scope, place, then reconcile.
 
     The sole caller of both :meth:`~brokers.port.BrokerPort.place_order` and
-    :meth:`~brokers.port.BrokerPort.get_order_status` (AD-7). Validates the v1
-    order scope (:func:`~strategy.index_core.is_index_core` on the symbol and
-    ``amount > 0``; ``side`` is guaranteed buy/sell by
+    :meth:`~brokers.port.BrokerPort.get_order_status` (AD-7). As its FIRST action
+    it asserts placement-time integrity (Story 4.8, FR23/AD-11): the handed
+    ``broker_session`` must be live AND its ``provider`` must match the placing
+    ``broker``'s ``provider``, raising :class:`SessionIntegrityError` on either
+    failure BEFORE the scope gate, key mint, or any broker call — so the broker is
+    NEVER touched on an integrity failure (integrity runs before scope). It then
+    validates the v1 order scope (:func:`~strategy.index_core.is_index_core` on
+    the symbol and ``amount > 0``; ``side`` is guaranteed buy/sell by
     :class:`~coach.recommendation.OrderSide`), raising :class:`OrderScopeError`
     on any violation BEFORE the broker is called. On a passing intent it mints an
     idempotency key (unless one is supplied), awaits a single ``place_order``,
@@ -99,6 +127,21 @@ async def execute_approved_order(
     yet be sent raw to the broker. The ``amount`` gate rejects non-finite values
     (``NaN``/``Inf``) as well as non-positive ones, since ``NaN <= 0`` is False.
     """
+    # Placement-time integrity FIRST (before scope/key/place_order): the session
+    # must be live and its provider must match the placing adapter, else refuse
+    # without ever touching the broker (Story 4.8, FR23/AD-11). Providers are
+    # compared case/whitespace-insensitively and via getattr so a stored-provider
+    # casing drift, a None on either side, or a misconfigured adapter missing
+    # ``provider`` refuses with the calm 409 rather than a raw AttributeError 500
+    # — the placer never places on doubt.
+    session_provider = (broker_session.provider or "").strip().lower()
+    adapter_provider = (getattr(broker, "provider", None) or "").strip().lower()
+    if not broker_session.is_live or session_provider != adapter_provider:
+        raise SessionIntegrityError(
+            "Your brokerage connection needs a quick reconnect before this order "
+            "can go through."
+        )
+
     normalized_symbol = (order_intent.symbol or "").strip().upper()
     if not is_index_core(normalized_symbol):
         raise OrderScopeError(
