@@ -90,6 +90,13 @@ COACH_SYSTEM_PROMPT = (
     "cannot promise. Past precedent never guarantees a future outcome.\n"
     "4. Always give plain-English reasoning for your recommendation; never a "
     "black box.\n"
+    "5. Teach as you go: your reasoning must explain, in plain English, the "
+    "principle and mechanics behind the recommended action tied to THIS decision "
+    "— why it works, not just what to do (for example, why consistent index "
+    "investing compounds over time, or why this is not market timing). Lead with "
+    "the immediate why, then layer in the deeper lesson so the reader can keep "
+    "reading without being interrupted. Stay patient and warm; never lecture, "
+    "and never use jargon, hype, or alarm.\n"
     "When there is no confident special call, the honest recommendation is to "
     "stick to the plan and make the regular contribution."
 )
@@ -168,16 +175,28 @@ def build_default_plan(retrieved: Sequence[EvidenceRecord]) -> BlessedRecommenda
     candidate = Recommendation(
         action_label="Stick to your plan: make your regular contribution",
         reasoning=(
-            "There's no confident special call here, and that's okay. The steady, "
-            "boring move — keeping to your plan and making your regular "
-            "contribution — is what tends to serve long-term investors best. "
-            "Reacting to short-term noise usually costs more than it helps, so the "
-            "honest recommendation is to stay the course."
+            "There's no confident special call here, and that's okay — the honest "
+            "move is to stick to your plan and make your regular contribution. "
+            "Here's why that works, not just what to do. The principle is simple: "
+            "time in the market tends to beat timing it. Nobody, including me, can "
+            "reliably predict the short-term swings, so trying to jump in and out "
+            "means guessing right twice — when to leave and when to return — and "
+            "getting either wrong usually costs more than staying put ever would. "
+            "The mechanics are just as steady: making the same regular "
+            "contribution on a schedule means you keep buying through both the "
+            "high days and the low days, and those steady buys compound quietly "
+            "over the years into most of your long-term growth. So the boring, "
+            "consistent move — this is deliberately not market timing — is the one "
+            "that tends to serve long-term investors best. Reacting to short-term "
+            "noise feels productive, but it usually just adds cost and stress "
+            "without improving the outcome, which is exactly why staying the "
+            "course is the recommendation."
         ),
         evidence=tuple(record.id for record in retrieved),
         uncertainties=(
             "Markets can stay volatile longer than anyone expects, and past "
-            "patterns never guarantee a future outcome.",
+            "patterns never guarantee a future outcome — staying invested "
+            "cannot promise a positive return.",
         ),
         order_intent=None,
     )

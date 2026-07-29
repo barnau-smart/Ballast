@@ -1,4 +1,5 @@
-"""Story 4.3 tests — the Coach pipeline & default-plan fallback (FR7/AD-4).
+"""Story 4.3 + 4.4 tests — the Coach pipeline, default-plan fallback (FR7/AD-4),
+and just-in-time teaching in the single ``reasoning`` field (FR18).
 
 These tests run with ZERO credentials and ZERO network. The pure/offline tests
 build in-memory ``EvidenceRecord`` fixtures and small ``LLMGateway`` stubs; the
@@ -14,6 +15,12 @@ They walk every row of the spec's I/O & Edge-Case Matrix:
   - Hard-reasoning routing → True for an EVENT_PRECEDENT, False for STRATEGY-only
   - End-to-end (offline) → run_coach_pipeline returns a BlessedRecommendation
     (the default plan, since the real FakeLLMGateway cannot cite real IDs)
+
+Story 4.4 (FR18) rows — teaching lives in the one ``reasoning`` field:
+  - Default-plan reasoning teaches the principle + mechanics (not a bare directive)
+  - COACH_SYSTEM_PROMPT carries the FR18 teaching directive for the LLM path
+  - LLM teaching reasoning is surfaced verbatim (no post-processing added by 4.4)
+  - AC3 canary → no new Recommendation field and no schema change under FR18
 """
 
 from __future__ import annotations
@@ -228,6 +235,107 @@ def test_default_plan_works_with_single_strategy_record():
     retrieved = (_strategy_record(),)
     blessed = build_default_plan(retrieved)
     assert tuple(e.id for e in blessed.evidence) == ("strat-0001",)
+
+
+# --- FR18: just-in-time teaching (one reasoning field) ------------------------
+
+
+def test_default_plan_reasoning_teaches_principle_and_mechanics():
+    # FR18: the default-plan reasoning must TEACH the principle + mechanics of
+    # staying the course (the "why it works"), not merely say "stick to your plan".
+    retrieved = (_strategy_record(), _event_record())
+    blessed = build_default_plan(retrieved)
+    text = blessed.reasoning.lower()
+
+    # It still blesses and stays well-formed.
+    assert isinstance(blessed, BlessedRecommendation)
+    # References the mechanics: time-in-market vs timing, and steady contributions.
+    assert "time in the market" in text
+    assert "timing" in text
+    assert "market timing" in text
+    assert "compound" in text
+    assert "contribution" in text
+    # Materially longer than a bare directive (it teaches, it doesn't just direct).
+    assert len(blessed.reasoning) > len(blessed.action_label) * 4
+    assert len(blessed.reasoning) > 400
+    # Still cites every retrieved ID, order preserved, with no order intent.
+    assert tuple(e.id for e in blessed.evidence) == ("strat-0001", "ep-0002")
+    assert blessed.order_intent is None
+    # Preserves ≥1 non-blank explicit uncertainty.
+    assert len(blessed.uncertainties) >= 1
+    assert any(u.strip() for u in blessed.uncertainties)
+
+
+def test_compose_request_system_prompt_carries_fr18_teaching_directive():
+    # FR18: the LLM-path teaching directive lives in the composed system prompt.
+    retrieved = (_strategy_record(), _event_record())
+    system = compose_request(_decision(), retrieved).system
+    lowered = system.lower()
+    assert "principle and mechanics" in lowered
+    assert "not market timing" in lowered
+    # It directs teaching tied to THIS decision, layered (immediate why first).
+    assert "this decision" in lowered
+    assert "lead with the immediate why" in lowered
+
+
+def test_llm_teaching_reasoning_is_surfaced_verbatim_not_default():
+    # A stub emitting teaching-shaped reasoning citing a REAL retrieved ID is
+    # surfaced (not the default), with its reasoning carried through verbatim.
+    retrieved = (_strategy_record(), _event_record())
+    teaching = (
+        "Staying invested here fits your plan. The principle is that consistent "
+        "index investing compounds over time, and this is not market timing — "
+        "you keep buying through the dips, which is where much of the long-run "
+        "return comes from."
+    )
+
+    class _TeachingGateway(LLMGateway):
+        provider = "test-teaching"
+
+        def complete(self, request):  # noqa: D401 - test stub
+            return LLMResponse(
+                output={
+                    "action_label": "Keep to your plan and stay invested",
+                    "reasoning": teaching,
+                    "evidence": ["ep-0002"],
+                    "uncertainties": ["Recovery timing is genuinely uncertain."],
+                },
+                model="test-model",
+                provider=self.provider,
+            )
+
+    blessed = surface(_TeachingGateway(), _decision(), retrieved)
+    assert isinstance(blessed, BlessedRecommendation)
+    # It's the LLM's recommendation, not the default plan.
+    assert blessed != build_default_plan(retrieved)
+    assert blessed.action_label == "Keep to your plan and stay invested"
+    # Teaching reasoning carried through verbatim.
+    assert blessed.reasoning == teaching
+    assert tuple(e.id for e in blessed.evidence) == ("ep-0002",)
+
+
+def test_teaching_adds_no_new_field_or_schema_change():
+    # AC3 canary: FR18 teaching lives in the single existing ``reasoning`` field.
+    # Story 4.4 must add NO new Recommendation field and NO schema change — this
+    # pins that central negative guarantee so a future FR18-branded widening fails.
+    from coach.recommendation import (
+        RECOMMENDATION_OUTPUT_SCHEMA,
+        Recommendation,
+    )
+
+    assert set(RECOMMENDATION_OUTPUT_SCHEMA["required"]) == {
+        "action_label",
+        "reasoning",
+        "evidence",
+        "uncertainties",
+    }
+    assert set(Recommendation.__dataclass_fields__) == {
+        "action_label",
+        "reasoning",
+        "evidence",
+        "uncertainties",
+        "order_intent",
+    }
 
 
 # --- Determinism --------------------------------------------------------------
