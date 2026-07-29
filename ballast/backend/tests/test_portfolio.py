@@ -396,6 +396,13 @@ class _FetchFailsAdapter(BrokerPort):
     def fetch_portfolio(self) -> PortfolioSnapshot:
         raise RuntimeError("simulated broker fetch failure")
 
+    async def place_order(self, order_intent, *, idempotency_key):
+        # Not exercised by this test; the BrokerPort contract now requires it
+        # (Story 4.6). Delegate to the fake so the double stays a valid adapter.
+        return await FakeBrokerAdapter().place_order(
+            order_intent, idempotency_key=idempotency_key
+        )
+
 
 def test_link_survives_portfolio_fetch_failure(client):
     email = _unique_email()

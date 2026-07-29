@@ -15,7 +15,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import quote, urlencode
 
-from brokers.port import BrokerPort, BrokerTokens, Holding, PortfolioSnapshot
+from coach.recommendation import OrderIntent
+from brokers.port import (
+    BrokerPort,
+    BrokerTokens,
+    Holding,
+    OrderOutcome,
+    OrderStatus,
+    PortfolioSnapshot,
+)
 
 # A recognisable, obviously-fake authorization host so it can never be mistaken
 # for a real Schwab URL in logs or the UI.
@@ -50,6 +58,12 @@ FAKE_HOLDINGS: tuple[Holding, ...] = (
     ),
 )
 FAKE_CASH = Decimal("750.25")
+
+# A deterministic, obviously-fake fill price the fake adapter reports for every
+# placed order. No wall-clock, no market data, no randomness — so the same
+# order placed twice yields a byte-identical OrderOutcome (tests assert this).
+# Money is Decimal (never float).
+FAKE_FILL_PRICE = Decimal("100.00")
 
 # A fixed base ``as_of`` so reconcile-wins tests can drive older/newer snapshots
 # deterministically. Callers/tests advance it via ``as_of_offset``; the default
@@ -108,4 +122,26 @@ class FakeBrokerAdapter(BrokerPort):
             as_of=FAKE_AS_OF_BASE + self._as_of_offset,
             cash=FAKE_CASH,
             holdings=list(FAKE_HOLDINGS),
+        )
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        """Return a deterministic ``FILLED`` :class:`OrderOutcome` (no network).
+
+        Fully deterministic — NO wall-clock, NO randomness — so an identical
+        ``(order_intent, idempotency_key)`` always yields an equal (frozen)
+        outcome (tests assert this). The dollar ``amount`` is converted to a
+        non-negative share ``filled_qty`` at the fixed :data:`FAKE_FILL_PRICE`,
+        and ``broker_ref`` is derived stably from ``idempotency_key`` so the
+        reference round-trips without a wall-clock timestamp. The fake only ever
+        returns ``filled`` (partial/rejected/timeout/pending reconciliation is
+        Story 4.7). Never logs token/secret material.
+        """
+        filled_qty = order_intent.amount / FAKE_FILL_PRICE
+        return OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=filled_qty,
+            avg_price=FAKE_FILL_PRICE,
+            broker_ref=f"fake-order-{idempotency_key}",
         )

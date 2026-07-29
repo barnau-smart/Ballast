@@ -8,11 +8,15 @@ swapped without touching a single caller.
 AD-6: the Broker Port is the one owner of brokerage state. Nothing else in the
 codebase talks to a brokerage.
 
-Scope of THIS story (2.1): only the OAuth *linking* surface is defined here —
-``authorization_url`` and ``exchange_code``. The full Broker Port Contract
-(order placement, ``OrderOutcome``, ``get_order_status``, AD-13) arrives with
-execution in Epic 4. This interface is deliberately narrow and WILL extend
-then; do NOT add order/execution methods here.
+Scope history: Story 2.1 defined only the OAuth *linking* surface
+(``authorization_url`` / ``exchange_code``) plus the read (``fetch_portfolio``).
+Story 4.6 adds the execution contract: ``place_order`` returning a normalized
+:class:`OrderOutcome`. Reconciliation — ``get_order_status`` plus the
+partial/rejected/timeout/pending handling and idempotency retry-reuse — is
+**Story 4.7** and is deliberately NOT added here (``place_order`` returns a
+single ``OrderOutcome``; 4.6 does not poll, retry, or re-derive state). The
+:class:`OrderStatus` enum defines all five values now as the fixed contract, but
+4.6's fake adapter only ever returns ``filled``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
+
+from coach.recommendation import OrderIntent
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,41 @@ class PortfolioSnapshot:
     holdings: list[Holding] = field(default_factory=list)
 
 
+class OrderStatus(str, Enum):
+    """The closed set of normalized order outcome states (the fixed contract).
+
+    All five values are defined NOW as the durable contract even though Story
+    4.6 only ever produces ``FILLED``: the fake adapter returns ``filled`` and
+    no reconciliation exists yet. The remaining states
+    (``partial``/``rejected``/``timeout``/``pending``) are honestly reconciled
+    in **Story 4.7** via ``get_order_status`` — not here.
+    """
+
+    FILLED = "filled"
+    PARTIAL = "partial"
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+    PENDING = "pending"
+
+
+@dataclass(frozen=True)
+class OrderOutcome:
+    """The normalized result of a placed order (AD-13, broker-neutral).
+
+    ``status`` is an :class:`OrderStatus`; ``filled_qty`` and ``avg_price`` are
+    ``Decimal`` (NEVER binary float) — ``avg_price`` may be ``None`` when nothing
+    filled; ``broker_ref`` is the broker's stable reference for the order (or
+    ``None`` when the broker did not assign one). Frozen so an outcome is an
+    immutable value. Story 4.6 returns exactly one of these from
+    :meth:`BrokerPort.place_order`; polling/reconciliation is Story 4.7.
+    """
+
+    status: OrderStatus
+    filled_qty: Decimal
+    avg_price: Decimal | None = None
+    broker_ref: str | None = None
+
+
 class BrokerPort(ABC):
     """The abstract brokerage boundary — the only type callers depend on.
 
@@ -75,9 +117,10 @@ class BrokerPort(ABC):
     dev / test, zero credentials) and
     :class:`~brokers.schwab_adapter.SchwabAdapter` (real, credential-gated).
 
-    NOTE: this contract currently covers ONLY OAuth linking. Order execution
-    (``place_order`` / ``get_order_status`` / ``OrderOutcome``) is Epic 4 and
-    will be added to this same port so callers still depend on one interface.
+    This contract covers OAuth linking, the portfolio read, and — as of Story
+    4.6 — order placement (:meth:`place_order` → :class:`OrderOutcome`).
+    ``get_order_status`` and reconciliation are Story 4.7 and are deliberately
+    NOT on this port yet, so callers keep depending on one interface.
     """
 
     @abstractmethod
@@ -113,5 +156,26 @@ class BrokerPort(ABC):
         NOT an execution method — it places nothing — so it does not breach the
         "no order/execution methods here" note above (``place_order`` /
         ``OrderOutcome`` / ``get_order_status`` remain Epic 4).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        """Place an order for ``order_intent`` and return its :class:`OrderOutcome`.
+
+        The SINGLE execution write on the port (AD-7). It is called ONLY by the
+        Coach Engine's execution owner
+        (:func:`coach.execution.execute_approved_order`) — never by an API
+        handler directly and never on an expired session (the live-session gate
+        is enforced upstream, Story 4.6 / AD-11). ``idempotency_key`` is the
+        client-minted key carried on the request; its retry-reuse and
+        reconciliation via ``get_order_status`` are **Story 4.7** — 4.6 mints and
+        passes it, nothing more. Implementations must NOT poll, retry, or
+        re-derive state here; they return exactly one ``OrderOutcome``.
+
+        Money in the returned outcome is ``Decimal`` (never binary float). This
+        method never logs token/secret material.
         """
         raise NotImplementedError

@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from api.config import get_settings
-from brokers.port import BrokerPort, BrokerTokens, PortfolioSnapshot
+from brokers.port import BrokerPort, BrokerTokens, OrderOutcome, PortfolioSnapshot
+from coach.recommendation import OrderIntent
 
 # Schwab's OAuth authorize endpoint (used only to reconstruct the received-url
 # for the code exchange; the actual authorization_url is built by schwab-py).
@@ -141,6 +142,25 @@ class SchwabAdapter(BrokerPort):
             "Schwab portfolio fetch is not wired yet. The fake adapter is the "
             "tested path for Story 2.3; the real schwab-py positions/balances "
             "mapping lands when live Schwab access is available."
+        )
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        """Place a real Schwab order (network call) — CREDENTIAL-GATED stub.
+
+        Mirrors :meth:`fetch_portfolio`: the fake adapter is the default/tested
+        path (Story 4.6 is fake-first). The real schwab-py order-placement +
+        outcome-normalization mapping is deferred until the Schwab developer app
+        is approved — wiring it here without live creds/fixtures would be
+        untested code that could place a real, uncovered order. Fails loudly
+        with a configuration error, never silently returns a phantom fill.
+        """
+        self._require_configured()
+        raise SchwabNotConfiguredError(
+            "Schwab order placement is not wired yet. The fake adapter is the "
+            "tested path for Story 4.6; the real schwab-py order placement + "
+            "OrderOutcome mapping lands when live Schwab access is available."
         )
 
     @staticmethod

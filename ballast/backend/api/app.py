@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.brokerage import router as brokerage_router
+from api.coach import router as coach_router
 from api.config import get_settings
 from api.portfolio import router as portfolio_router
 from api.precedent import router as precedent_router
@@ -165,6 +166,11 @@ def create_app() -> FastAPI:
     # surface over the Precedent Engine (AD-3). Returns the AD-12 evidence shape
     # verbatim; the Coach surface renders it.
     app.include_router(precedent_router)
+
+    # Coach propose-and-approve (Story 4.6, FR8/FR9/FR10, AD-7/AD-11): the
+    # coach's first HTTP surface. /recommend proposes (degraded-ok, never
+    # executes); /approve executes through the Coach Engine on a live session.
+    app.include_router(coach_router)
 
     # --- Routes --------------------------------------------------------------
 
