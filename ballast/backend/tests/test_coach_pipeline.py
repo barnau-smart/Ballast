@@ -21,6 +21,22 @@ Story 4.4 (FR18) rows — teaching lives in the one ``reasoning`` field:
   - COACH_SYSTEM_PROMPT carries the FR18 teaching directive for the LLM path
   - LLM teaching reasoning is surfaced verbatim (no post-processing added by 4.4)
   - AC3 canary → no new Recommendation field and no schema change under FR18
+
+Story 4.5 (FR11) rows — self-destructive-move warnings that NEVER block, still
+one ``reasoning`` field, no new schema field / gate rule:
+  - Panic-sell (sell into a live drawdown) → default plan warns, still blesses,
+    cites all IDs, order_intent=None, ≥1 honest uncertainty
+  - Over-concentration (buy past the concentration ceiling of a PortfolioView) →
+    warning content in reasoning
+  - Oversized-lump (buy amount dwarfs the portfolio) → warning content in reasoning
+  - No rash move (plain buy, small/no amount, no/diversified portfolio) → NO
+    warning content (pre-4.5 behavior unchanged)
+  - Never-block canary → a detected move + a valid order_intent still yields a
+    blessed recommendation with order_intent intact and unchanged
+  - Prompt/request → COACH_SYSTEM_PROMPT carries the FR11 directive; a detected
+    warning surfaces as a risk signal in compose_request(...).user_content
+  - Determinism → equal warnings + equal frozen default plans for identical inputs
+  - No-new-field/no-schema-change canary
 """
 
 from __future__ import annotations
@@ -33,17 +49,22 @@ import pytest_asyncio
 
 from coach.pipeline import (
     COACH_SYSTEM_PROMPT,
+    CONCENTRATION_SHARE_CEILING,
+    OVERSIZED_LUMP_MULTIPLE,
     CoachDecision,
+    WarningKind,
     build_default_plan,
     compose_request,
+    detect_self_destructive_moves,
     is_hard_reasoning,
     run_coach_pipeline,
     surface,
 )
 from coach.recommendation import RECOMMENDATION_OUTPUT_SCHEMA, OrderSide
 from coach.validation import BlessedRecommendation
+from brokers.portfolio import PortfolioView
 from db.connection import get_connection
-from db.models import MarketDaily
+from db.models import MarketDaily, PortfolioCache
 from db.session import async_session_maker, engine
 from llm.fake_adapter import FakeLLMGateway
 from llm.port import LLMGateway, LLMResponse
@@ -77,6 +98,43 @@ def _event_record(rid: str = "ep-0002") -> EvidenceRecord:
 
 def _decision() -> CoachDecision:
     return CoachDecision(symbol="VTI", question="Should I keep investing?")
+
+
+# --- In-memory portfolio fixtures (no DB; unsaved ORM instances) -------------
+
+
+def _holding(symbol: str, market_value: Decimal) -> PortfolioCache:
+    """An unsaved PortfolioCache row for offline concentration/lump math."""
+    return PortfolioCache(
+        symbol=symbol,
+        quantity=Decimal("1"),
+        market_value=market_value,
+        cost_basis=market_value,
+        cash=Decimal("0"),
+        as_of=datetime(2026, 7, 28, tzinfo=timezone.utc),
+    )
+
+
+def _portfolio(
+    holdings: list[PortfolioCache], cash: Decimal = Decimal("0")
+) -> PortfolioView:
+    return PortfolioView(
+        holdings=holdings,
+        cash=cash,
+        as_of=datetime(2026, 7, 28, tzinfo=timezone.utc),
+    )
+
+
+def _diversified_portfolio() -> PortfolioView:
+    """A well-diversified portfolio: no single holding near the ceiling."""
+    return _portfolio(
+        [
+            _holding("VTI", Decimal("2000")),
+            _holding("BND", Decimal("2000")),
+            _holding("VXUS", Decimal("2000")),
+        ],
+        cash=Decimal("2000"),
+    )
 
 
 # --- Test gateway stubs ------------------------------------------------------
@@ -491,5 +549,237 @@ async def test_end_to_end_default_gateway_offline():
             blessed = await run_coach_pipeline(session, decision)
         assert isinstance(blessed, BlessedRecommendation)
         assert len(blessed.evidence) >= 1
+    finally:
+        _clean([SYM_E2E])
+
+
+# --- FR11: self-destructive-move warnings (never block, one reasoning field) --
+
+
+def test_panic_sell_default_plan_warns_still_blesses_cites_all():
+    # (a) side="sell" while a live drawdown (event-precedent) is present → the
+    # default plan warns about selling into a downturn, still blesses, cites all
+    # IDs, order_intent=None, ≥1 non-blank uncertainty. Never blocked.
+    retrieved = (_strategy_record(), _event_record())
+    decision = CoachDecision(symbol="VTI", question="Should I sell?", side="sell")
+    warnings = detect_self_destructive_moves(decision, retrieved)
+    assert any(w.kind is WarningKind.PANIC_SELL for w in warnings)
+
+    blessed = build_default_plan(retrieved, warnings)
+    text = blessed.reasoning.lower()
+    assert isinstance(blessed, BlessedRecommendation)
+    # Warns honestly about selling into a downturn and explains the risk.
+    assert "selling into a downturn" in text
+    assert "locks in the loss" in text
+    # Still blessed, cites every retrieved ID (order preserved), no order intent.
+    assert tuple(e.id for e in blessed.evidence) == ("strat-0001", "ep-0002")
+    assert blessed.order_intent is None
+    assert len(blessed.uncertainties) >= 1
+    assert any(u.strip() for u in blessed.uncertainties)
+
+
+def test_panic_sell_needs_no_portfolio_and_requires_live_drawdown():
+    # Panic-sell fires from side="sell" + an event-precedent, no portfolio needed;
+    # a sell with only a strategy record (no live drawdown) does NOT warn.
+    sell = CoachDecision(symbol="VTI", side="sell")
+    assert any(
+        w.kind is WarningKind.PANIC_SELL
+        for w in detect_self_destructive_moves(sell, (_strategy_record(), _event_record()))
+    )
+    assert detect_self_destructive_moves(sell, (_strategy_record(),)) == ()
+
+
+def test_over_concentration_produces_warning_content():
+    # (b) A buy that pushes this symbol past the concentration ceiling of total
+    # portfolio value → over-concentration warning content in the reasoning.
+    # Portfolio: 5000 in VTI already, 1000 cash → total 6000. Buy 5000 more of VTI
+    # → post 10000 / 11000 ≈ 0.91 > 0.40 ceiling.
+    portfolio = _portfolio([_holding("VTI", Decimal("5000"))], cash=Decimal("1000"))
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("5000"))
+    retrieved = (_strategy_record(),)
+    warnings = detect_self_destructive_moves(decision, retrieved, portfolio)
+    assert any(w.kind is WarningKind.OVER_CONCENTRATION for w in warnings)
+
+    blessed = build_default_plan(retrieved, warnings)
+    text = blessed.reasoning.lower()
+    assert "vti" in text
+    assert "outsized share" in text
+    assert blessed.order_intent is None
+    # A numeric threshold fired → the honest heuristic uncertainty is present.
+    assert any("heuristic" in u.lower() for u in blessed.uncertainties)
+
+
+def test_oversized_lump_produces_warning_content():
+    # (c) A buy whose amount dwarfs the portfolio value → oversized-lump warning.
+    # Portfolio total = 1000; buy 2000 (> 0.50 * 1000). Use a diversified symbol so
+    # concentration doesn't dominate the assertion (both may fire, that's fine).
+    portfolio = _portfolio(
+        [_holding("BND", Decimal("800"))], cash=Decimal("200")
+    )
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("2000"))
+    retrieved = (_strategy_record(),)
+    warnings = detect_self_destructive_moves(decision, retrieved, portfolio)
+    assert any(w.kind is WarningKind.OVERSIZED_LUMP for w in warnings)
+
+    blessed = build_default_plan(retrieved, warnings)
+    text = blessed.reasoning.lower()
+    assert "large next to your current" in text
+    assert blessed.order_intent is None
+    assert any("heuristic" in u.lower() for u in blessed.uncertainties)
+
+
+def test_no_rash_move_adds_no_warning_content():
+    # (d) A plain, sensible buy (small amount, diversified portfolio) adds NO
+    # warning content — behavior identical to pre-4.5.
+    portfolio = _diversified_portfolio()
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("100"))
+    retrieved = (_strategy_record(), _event_record())
+    warnings = detect_self_destructive_moves(decision, retrieved, portfolio)
+    assert warnings == ()
+    # The default plan is byte-for-byte the pre-4.5 (no-warning) plan.
+    assert build_default_plan(retrieved, warnings) == build_default_plan(retrieved)
+
+
+def test_no_side_and_no_portfolio_yields_no_warnings_backward_compatible():
+    # Backward compatibility: a CoachDecision with no side / no portfolio yields
+    # no warnings and the same default plan as before 4.5.
+    retrieved = (_strategy_record(), _event_record())
+    warnings = detect_self_destructive_moves(_decision(), retrieved, None)
+    assert warnings == ()
+    assert build_default_plan(retrieved, warnings) == build_default_plan(retrieved)
+
+
+def test_over_concentration_only_when_portfolio_provided():
+    # over-concentration / oversized-lump need a portfolio; without one, no warning.
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("100000"))
+    assert detect_self_destructive_moves(decision, (_strategy_record(),), None) == ()
+
+
+def test_never_block_canary_order_intent_carried_through_on_detected_move():
+    # (e) A detected self-destructive move + a gateway emitting a valid order_intent
+    # STILL yields a blessed recommendation with the order_intent intact and
+    # unchanged — a warning never refuses, blocks, or strips the intent (FR11).
+    retrieved = (_strategy_record(), _event_record())
+    decision = CoachDecision(symbol="VTI", question="Sell now?", side="sell")
+    warnings = detect_self_destructive_moves(decision, retrieved)
+    assert warnings  # a panic-sell was detected
+
+    gateway = _CitingGateway(
+        "ep-0002",
+        order_intent={"symbol": "VTI", "side": "sell", "amount": "500"},
+    )
+    blessed = surface(gateway, decision, retrieved, warnings)
+
+    assert isinstance(blessed, BlessedRecommendation)
+    # Not blocked: the LLM path was consulted and its recommendation surfaced.
+    assert gateway.calls == 1
+    assert blessed.action_label == "Buy the dip within your plan"
+    # order_intent carried through intact and unchanged.
+    assert blessed.order_intent is not None
+    assert blessed.order_intent.symbol == "VTI"
+    assert blessed.order_intent.side is OrderSide.SELL
+    assert blessed.order_intent.amount == Decimal("500")
+
+
+def test_compose_request_carries_fr11_directive_and_risk_signal():
+    # (f) The system prompt carries the FR11 "warn but never block" directive, and
+    # a detected warning surfaces as a risk signal in compose_request.user_content.
+    retrieved = (_strategy_record(), _event_record())
+    system = compose_request(_decision(), retrieved).system.lower()
+    assert "self-destructive" in system
+    assert "never refuse, block" in system
+    assert "you advise, the user decides" in system
+
+    decision = CoachDecision(symbol="VTI", side="sell")
+    warnings = detect_self_destructive_moves(decision, retrieved)
+    content = compose_request(decision, retrieved, warnings).messages[0].content
+    assert "self-destructive-move risks" in content.lower()
+    assert "selling into a downturn locks in the loss" in content.lower()
+    # No warnings → no risk-signal block (pre-4.5 request shape unchanged).
+    plain = compose_request(_decision(), retrieved).messages[0].content
+    assert "self-destructive-move risks" not in plain.lower()
+
+
+def test_detect_and_default_plan_are_deterministic_on_repeat():
+    # (g) Determinism: equal warnings for identical inputs, and two default plans
+    # built from the same warnings are equal (frozen).
+    portfolio = _portfolio([_holding("VTI", Decimal("5000"))], cash=Decimal("1000"))
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("5000"))
+    retrieved = (_strategy_record(),)
+    w1 = detect_self_destructive_moves(decision, retrieved, portfolio)
+    w2 = detect_self_destructive_moves(decision, retrieved, portfolio)
+    assert w1 == w2
+    assert build_default_plan(retrieved, w1) == build_default_plan(retrieved, w2)
+
+
+def test_warning_uncertainty_is_not_a_smuggled_benefit_claim():
+    # The heuristic uncertainty states a genuine unknown only — no favorable
+    # benefit claim smuggled into the FR14 uncertainty slot.
+    portfolio = _portfolio([_holding("VTI", Decimal("5000"))], cash=Decimal("1000"))
+    decision = CoachDecision(symbol="VTI", side="buy", amount=Decimal("5000"))
+    retrieved = (_strategy_record(),)
+    warnings = detect_self_destructive_moves(decision, retrieved, portfolio)
+    blessed = build_default_plan(retrieved, warnings)
+    heuristic = next(u for u in blessed.uncertainties if "heuristic" in u.lower())
+    low = heuristic.lower()
+    assert "not guarantees" in low
+    assert "cannot tell you what the market will do" in low
+
+
+def test_fr11_adds_no_new_field_or_schema_change():
+    # (h) No-new-field/no-schema-change canary: FR11 warnings live in the single
+    # existing ``reasoning`` field. Pin the schema required set and the
+    # Recommendation fields so a future FR11-branded widening fails loudly.
+    from coach.recommendation import RECOMMENDATION_OUTPUT_SCHEMA, Recommendation
+
+    assert set(RECOMMENDATION_OUTPUT_SCHEMA["required"]) == {
+        "action_label",
+        "reasoning",
+        "evidence",
+        "uncertainties",
+    }
+    assert set(Recommendation.__dataclass_fields__) == {
+        "action_label",
+        "reasoning",
+        "evidence",
+        "uncertainties",
+        "order_intent",
+    }
+
+
+def test_threshold_constants_are_decimal_not_float():
+    # Money/ratio thresholds are Decimal, never binary float (consistency AD).
+    assert isinstance(CONCENTRATION_SHARE_CEILING, Decimal)
+    assert isinstance(OVERSIZED_LUMP_MULTIPLE, Decimal)
+
+
+@pytest.mark.asyncio
+async def test_run_coach_pipeline_threads_portfolio_into_fr11_warning():
+    # The public-entrypoint seam (what Story 4.6 will call): run_coach_pipeline
+    # must thread the optional portfolio snapshot through detection into the
+    # surfaced recommendation. A concentrated buy + the offline fake gateway
+    # (which falls to the default plan) surfaces the over-concentration warning
+    # end to end; the same call with NO portfolio surfaces no warning — proving
+    # the portfolio→detect→surface wiring is real, both directions.
+    _clean([SYM_E2E])
+    _insert_series(SYM_E2E, [Decimal("100"), Decimal("92")])
+    try:
+        portfolio = _portfolio(
+            [_holding(SYM_E2E, Decimal("5000"))], cash=Decimal("1000")
+        )
+        decision = CoachDecision(symbol=SYM_E2E, side="buy", amount=Decimal("5000"))
+        async with async_session_maker() as session:
+            blessed = await run_coach_pipeline(
+                session, decision, gateway=FakeLLMGateway(), portfolio=portfolio
+            )
+        assert isinstance(blessed, BlessedRecommendation)
+        assert "outsized share" in blessed.reasoning.lower()
+        assert blessed.order_intent is None
+        # Same entrypoint, no portfolio → no threshold warning surfaced.
+        async with async_session_maker() as session:
+            plain = await run_coach_pipeline(
+                session, decision, gateway=FakeLLMGateway()
+            )
+        assert "outsized share" not in plain.reasoning.lower()
     finally:
         _clean([SYM_E2E])

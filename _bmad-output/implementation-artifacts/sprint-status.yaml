@@ -80,7 +80,7 @@ development_status:
   4-2-recommendation-object-validation-gate: done
   4-3-coach-pipeline-default-plan-fallback: done
   4-4-just-in-time-teaching: done
-  4-5-self-destructive-move-warnings: backlog
+  4-5-self-destructive-move-warnings: done
   4-6-propose-and-approve-execution: backlog
   4-7-order-outcomes-reconciliation: backlog
   4-8-approval-placement-integrity: backlog

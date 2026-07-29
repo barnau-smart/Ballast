@@ -36,10 +36,12 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Sequence
+from enum import Enum
+from typing import Literal, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from brokers.portfolio import PortfolioView
 from coach.recommendation import (
     RECOMMENDATION_OUTPUT_SCHEMA,
     Recommendation,
@@ -62,14 +64,20 @@ class CoachDecision:
     benchmark ``VTI``); ``question`` is the free-text ask ("should I invest $X?");
     ``amount`` is the optional contribution size as :class:`~decimal.Decimal`
     (NEVER binary float); ``as_of`` pins the precedent lookup to a calendar date
-    (``None`` = latest data day, never the wall clock). Frozen so a decision is an
-    immutable value.
+    (``None`` = latest data day, never the wall clock); ``side`` is the optional
+    direction of the action the user is contemplating (``"buy"``/``"sell"``, or
+    ``None`` when unstated) — the FR11 self-destructive-move detector reads it.
+    Frozen so a decision is an immutable value.
+
+    ``side`` defaults to ``None`` so a pre-4.5 ``CoachDecision`` is fully
+    backward-compatible (no side → no warnings, identical behavior).
     """
 
     symbol: str = DEFAULT_BENCHMARK
     question: str = ""
     amount: Decimal | None = None
     as_of: date | None = None
+    side: Literal["buy", "sell"] | None = None
 
 
 #: The coach-voice system prompt (owned by the Coach Engine, not the Gateway).
@@ -97,9 +105,163 @@ COACH_SYSTEM_PROMPT = (
     "the immediate why, then layer in the deeper lesson so the reader can keep "
     "reading without being interrupted. Stay patient and warm; never lecture, "
     "and never use jargon, hype, or alarm.\n"
+    "6. If the request flags a potentially self-destructive move (for example "
+    "selling into a downturn, concentrating too much in one holding, or "
+    "committing a lump sum that dwarfs the portfolio), warn honestly and explain "
+    "the risk in plain, calm English, then leave the decision to the user. Never "
+    "refuse, block, or override the user's choice, and never be alarmist — you "
+    "advise, the user decides.\n"
     "When there is no confident special call, the honest recommendation is to "
     "stick to the plan and make the regular contribution."
 )
+
+
+# --- FR11 self-destructive-move detection (deterministic, pure) ---------------
+
+#: Over-concentration ceiling: a single post-trade holding taking more than this
+#: share of total portfolio value (holdings market value + cash) is flagged as
+#: over-concentrated. 0.40 is a coach heuristic — one position past ~40% of the
+#: whole portfolio carries meaningful single-name risk for a beginner whose plan
+#: is broad diversification. Tunable; NOT a guarantee. Decimal, never float.
+CONCENTRATION_SHARE_CEILING: Decimal = Decimal("0.40")
+
+#: Oversized-lump multiple: a single buy whose amount exceeds this multiple of
+#: total portfolio value is flagged as an oversized lump. 0.50 is a coach
+#: heuristic — a one-shot contribution larger than half the existing portfolio
+#: is a big, lumpy bet whose timing risk is worth naming (spreading it out is
+#: often calmer). Tunable; NOT a guarantee. Decimal, never float.
+OVERSIZED_LUMP_MULTIPLE: Decimal = Decimal("0.50")
+
+
+class WarningKind(str, Enum):
+    """The closed set of FR11 self-destructive-move signals (v1).
+
+    ``PANIC_SELL`` — selling into a live drawdown; ``OVER_CONCENTRATION`` — a buy
+    that would push one holding past the concentration ceiling of portfolio value;
+    ``OVERSIZED_LUMP`` — a buy whose amount dwarfs the portfolio. These are honest
+    warnings the coach explains; they NEVER block (FR11).
+    """
+
+    PANIC_SELL = "panic-sell"
+    OVER_CONCENTRATION = "over-concentration"
+    OVERSIZED_LUMP = "oversized-lump"
+
+
+@dataclass(frozen=True)
+class MoveWarning:
+    """A single deterministic FR11 warning descriptor (frozen, comparable).
+
+    ``kind`` is the :class:`WarningKind`; ``risk`` is a short, plain-English,
+    calm sentence naming the risk (embedded verbatim into the composed request's
+    ``user_content`` so the LLM can warn, and folded into the code-authored
+    default-plan reasoning). ``from_threshold`` marks warnings that fired from a
+    numeric heuristic (concentration/lump) so the default plan can add the
+    honest "these are heuristics, not guarantees" uncertainty.
+    """
+
+    kind: WarningKind
+    risk: str
+    from_threshold: bool = False
+
+
+def _total_portfolio_value(portfolio: PortfolioView) -> Decimal:
+    """Total portfolio value = sum of holding market values + cash (Decimal)."""
+    return sum(
+        (h.market_value for h in portfolio.holdings), start=Decimal("0")
+    ) + portfolio.cash
+
+
+def detect_self_destructive_moves(
+    decision: CoachDecision,
+    retrieved: Sequence[EvidenceRecord],
+    portfolio: PortfolioView | None = None,
+) -> tuple[MoveWarning, ...]:
+    """Detect FR11 self-destructive moves — PURE and deterministic (no I/O).
+
+    Returns a tuple of :class:`MoveWarning` descriptors for:
+
+    - **panic-sell:** ``decision.side == "sell"`` AND a live drawdown is present
+      (any retrieved record is an :attr:`~precedent.EvidenceKind.EVENT_PRECEDENT`).
+      No portfolio needed.
+    - **over-concentration:** ``decision.side == "buy"`` AND, given a
+      ``portfolio``, the post-trade share of ``decision.symbol`` would exceed
+      :data:`CONCENTRATION_SHARE_CEILING` of total portfolio value. Only when a
+      portfolio is provided.
+    - **oversized-lump:** ``decision.side == "buy"`` AND ``decision.amount``
+      exceeds :data:`OVERSIZED_LUMP_MULTIPLE` of total portfolio value. Only when
+      a portfolio is provided and ``amount`` is not ``None``.
+
+    No wall-clock, no randomness, no network: identical
+    ``(decision, retrieved, portfolio)`` → identical output. Money is
+    :class:`~decimal.Decimal` throughout, never binary float. These are honest
+    warnings only — the caller NEVER blocks on them (FR11).
+    """
+    warnings: list[MoveWarning] = []
+
+    if decision.side == "sell" and any(
+        r.kind is EvidenceKind.EVENT_PRECEDENT for r in retrieved
+    ):
+        warnings.append(
+            MoveWarning(
+                kind=WarningKind.PANIC_SELL,
+                risk=(
+                    "Selling into a downturn locks in the loss and takes you out "
+                    "of the recovery the record shows tends to follow."
+                ),
+            )
+        )
+
+    if decision.side == "buy" and portfolio is not None:
+        total_value = _total_portfolio_value(portfolio)
+        if total_value > 0:
+            existing_symbol_value = sum(
+                (
+                    h.market_value
+                    for h in portfolio.holdings
+                    if h.symbol == decision.symbol
+                ),
+                start=Decimal("0"),
+            )
+            amount = decision.amount or Decimal("0")
+            post_symbol_value = existing_symbol_value + amount
+            post_total_value = total_value + amount
+            # Post-trade share of this one holding vs. the whole portfolio.
+            if post_symbol_value > CONCENTRATION_SHARE_CEILING * post_total_value:
+                warnings.append(
+                    MoveWarning(
+                        kind=WarningKind.OVER_CONCENTRATION,
+                        risk=(
+                            f"This buy would leave {decision.symbol} as an "
+                            "outsized share of your portfolio, so a single "
+                            "holding's swings would drive most of your results."
+                        ),
+                        from_threshold=True,
+                    )
+                )
+
+            if (
+                decision.amount is not None
+                and decision.amount > OVERSIZED_LUMP_MULTIPLE * total_value
+            ):
+                warnings.append(
+                    MoveWarning(
+                        kind=WarningKind.OVERSIZED_LUMP,
+                        risk=(
+                            "This contribution is large next to your current "
+                            "portfolio, so investing it all at one moment leans "
+                            "heavily on the timing of that single day."
+                        ),
+                        from_threshold=True,
+                    )
+                )
+
+    return tuple(warnings)
+
+
+def _render_warnings(warnings: Sequence[MoveWarning]) -> str:
+    """Render detected warnings as a calm, human-readable risk signal block."""
+    lines = [f"- {w.risk}" for w in warnings]
+    return "\n".join(lines)
 
 
 def is_hard_reasoning(retrieved: Sequence[EvidenceRecord]) -> bool:
@@ -121,14 +283,20 @@ def _render_evidence(retrieved: Sequence[EvidenceRecord]) -> str:
 
 
 def compose_request(
-    decision: CoachDecision, retrieved: Sequence[EvidenceRecord]
+    decision: CoachDecision,
+    retrieved: Sequence[EvidenceRecord],
+    warnings: Sequence[MoveWarning] = (),
 ) -> LLMRequest:
     """Compose the structured :class:`~llm.port.LLMRequest` (compose stage).
 
     The user message embeds the decision and each retrieved record (via its
     JSON-safe ``to_dict()``), so the LLM sees exactly the IDs it may cite. The
     request always carries :data:`RECOMMENDATION_OUTPUT_SCHEMA`, the coach-voice
-    :data:`COACH_SYSTEM_PROMPT`, and a deterministic ``hard_reasoning`` flag. Pure:
+    :data:`COACH_SYSTEM_PROMPT`, and a deterministic ``hard_reasoning`` flag.
+
+    When ``warnings`` are detected (FR11), a calm, human-readable risk-signal
+    block is embedded into ``user_content`` so the LLM can warn about the move
+    per the system prompt's FR11 rule — the coach advises, never blocks. Pure:
     no I/O, no LLM call, no wall-clock.
     """
     amount_line = (
@@ -141,12 +309,21 @@ def compose_request(
         if decision.as_of is not None
         else "As of: latest available data"
     )
+    warning_block = (
+        "\nPotentially self-destructive-move risks to warn about honestly "
+        "(explain the risk calmly, then leave the choice to the user — do NOT "
+        "refuse or block):\n"
+        f"{_render_warnings(warnings)}\n"
+        if warnings
+        else ""
+    )
     user_content = (
         "A user is asking for a recommendation.\n"
         f"Symbol: {decision.symbol}\n"
         f"Question: {decision.question or '(none given)'}\n"
         f"{amount_line}\n"
-        f"{as_of_line}\n\n"
+        f"{as_of_line}\n"
+        f"{warning_block}\n"
         "Retrieved evidence (cite only these IDs, never invent one):\n"
         f"{_render_evidence(retrieved)}\n\n"
         "Produce a recommendation as structured output conforming to the schema. "
@@ -161,43 +338,79 @@ def compose_request(
     )
 
 
-def build_default_plan(retrieved: Sequence[EvidenceRecord]) -> BlessedRecommendation:
+def build_default_plan(
+    retrieved: Sequence[EvidenceRecord],
+    warnings: Sequence[MoveWarning] = (),
+) -> BlessedRecommendation:
     """Build the deterministic, code-authored default plan and bless it (FR7/AD-4).
 
     The default plan is NOT LLM-derived: it cites EVERY retrieved evidence ID,
     carries non-empty coach-voice "stick to your plan" reasoning and ≥1 explicit
     uncertainty, sets ``order_intent=None``, and always passes the gate. Pure and
-    deterministic: identical retrieved set → equal (frozen) blessed object; no
-    I/O, no LLM, no wall-clock, no randomness. This is the "never a dead-end"
-    guarantee — always safe to return when the LLM path fails or offers no
-    confident special call.
+    deterministic: identical retrieved set (and ``warnings``) → equal (frozen)
+    blessed object; no I/O, no LLM, no wall-clock, no randomness. This is the
+    "never a dead-end" guarantee — always safe to return when the LLM path fails
+    or offers no confident special call.
+
+    When ``warnings`` are present (FR11), a calm, honest, coach-voice warning
+    LEADS the ``reasoning`` and ``action_label`` — explaining the risk of the
+    contemplated move in plain English, then leaving the decision to the user
+    (never blocking). If any warning fired from a numeric threshold, an honest
+    uncertainty is added noting those thresholds are coach heuristics, not
+    guarantees — kept in the uncertainty slot as a genuine unknown, NEVER a
+    smuggled benefit claim.
     """
+    plan_reasoning = (
+        "There's no confident special call here, and that's okay — the honest "
+        "move is to stick to your plan and make your regular contribution. "
+        "Here's why that works, not just what to do. The principle is simple: "
+        "time in the market tends to beat timing it. Nobody, including me, can "
+        "reliably predict the short-term swings, so trying to jump in and out "
+        "means guessing right twice — when to leave and when to return — and "
+        "getting either wrong usually costs more than staying put ever would. "
+        "The mechanics are just as steady: making the same regular "
+        "contribution on a schedule means you keep buying through both the "
+        "high days and the low days, and those steady buys compound quietly "
+        "over the years into most of your long-term growth. So the boring, "
+        "consistent move — this is deliberately not market timing — is the one "
+        "that tends to serve long-term investors best. Reacting to short-term "
+        "noise feels productive, but it usually just adds cost and stress "
+        "without improving the outcome, which is exactly why staying the "
+        "course is the recommendation."
+    )
+    uncertainties = [
+        "Markets can stay volatile longer than anyone expects, and past "
+        "patterns never guarantee a future outcome — staying invested "
+        "cannot promise a positive return.",
+    ]
+
+    action_label = "Stick to your plan: make your regular contribution"
+
+    if warnings:
+        # The warning LEADS — name the risk calmly, explain it, then hand the
+        # decision back to the user. This never blocks (FR11): the plan is still
+        # blessed and order_intent stays None.
+        risk_sentences = " ".join(w.risk for w in warnings)
+        warning_reasoning = (
+            "Before you act, here's an honest word of caution. " + risk_sentences
+            + " I'm not telling you not to — this is your call. I just want the "
+            "risk in plain view so you can weigh it calmly. With that said, "
+            "here's how I'd think about the steadier path. "
+        )
+        plan_reasoning = warning_reasoning + plan_reasoning
+        action_label = "A caution before you act — then, if you like, stick to your plan"
+        if any(w.from_threshold for w in warnings):
+            uncertainties.append(
+                "The thresholds behind this caution are coach heuristics, not "
+                "guarantees — they flag a risk worth weighing, but they cannot "
+                "tell you what the market will do."
+            )
+
     candidate = Recommendation(
-        action_label="Stick to your plan: make your regular contribution",
-        reasoning=(
-            "There's no confident special call here, and that's okay — the honest "
-            "move is to stick to your plan and make your regular contribution. "
-            "Here's why that works, not just what to do. The principle is simple: "
-            "time in the market tends to beat timing it. Nobody, including me, can "
-            "reliably predict the short-term swings, so trying to jump in and out "
-            "means guessing right twice — when to leave and when to return — and "
-            "getting either wrong usually costs more than staying put ever would. "
-            "The mechanics are just as steady: making the same regular "
-            "contribution on a schedule means you keep buying through both the "
-            "high days and the low days, and those steady buys compound quietly "
-            "over the years into most of your long-term growth. So the boring, "
-            "consistent move — this is deliberately not market timing — is the one "
-            "that tends to serve long-term investors best. Reacting to short-term "
-            "noise feels productive, but it usually just adds cost and stress "
-            "without improving the outcome, which is exactly why staying the "
-            "course is the recommendation."
-        ),
+        action_label=action_label,
+        reasoning=plan_reasoning,
         evidence=tuple(record.id for record in retrieved),
-        uncertainties=(
-            "Markets can stay volatile longer than anyone expects, and past "
-            "patterns never guarantee a future outcome — staying invested "
-            "cannot promise a positive return.",
-        ),
+        uncertainties=tuple(uncertainties),
         order_intent=None,
     )
     return validate_recommendation(candidate, retrieved)
@@ -207,6 +420,7 @@ def surface(
     gateway: LLMGateway,
     decision: CoachDecision,
     retrieved: Sequence[EvidenceRecord],
+    warnings: Sequence[MoveWarning] = (),
 ) -> BlessedRecommendation:
     """Return the surfaceable recommendation — the resilience boundary (FR7/AD-4).
 
@@ -216,9 +430,14 @@ def surface(
     :class:`~coach.validation.RecommendationValidationError` is an ``Exception``)
     it returns :func:`build_default_plan`. The default builder runs OUTSIDE the
     ``try``, so a bug there still surfaces rather than being silently masked.
+
+    Detected FR11 ``warnings`` are threaded into BOTH paths: the risk signal into
+    the composed request (LLM path) and the code-authored warning content into
+    the default plan (fallback). Warnings never block — any LLM-emitted
+    ``order_intent`` still carries through unchanged.
     """
     try:
-        response = gateway.complete(compose_request(decision, retrieved))
+        response = gateway.complete(compose_request(decision, retrieved, warnings))
         return validate_recommendation(
             recommendation_from_output(response.output), retrieved
         )
@@ -232,7 +451,7 @@ def surface(
             getattr(gateway, "provider", "unknown"),
             type(exc).__name__,
         )
-        return build_default_plan(retrieved)  # never a dead-end
+        return build_default_plan(retrieved, warnings)  # never a dead-end
 
 
 async def run_coach_pipeline(
@@ -240,6 +459,7 @@ async def run_coach_pipeline(
     decision: CoachDecision,
     *,
     gateway: LLMGateway | None = None,
+    portfolio: PortfolioView | None = None,
 ) -> BlessedRecommendation:
     """Run the full pipeline for a decision and return a blessed recommendation.
 
@@ -249,9 +469,17 @@ async def run_coach_pipeline(
     injectable for tests and the future ask→approve surface (4.6). Always returns
     a :class:`~coach.validation.BlessedRecommendation`; never raises for a missing
     special call.
+
+    ``portfolio`` is an OPTIONAL read-only snapshot the CALLER passes (the
+    pipeline never fetches a live portfolio, threads a :class:`~db.scope.Scope`,
+    or handles degraded/all-cash — that is Story 4.6's ask→approve concern). When
+    provided, it feeds :func:`detect_self_destructive_moves` so FR11 warnings
+    surface. Backward compatible: no ``side``/no ``portfolio`` → empty warnings →
+    identical behavior to pre-4.5.
     """
     retrieved = tuple(
         await find_precedent(session, symbol=decision.symbol, as_of=decision.as_of)
     )
+    warnings = detect_self_destructive_moves(decision, retrieved, portfolio)
     gateway = gateway or get_llm_gateway()
-    return surface(gateway, decision, retrieved)
+    return surface(gateway, decision, retrieved, warnings)
