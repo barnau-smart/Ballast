@@ -52,7 +52,12 @@ from brokers.factory import get_broker
 from brokers.port import BrokerPort, OrderOutcome
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
-from coach.decision_record import cosign, load_decision, record_proposal
+from coach.decision_record import (
+    cosign,
+    list_cosigned_decisions,
+    load_decision,
+    record_proposal,
+)
 from coach.execution import (
     OrderScopeError,
     SessionIntegrityError,
@@ -163,6 +168,47 @@ class ApproveResponse(BaseModel):
     broker_ref: str | None = None
 
 
+class DecisionSummaryOut(BaseModel):
+    """One co-signed decision in the history list (Story 4.10, read-only).
+
+    A compact summary for the Decisions surface: enough to label and order the
+    row without shipping the full snapshot. ``symbol`` comes from the EXECUTED
+    ``cosign_snapshot.order_intent`` (the offline seam: the proposed order_intent
+    can be ``None`` on the fake default plan, but a cosigned row always carries
+    an executed intent). ``co_signed_at`` is an ISO-8601 UTC string.
+    """
+
+    decision_id: str
+    action_label: str
+    symbol: str | None = None
+    co_signed_at: str
+    outcome_status: str
+
+
+class DecisionListResponse(BaseModel):
+    """The user's co-signed decisions, newest-first (Story 4.10)."""
+
+    decisions: list[DecisionSummaryOut]
+
+
+class DecisionDetailResponse(BaseModel):
+    """The verbatim replay payload for one co-signed decision (Story 4.10).
+
+    The persisted ``recommendation_snapshot`` and ``cosign_snapshot`` are passed
+    through as stored JSON (``dict`` passthrough) — NEVER recomputed, the pipeline
+    is NEVER re-run, and precedent is NEVER re-hydrated (AD-5). Timestamps are
+    serialized via ``.isoformat()``.
+    """
+
+    decision_id: str
+    schema_version: int
+    status: str
+    created_at: str
+    co_signed_at: str | None = None
+    recommendation_snapshot: dict
+    cosign_snapshot: dict | None = None
+
+
 # --- Serialization helpers ---------------------------------------------------
 
 
@@ -207,6 +253,26 @@ def _to_approve_response(outcome: OrderOutcome) -> ApproveResponse:
         filled_qty=_money_str(outcome.filled_qty),
         avg_price=None if outcome.avg_price is None else _money_str(outcome.avg_price),
         broker_ref=outcome.broker_ref,
+    )
+
+
+def _decision_summary_out(record) -> DecisionSummaryOut:
+    """Map a cosigned record to its history summary (verbatim snapshot reads).
+
+    ``action_label`` comes from the immutable ``recommendation_snapshot``; the
+    ``symbol`` and ``outcome_status`` come from the co-sign snapshot's executed
+    intent + reconciled outcome. Nothing is recomputed.
+    """
+    snapshot = record.recommendation_snapshot or {}
+    cosign_snapshot = record.cosign_snapshot or {}
+    order_intent = cosign_snapshot.get("order_intent") or {}
+    outcome = cosign_snapshot.get("outcome") or {}
+    return DecisionSummaryOut(
+        decision_id=str(record.id),
+        action_label=snapshot.get("action_label", ""),
+        symbol=order_intent.get("symbol"),
+        co_signed_at=record.co_signed_at.isoformat(),
+        outcome_status=outcome.get("status", ""),
     )
 
 
@@ -358,3 +424,59 @@ async def approve(
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
     return _to_approve_response(outcome)
+
+
+@router.get("/decisions", response_model=DecisionListResponse)
+async def list_decisions(
+    scope: Scope = Depends(get_scope),
+    session: AsyncSession = Depends(get_async_session),
+) -> DecisionListResponse:
+    """LIST the caller's co-signed decisions, newest-first (Story 4.10, FR16).
+
+    Read-only history over the immutable record: delegates to the Coach Engine's
+    sole reader (:func:`coach.decision_record.list_cosigned_decisions`), which
+    returns this user's ``cosigned`` rows ordered by ``co_signed_at`` desc through
+    the fail-closed :class:`~db.repository.ScopedRepository` (a foreign row is
+    never visible; ``proposed`` rows are excluded). This handler never queries the
+    model itself (AD-6) and NEVER re-runs the pipeline or recomputes anything
+    (AD-5). No broker/live-session dependency — history reads work in degraded mode.
+    """
+    records = await list_cosigned_decisions(scope=scope, session=session)
+    return DecisionListResponse(
+        decisions=[_decision_summary_out(record) for record in records]
+    )
+
+
+@router.get("/decisions/{decision_id}", response_model=DecisionDetailResponse)
+async def get_decision(
+    decision_id: UUID,
+    scope: Scope = Depends(get_scope),
+    session: AsyncSession = Depends(get_async_session),
+) -> DecisionDetailResponse:
+    """REPLAY one co-signed decision VERBATIM (Story 4.10, FR16, AD-5).
+
+    Loads the owned record through the sole reader
+    (:func:`coach.decision_record.load_decision`, per-user scoped — an unknown or
+    foreign id is invisible → ``None`` → 404). Returns the stored
+    ``recommendation_snapshot`` (action_label, reasoning, full evidence records,
+    uncertainties, proposed order_intent) and ``cosign_snapshot`` (executed
+    order_intent + reconciled outcome) EXACTLY as 4.9 persisted them (``dict``
+    passthrough), plus ``schema_version``/``status`` and the ISO-8601 timestamps.
+    Nothing is recomputed, the pipeline is not re-run, precedent is not
+    re-hydrated, and the record is not mutated. No broker/live-session dependency.
+    """
+    record = await load_decision(decision_id, scope=scope, session=session)
+    if record is None:
+        # Unknown or foreign decision_id → invisible under this user's scope.
+        raise HTTPException(status_code=404, detail="Decision record not found.")
+    return DecisionDetailResponse(
+        decision_id=str(record.id),
+        schema_version=record.schema_version,
+        status=record.status,
+        created_at=record.created_at.isoformat(),
+        co_signed_at=(
+            None if record.co_signed_at is None else record.co_signed_at.isoformat()
+        ),
+        recommendation_snapshot=record.recommendation_snapshot,
+        cosign_snapshot=record.cosign_snapshot,
+    )

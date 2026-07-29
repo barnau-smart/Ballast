@@ -122,6 +122,28 @@ async def load_decision(
     return await repo.get(decision_id)
 
 
+async def list_cosigned_decisions(
+    *,
+    scope: Scope,
+    session: AsyncSession,
+) -> list[DecisionRecord]:
+    """List THIS user's co-signed decision records, newest co-sign first (4.10).
+
+    Reads the owner's rows THROUGH the fail-closed
+    :class:`~db.repository.ScopedRepository` (a foreign row is never visible),
+    keeps only ``status == "cosigned"`` rows, and sorts by ``co_signed_at``
+    descending in Python (``ScopedRepository.list()`` is unordered; every
+    cosigned row has a ``co_signed_at`` set). Read-only — this SOLE reader never
+    mutates or re-derives a record (AD-5/AD-6). The CALLER owns any commit
+    (there is nothing to commit here).
+    """
+    repo = ScopedRepository(DecisionRecord, scope, session)
+    rows = await repo.list()
+    cosigned = [row for row in rows if row.status == "cosigned"]
+    cosigned.sort(key=lambda row: row.co_signed_at, reverse=True)
+    return cosigned
+
+
 def cosign(
     record: DecisionRecord,
     *,

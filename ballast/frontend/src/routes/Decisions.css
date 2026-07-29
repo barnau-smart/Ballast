@@ -1,0 +1,72 @@
+/*
+ * Decisions surface (Story 4.10) — the co-signed history list + inline replay.
+ * Calm, low-contrast list; the selected item is marked by a phosphor accent AND
+ * aria-pressed (color is never the sole signal). All values reference
+ * --ballast-* design tokens (no raw hex/px — stylelint enforced).
+ */
+
+.ballast-decisions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-24);
+}
+
+.ballast-decisions__calm {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-decisions__list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  margin: 0;
+  padding: 0;
+}
+
+.ballast-decisions__item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+  width: 100%;
+  text-align: left;
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-16);
+  cursor: pointer;
+}
+
+.ballast-decisions__item--active {
+  border-color: var(--ballast-color-phosphor);
+}
+
+.ballast-decisions__item:focus-visible {
+  outline-style: solid;
+  outline-width: var(--ballast-space-4);
+  outline-color: var(--ballast-color-phosphor-dim);
+}
+
+.ballast-decisions__item-label {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+}
+
+.ballast-decisions__item-meta {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+}
+
+.ballast-decisions__replay {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+}

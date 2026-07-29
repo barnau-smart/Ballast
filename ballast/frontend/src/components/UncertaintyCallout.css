@@ -1,0 +1,43 @@
+/*
+ * Uncertainty callout (epic UX) — violet, always present on a recommendation
+ * replay. Color comes exclusively from the --ballast-color-uncertainty token;
+ * it is never the sole signal (the heading + list text carry the meaning). All
+ * values reference --ballast-* design tokens (no raw hex/px — stylelint enforced).
+ */
+
+.ballast-uncertainty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-uncertainty);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-uncertainty__heading {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-uncertainty);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-uncertainty__list {
+  list-style: disc;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  margin: 0;
+  padding-left: var(--ballast-space-20);
+}
+
+.ballast-uncertainty__item {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+}

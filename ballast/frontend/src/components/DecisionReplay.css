@@ -1,0 +1,78 @@
+/*
+ * Decision replay panel (Story 4.10) — the verbatim coach-card sequence for a
+ * co-signed decision. Calm, honest, accessible. The co-sign zone is a dashed
+ * red-tinted divider (epic UX signature) — but a LOSS/amount is NEVER rendered
+ * red/pink; the outcome text is calm mono. All values reference --ballast-*
+ * design tokens (no raw hex/px — stylelint enforced).
+ */
+
+.ballast-replay {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-20);
+  background-color: var(--ballast-color-surface);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-24);
+}
+
+.ballast-replay__action {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-xl);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-replay__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-replay__heading {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-replay__reasoning {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-replay__cosign {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  border-style: dashed;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line-red);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-replay__cosign-heading {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-replay__cosign-line {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}

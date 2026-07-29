@@ -1432,3 +1432,234 @@ def test_decision_record_sole_writer_canary():
         "DecisionRecord(...) must be constructed ONLY by coach.decision_record "
         f"(AD-6). Unexpected constructors: {offenders}"
     )
+
+
+# =============================================================================
+# STORY 4.10 — DECISIONS HISTORY & REPLAY (read-only)
+# =============================================================================
+
+
+def _cosign_one(client: TestClient, headers: dict) -> str:
+    """Drive the happy-path recommend→approve so ONE decision is cosigned.
+
+    Returns the cosigned ``decision_id``. The caller must have a live session
+    linked (``_insert_token_sync(..., _live())``) and a broker override in place.
+    """
+    decision_id = _recommend_decision_id(client, headers)
+    resp = client.post(
+        "/api/coach/approve",
+        json={
+            "decision_id": decision_id,
+            "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return decision_id
+
+
+def test_list_decisions_cosigned_only_newest_first_owner_scoped(client):
+    # (a) GET /decisions returns ONLY this user's cosigned decisions, newest-first
+    # by co_signed_at; an un-cosigned proposed record is excluded.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        first_id = _cosign_one(client, headers)
+        second_id = _cosign_one(client, headers)
+        # A proposed-but-never-cosigned record must NOT appear in the list.
+        proposed_id = _recommend_decision_id(client, headers)
+
+        resp = client.get("/api/coach/decisions", headers=headers)
+        assert resp.status_code == 200, resp.text
+        decisions = resp.json()["decisions"]
+
+        ids = [d["decision_id"] for d in decisions]
+        assert set(ids) == {first_id, second_id}  # cosigned only
+        assert proposed_id not in ids  # proposed excluded
+        # Newest co-sign first: the second cosign precedes the first.
+        assert ids == [second_id, first_id]
+        # Summary shape: executed symbol + reconciled outcome status.
+        for d in decisions:
+            assert d["action_label"]
+            assert d["symbol"] == "VTI"
+            assert d["co_signed_at"]
+            assert d["outcome_status"] == "filled"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_list_decisions_empty_history(client):
+    # (a, empty) A user with no cosigned records gets an empty list, not an error.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = client.get("/api/coach/decisions", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["decisions"] == []
+    finally:
+        _delete_user(email)
+
+
+def test_detail_returns_verbatim_snapshots_and_metadata(client):
+    # (b) GET /decisions/{id} reproduces the persisted snapshots + metadata
+    # VERBATIM — the recommendation_snapshot equals what was persisted at
+    # /recommend time, and the cosign_snapshot carries the executed intent +
+    # reconciled outcome. Nothing recomputed.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    _clean_market([SYM])
+    _insert_series(SYM, [Decimal("100"), Decimal("92")])
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        rec = client.post(
+            "/api/coach/recommend",
+            json={"symbol": SYM, "question": "Should I invest now?"},
+            headers=headers,
+        )
+        decision_id = rec.json()["decision_id"]
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # The persisted row is the source of truth for "verbatim".
+        row = _decision_rows(uid)[0]
+
+        detail = client.get(f"/api/coach/decisions/{decision_id}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+
+        assert body["decision_id"] == decision_id
+        assert body["schema_version"] == row["schema_version"] == 1
+        assert body["status"] == "cosigned"
+        assert body["created_at"]
+        assert body["co_signed_at"]
+        # Snapshots returned EXACTLY as persisted (dict passthrough).
+        assert body["recommendation_snapshot"] == row["recommendation_snapshot"]
+        assert body["cosign_snapshot"] == row["cosign_snapshot"]
+        # The replay carries reasoning, evidence records, uncertainties.
+        snap = body["recommendation_snapshot"]
+        assert snap["reasoning"].strip()
+        assert len(snap["evidence"]) >= 1
+        for evidence in snap["evidence"]:
+            assert set(evidence) == {
+                "id",
+                "kind",
+                "statement",
+                "stats",
+                "source",
+                "as_of",
+            }
+        assert any(u.strip() for u in snap["uncertainties"])
+        # The cosign snapshot carries the executed intent + reconciled outcome.
+        assert body["cosign_snapshot"]["order_intent"] == {
+            "symbol": "VTI",
+            "side": "buy",
+            "amount": "500",
+        }
+        assert body["cosign_snapshot"]["outcome"]["status"] == "filled"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _clean_market([SYM])
+        _delete_user(email)
+
+
+def test_detail_unknown_decision_id_returns_404(client):
+    # (c) An unknown decision_id → 404; nothing leaked.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = client.get(
+            f"/api/coach/decisions/{uuid.uuid4()}", headers=headers
+        )
+        assert resp.status_code == 404, resp.text
+    finally:
+        _delete_user(email)
+
+
+def test_detail_foreign_decision_id_returns_404(client):
+    # (c, foreign) A decision_id owned by ANOTHER user is invisible → 404.
+    owner_email = _unique_email()
+    attacker_email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, owner_email)
+        owner_token = _login(client, owner_email)
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+        _insert_token_sync(_user_id_for(owner_email), _live())
+        foreign_id = _cosign_one(client, owner_headers)
+
+        _register(client, attacker_email)
+        attacker_token = _login(client, attacker_email)
+        attacker_headers = {"Authorization": f"Bearer {attacker_token}"}
+
+        resp = client.get(
+            f"/api/coach/decisions/{foreign_id}", headers=attacker_headers
+        )
+        assert resp.status_code == 404, resp.text  # foreign row invisible
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(owner_email)
+        _delete_user(attacker_email)
+
+
+def test_cross_user_isolation_list_and_detail(client):
+    # (d) User B's cosigned decision is ABSENT from A's list and 404 on A's detail.
+    a_email = _unique_email()
+    b_email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        # B cosigns one decision.
+        _register(client, b_email)
+        b_token = _login(client, b_email)
+        b_headers = {"Authorization": f"Bearer {b_token}"}
+        _insert_token_sync(_user_id_for(b_email), _live())
+        b_id = _cosign_one(client, b_headers)
+
+        # A cosigns their own.
+        _register(client, a_email)
+        a_token = _login(client, a_email)
+        a_headers = {"Authorization": f"Bearer {a_token}"}
+        _insert_token_sync(_user_id_for(a_email), _live())
+        a_id = _cosign_one(client, a_headers)
+
+        # A's list contains only A's decision — never B's.
+        resp = client.get("/api/coach/decisions", headers=a_headers)
+        assert resp.status_code == 200, resp.text
+        ids = [d["decision_id"] for d in resp.json()["decisions"]]
+        assert ids == [a_id]
+        assert b_id not in ids
+
+        # A cannot read B's decision by id.
+        detail = client.get(f"/api/coach/decisions/{b_id}", headers=a_headers)
+        assert detail.status_code == 404, detail.text
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(a_email)
+        _delete_user(b_email)

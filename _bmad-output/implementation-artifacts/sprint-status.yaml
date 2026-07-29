@@ -85,7 +85,7 @@ development_status:
   4-7-order-outcomes-reconciliation: done
   4-8-approval-placement-integrity: done
   4-9-co-signed-immutable-decision-record: done
-  4-10-decisions-history-replay: backlog
+  4-10-decisions-history-replay: done
   epic-4-retrospective: optional
 
   # Epic 5: Weekly Digest
