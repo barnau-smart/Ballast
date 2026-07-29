@@ -84,6 +84,14 @@ class FakeBrokerAdapter(BrokerPort):
 
     def __init__(self, *, as_of_offset: timedelta | None = None) -> None:
         self._as_of_offset = as_of_offset or timedelta(0)
+        # Per-instance idempotency store: idempotency_key -> recorded outcome.
+        # ``get_broker()`` returns a fresh adapter per request, so this store
+        # lives for exactly one approve flow (4.7 scope; cross-request key reuse
+        # needs the persisted decision record, Story 4.9). Making the fake
+        # idempotency-keyed is what makes "a timeout never double-places"
+        # structural: a re-place with a seen key returns the recorded order and
+        # records it only once (AD-13).
+        self._orders: dict[str, OrderOutcome] = {}
 
     def authorization_url(self, state: str) -> str:
         """Return a deterministic fake authorization URL embedding ``state``."""
@@ -129,19 +137,50 @@ class FakeBrokerAdapter(BrokerPort):
     ) -> OrderOutcome:
         """Return a deterministic ``FILLED`` :class:`OrderOutcome` (no network).
 
+        Idempotency-keyed (Story 4.7): if ``idempotency_key`` was already placed,
+        the recorded outcome is returned unchanged and NO second order is
+        recorded — a re-place with the same key never double-places (AD-13,
+        FR22/NFR3). Otherwise the deterministic ``FILLED`` outcome is computed,
+        recorded under the key, and returned.
+
         Fully deterministic — NO wall-clock, NO randomness — so an identical
         ``(order_intent, idempotency_key)`` always yields an equal (frozen)
         outcome (tests assert this). The dollar ``amount`` is converted to a
         non-negative share ``filled_qty`` at the fixed :data:`FAKE_FILL_PRICE`,
         and ``broker_ref`` is derived stably from ``idempotency_key`` so the
-        reference round-trips without a wall-clock timestamp. The fake only ever
-        returns ``filled`` (partial/rejected/timeout/pending reconciliation is
-        Story 4.7). Never logs token/secret material.
+        reference round-trips without a wall-clock timestamp. The fake's default
+        placement is always ``filled`` (unchanged from 4.6). Never logs
+        token/secret material.
         """
+        recorded = self._orders.get(idempotency_key)
+        if recorded is not None:
+            return recorded
         filled_qty = order_intent.amount / FAKE_FILL_PRICE
-        return OrderOutcome(
+        outcome = OrderOutcome(
             status=OrderStatus.FILLED,
             filled_qty=filled_qty,
             avg_price=FAKE_FILL_PRICE,
             broker_ref=f"fake-order-{idempotency_key}",
+        )
+        self._orders[idempotency_key] = outcome
+        return outcome
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        """Return the recorded :class:`OrderOutcome` for ``idempotency_key`` (no network).
+
+        The reconciliation read (Story 4.7, AD-13). A key that was placed on this
+        adapter returns its recorded outcome. An UNKNOWN key returns an honest
+        ``pending`` outcome (``filled_qty`` 0, no ``avg_price``, no
+        ``broker_ref``) — the fake NEVER invents a fill for an order it has no
+        record of. Fully deterministic (no wall-clock, no randomness). Never logs
+        token/secret material.
+        """
+        recorded = self._orders.get(idempotency_key)
+        if recorded is not None:
+            return recorded
+        return OrderOutcome(
+            status=OrderStatus.PENDING,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref=None,
         )

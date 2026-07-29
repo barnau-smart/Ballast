@@ -196,13 +196,16 @@ class _SpyAdapter(BrokerPort):
     """A fake broker that records how many times place_order was called.
 
     Wraps FakeBrokerAdapter's behavior but counts calls so tests can assert the
-    single-execution-path invariant (exactly once, or never) structurally.
+    single-execution-path invariant (exactly once, or never) structurally. As of
+    Story 4.7 it also records ``get_order_status`` calls so the reconciliation
+    invariants (same-key reuse, called only when indeterminate) can be asserted.
     """
 
     provider = "fake"
 
     def __init__(self) -> None:
         self.calls: list[tuple[OrderIntent, str]] = []
+        self.status_calls: list[str] = []
         self._delegate = FakeBrokerAdapter()
 
     def authorization_url(self, state: str) -> str:
@@ -221,6 +224,61 @@ class _SpyAdapter(BrokerPort):
         return await self._delegate.place_order(
             order_intent, idempotency_key=idempotency_key
         )
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        self.status_calls.append(idempotency_key)
+        return await self._delegate.get_order_status(idempotency_key)
+
+
+class _ScriptedAdapter(BrokerPort):
+    """A broker double that returns a SCRIPTED placement/reconciliation outcome.
+
+    Story 4.7 needs non-``FILLED`` statuses that the default FakeBrokerAdapter
+    never produces (its default placement is always ``filled``). This double lets
+    a test inject a specific ``place_order`` outcome and, independently, a
+    specific ``get_order_status`` outcome — while recording call args so the
+    reconciliation invariants (place_order at most once, same-key reuse,
+    get_order_status called only when indeterminate) are asserted structurally.
+    Fully offline/deterministic; injected via the ``get_broker`` DI override.
+    """
+
+    provider = "fake"
+
+    def __init__(
+        self,
+        *,
+        placement: OrderOutcome,
+        reconciled: OrderOutcome | None = None,
+    ) -> None:
+        self._placement = placement
+        self._reconciled = reconciled
+        self.calls: list[tuple[OrderIntent, str]] = []
+        self.status_calls: list[str] = []
+        self._delegate = FakeBrokerAdapter()
+
+    def authorization_url(self, state: str) -> str:
+        return self._delegate.authorization_url(state)
+
+    def exchange_code(self, code: str, state: str) -> BrokerTokens:
+        return self._delegate.exchange_code(code, state)
+
+    def fetch_portfolio(self) -> PortfolioSnapshot:
+        return self._delegate.fetch_portfolio()
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        self.calls.append((order_intent, idempotency_key))
+        return self._placement
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        self.status_calls.append(idempotency_key)
+        if self._reconciled is None:
+            raise AssertionError(
+                "get_order_status was called but no reconciled outcome was "
+                "scripted — the placement should have been definitive."
+            )
+        return self._reconciled
 
 
 # =============================================================================
@@ -548,10 +606,13 @@ async def test_execution_owner_places_exactly_once_and_mints_key():
     assert key  # minted
 
 
-def test_sole_execution_path_canary():
-    # (k) AD-7: the ONLY code that calls BrokerPort.place_order is the Coach
-    # Engine execution owner. Grep the source tree — no other module (API
-    # handlers, pipeline, portfolio) calls .place_order(.
+@pytest.mark.parametrize("broker_method", [".place_order(", ".get_order_status("])
+def test_sole_execution_path_canary(broker_method):
+    # (k) AD-7: the ONLY code that calls BrokerPort.place_order OR
+    # BrokerPort.get_order_status is the Coach Engine execution owner. Grep the
+    # source tree — no other module (API handlers, pipeline, portfolio) may call
+    # either. Story 4.7 extends the 4.6 canary to the reconciliation read so it
+    # cannot leak into the API handler or elsewhere.
     import pathlib
 
     backend = pathlib.Path(__file__).resolve().parent.parent
@@ -570,11 +631,11 @@ def test_sole_execution_path_canary():
         }:
             continue
         text = path.read_text(encoding="utf-8")
-        if ".place_order(" in text:
+        if broker_method in text:
             offenders.append(rel.as_posix())
     assert offenders == [], (
-        "place_order must be called ONLY by coach.execution (AD-7). "
-        f"Unexpected callers: {offenders}"
+        f"{broker_method.strip('.(')} must be called ONLY by coach.execution "
+        f"(AD-7). Unexpected callers: {offenders}"
     )
 
 
@@ -635,3 +696,207 @@ def test_approve_normalizes_symbol_before_placing(client):
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
+
+
+# =============================================================================
+# STORY 4.7 — OUTCOMES & RECONCILIATION
+# =============================================================================
+
+
+def _approve_with_scripted(client: TestClient, adapter: BrokerPort):
+    """Register+login+link a live session, then POST an in-scope approve through
+    the injected ``adapter``. Returns the raw response. Caller cleans up."""
+    email = _unique_email()
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+        resp = client.post(
+            "/api/coach/approve",
+            json={"order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"}},
+            headers=headers,
+        )
+        return resp
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+@pytest.mark.parametrize(
+    "placement_status, filled_qty, avg_price",
+    [
+        (OrderStatus.FILLED, Decimal("5"), Decimal("100.00")),
+        (OrderStatus.PARTIAL, Decimal("2"), Decimal("100.00")),
+        (OrderStatus.REJECTED, Decimal("0"), None),
+    ],
+)
+def test_approve_definitive_placement_surfaced_no_reconcile(
+    client, placement_status, filled_qty, avg_price
+):
+    # (a) A definitive placement (filled/partial/rejected) is surfaced honestly
+    # at HTTP 200, get_order_status is NOT called, and place_order is called once.
+    # A non-`filled` status is truthful data, not coerced into an error/phantom.
+    placement = OrderOutcome(
+        status=placement_status,
+        filled_qty=filled_qty,
+        avg_price=avg_price,
+        broker_ref="scripted-ref",
+    )
+    adapter = _ScriptedAdapter(placement=placement)
+    resp = _approve_with_scripted(client, adapter)
+
+    assert resp.status_code == 200, resp.text  # honest body, not an error envelope
+    body = resp.json()
+    assert body["status"] == placement_status.value
+    assert Decimal(body["filled_qty"]) == filled_qty
+    if avg_price is None:
+        assert body["avg_price"] is None  # never coerced into a phantom fill
+    else:
+        assert Decimal(body["avg_price"]) == avg_price
+    assert len(adapter.calls) == 1  # placed exactly once
+    assert adapter.status_calls == []  # definitive → no reconciliation read
+
+
+def test_approve_timeout_reconciles_to_filled(client):
+    # (b) A `timeout` placement reconciles once via get_order_status → filled;
+    # place_order is called EXACTLY once (no double-place), reconciled state wins.
+    placement = OrderOutcome(
+        status=OrderStatus.TIMEOUT, filled_qty=Decimal("0"), avg_price=None
+    )
+    reconciled = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+        broker_ref="scripted-ref",
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    resp = _approve_with_scripted(client, adapter)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "filled"  # the user sees the reconciled true state
+    assert Decimal(body["filled_qty"]) == Decimal("5")
+    assert len(adapter.calls) == 1  # placed at most once (no double-place)
+    assert len(adapter.status_calls) == 1  # reconciled exactly once
+
+
+def test_approve_pending_stays_pending_honestly(client):
+    # (c) A `pending` placement reconciles once; the broker still reports
+    # `pending`, and that honest state is surfaced (no phantom success, no
+    # re-place, no wait-loop).
+    placement = OrderOutcome(
+        status=OrderStatus.PENDING, filled_qty=Decimal("0"), avg_price=None
+    )
+    reconciled = OrderOutcome(
+        status=OrderStatus.PENDING, filled_qty=Decimal("0"), avg_price=None
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    resp = _approve_with_scripted(client, adapter)
+
+    assert resp.status_code == 200, resp.text  # honest body, not an error
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert Decimal(body["filled_qty"]) == Decimal("0")
+    assert body["avg_price"] is None
+    assert len(adapter.calls) == 1
+    assert len(adapter.status_calls) == 1  # reconciled once, no loop
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_reuses_same_idempotency_key():
+    # (d) Reuse-key reconciliation canary: on an indeterminate placement the
+    # engine calls place_order once and get_order_status once, and the key passed
+    # to BOTH is identical (so a timeout never double-places).
+    placement = OrderOutcome(
+        status=OrderStatus.TIMEOUT, filled_qty=Decimal("0"), avg_price=None
+    )
+    reconciled = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+
+    outcome = await execute_approved_order(intent, broker=adapter)
+
+    assert outcome.status is OrderStatus.FILLED
+    assert len(adapter.calls) == 1
+    assert len(adapter.status_calls) == 1
+    _, placed_key = adapter.calls[0]
+    reconciled_key = adapter.status_calls[0]
+    assert placed_key == reconciled_key  # SAME idempotency key reused
+
+
+@pytest.mark.asyncio
+async def test_definitive_placement_never_reconciles_unit():
+    # (a, unit level) a definitive placement returns unchanged and the engine
+    # never calls get_order_status.
+    placement = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+    )
+    adapter = _ScriptedAdapter(placement=placement)  # no reconciled outcome
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+
+    outcome = await execute_approved_order(intent, broker=adapter)
+
+    assert outcome == placement
+    assert len(adapter.calls) == 1
+    assert adapter.status_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fake_place_order_idempotent_by_key():
+    # (e) The fake is idempotency-keyed: re-placing with the SAME key returns the
+    # identical recorded outcome and records the order only once (no duplicate).
+    adapter = FakeBrokerAdapter()
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+
+    first = await adapter.place_order(intent, idempotency_key="dup-key")
+    second = await adapter.place_order(intent, idempotency_key="dup-key")
+
+    assert first == second  # identical recorded outcome
+    assert first is second  # literally the recorded object (recorded once)
+    assert len(adapter._orders) == 1  # only one order recorded
+
+
+@pytest.mark.asyncio
+async def test_fake_get_order_status_placed_vs_unknown_key():
+    # (f) get_order_status returns the recorded outcome for a placed key; an
+    # UNKNOWN key gets an honest `pending` outcome — the fake never invents a fill.
+    adapter = FakeBrokerAdapter()
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+
+    placed = await adapter.place_order(intent, idempotency_key="known-key")
+    status = await adapter.get_order_status("known-key")
+    assert status == placed  # recorded outcome round-trips
+
+    unknown = await adapter.get_order_status("never-placed")
+    assert unknown.status is OrderStatus.PENDING
+    assert unknown.filled_qty == Decimal("0")
+    assert unknown.avg_price is None
+    assert unknown.broker_ref is None  # never a phantom fill
+
+
+@pytest.mark.asyncio
+async def test_schwab_get_order_status_stub_raises_without_creds(monkeypatch):
+    # (g) The Schwab get_order_status stub always raises SchwabNotConfiguredError
+    # ("not wired"), mirroring place_order/fetch_portfolio — never a phantom fill.
+    from brokers.schwab_adapter import SchwabAdapter, SchwabNotConfiguredError
+
+    monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
+    monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://example.com/cb")
+    adapter = SchwabAdapter()  # constructs (creds present) but network-gated
+
+    with pytest.raises(SchwabNotConfiguredError, match="not wired"):
+        await adapter.get_order_status("k")
+
+    # Creds-missing path: strip the captured cred to exercise the guard directly.
+    adapter._client_id = ""
+    with pytest.raises(SchwabNotConfiguredError):
+        await adapter.get_order_status("k")

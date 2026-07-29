@@ -403,6 +403,11 @@ class _FetchFailsAdapter(BrokerPort):
             order_intent, idempotency_key=idempotency_key
         )
 
+    async def get_order_status(self, idempotency_key):
+        # Not exercised by this test; the BrokerPort contract now requires it
+        # (Story 4.7). Delegate to the fake so the double stays a valid adapter.
+        return await FakeBrokerAdapter().get_order_status(idempotency_key)
+
 
 def test_link_survives_portfolio_fetch_failure(client):
     email = _unique_email()

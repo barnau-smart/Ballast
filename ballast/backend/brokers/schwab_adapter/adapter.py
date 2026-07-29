@@ -163,6 +163,24 @@ class SchwabAdapter(BrokerPort):
             "OrderOutcome mapping lands when live Schwab access is available."
         )
 
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        """Reconcile a Schwab order by its client key — CREDENTIAL-GATED stub.
+
+        Mirrors :meth:`place_order` / :meth:`fetch_portfolio`: the fake adapter is
+        the default/tested path (Story 4.7 is fake-first). The real schwab-py
+        order-status lookup + outcome-normalization mapping is deferred until the
+        Schwab developer app is approved — wiring it here without live
+        creds/fixtures would be untested code. Fails loudly with a configuration
+        error, never silently returns a phantom fill.
+        """
+        self._require_configured()
+        raise SchwabNotConfiguredError(
+            "Schwab order-status reconciliation is not wired yet. The fake "
+            "adapter is the tested path for Story 4.7; the real schwab-py "
+            "get_order_status + OrderOutcome mapping lands when live Schwab "
+            "access is available."
+        )
+
     @staticmethod
     def _to_broker_tokens(token: dict) -> BrokerTokens:
         """Normalise schwab-py's token dict into :class:`BrokerTokens`."""

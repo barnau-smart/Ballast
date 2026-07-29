@@ -14,9 +14,12 @@ Two endpoints, mounted at ``/api/coach``:
   (:func:`coach.execution.execute_approved_order`) — the SOLE caller of the
   Broker Port. This handler NEVER calls the broker directly (AD-7).
 
-Money crosses the wire as decimal STRINGS (never binary float), consistent with
+Reconciliation of the order outcome (Story 4.7) is owned by the Coach Engine
+execution owner, not this handler: ``/approve`` returns whatever true state
+:func:`~coach.execution.execute_approved_order` reconciled. Money crosses the
+wire as decimal STRINGS (never binary float), consistent with
 ``RECOMMENDATION_OUTPUT_SCHEMA``. This module adds NO persistence (decision
-records are Story 4.9), NO reconciliation (Story 4.7), and NO UI.
+records are Story 4.9) and NO UI.
 """
 
 from __future__ import annotations
@@ -114,8 +117,10 @@ class ApproveRequest(BaseModel):
 
 
 class ApproveResponse(BaseModel):
-    """The placed-order :class:`~brokers.port.OrderOutcome` (unreconciled —
-    reconciliation is Story 4.7), money as strings."""
+    """The reconciled order :class:`~brokers.port.OrderOutcome` (the true state,
+    Story 4.7), money as strings. Any of the five statuses
+    (``filled``/``partial``/``rejected``/``timeout``/``pending``) is surfaced
+    honestly — a non-``filled`` outcome is truthful data, never an app error."""
 
     status: str
     filled_qty: str
@@ -206,8 +211,12 @@ async def approve(
     execution owner (the SOLE caller of the Broker Port); this handler never
     calls ``broker.place_order`` directly (AD-7). An out-of-v1-scope intent
     raises :class:`OrderScopeError`, mapped to a 422 through the app error
-    envelope BEFORE any broker call. Returns the placed-order outcome
-    (unreconciled; reconciliation is Story 4.7), money as decimal strings.
+    envelope BEFORE any broker call. Returns the reconciled order outcome (the
+    true state, Story 4.7), money as decimal strings. Any of the five resolved
+    statuses (``filled``/``partial``/``rejected``/``timeout``/``pending``) is
+    returned at HTTP 200 with the honest body — a broker ``rejected``/``pending``
+    is truthful data, NOT coerced into the error envelope and never a phantom
+    fill. Only scope/auth/session failures use the error envelope.
     """
     intent = OrderIntent(
         symbol=body.order_intent.symbol,
