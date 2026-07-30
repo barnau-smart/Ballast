@@ -77,6 +77,32 @@ class Settings(BaseSettings):
     # and the fake adapter needs no creds). The key is never logged.
     ANTHROPIC_API_KEY: str = ""
 
+    # --- Weekly digest / Story 5.1 -------------------------------------------
+
+    # Which email adapter the factory returns. "fake" for dev/test (no creds, no
+    # network, records messages in memory — the tested path), "smtp" when the
+    # SMTP_* + DIGEST_FROM_ADDRESS values below are set.
+    EMAIL_ADAPTER: str = "fake"
+
+    # SMTP transport settings for the real SmtpEmailAdapter. Empty by default —
+    # the adapter is code-complete but gated: using it without SMTP_HOST /
+    # DIGEST_FROM_ADDRESS raises a clear "email not configured" error (it never
+    # crashes at import, and the fake adapter needs none of these). The password
+    # is never logged.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # The From: address the weekly digest is sent from (required by the smtp
+    # adapter). Harmless dev default; set a real address in any environment that
+    # actually sends.
+    DIGEST_FROM_ADDRESS: str = "ballast@localhost"
+
+    # Base URL the one-click unsubscribe link is built on. The link points at the
+    # backend's GET /api/digest/unsubscribe. Defaults to local dev.
+    DIGEST_UNSUBSCRIBE_BASE_URL: str = "http://localhost:8000"
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

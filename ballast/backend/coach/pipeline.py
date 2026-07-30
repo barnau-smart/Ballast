@@ -37,11 +37,10 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from enum import Enum
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from brokers.portfolio import PortfolioView
 from coach.recommendation import (
     RECOMMENDATION_OUTPUT_SCHEMA,
     Recommendation,
@@ -52,6 +51,14 @@ from llm.factory import get_llm_gateway
 from llm.port import LLMGateway, LLMMessage, LLMRequest
 from precedent import EvidenceKind, EvidenceRecord, find_precedent
 from precedent.engine import DEFAULT_BENCHMARK
+
+if TYPE_CHECKING:
+    # Imported for type hints only. A runtime import here would create a cycle
+    # (brokers.portfolio -> brokers.port -> coach.recommendation -> coach ->
+    # coach.pipeline), which used to make brokers.portfolio un-importable as an
+    # entry point. `from __future__ import annotations` keeps every PortfolioView
+    # annotation below a lazy string, so no runtime import is needed.
+    from brokers.portfolio import PortfolioView
 
 logger = logging.getLogger("ballast.coach.pipeline")
 

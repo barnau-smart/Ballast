@@ -275,3 +275,53 @@ class DecisionRecord(OwnedEntityMixin, Base):
     )
     # The executed order_intent + reconciled OrderOutcome (what was EXECUTED).
     cosign_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class DigestPreference(OwnedEntityMixin, Base):
+    """A user's opt-in for the weekly email digest (table: ``digest_preference``).
+
+    Story 5.1 (FR21): the digest is Ballast's ONE sanctioned proactive touch, so
+    it is strictly opt-in and OFF by default. This is a per-user owned entity
+    (AD-10): reachable ONLY through the fail-closed ``ScopedRepository`` on the
+    request path, and enumerated by the SYSTEM-scope batch job (``digest.job``)
+    when it decides who to send to. Exactly one row per user
+    (``UniqueConstraint`` on ``owner_id``).
+
+    ``unsubscribe_token`` is an unguessable per-user secret minted at row
+    creation (``secrets.token_urlsafe``). It backs the one-click, UNAUTHENTICATED
+    unsubscribe link embedded in every email — the recipient must be able to opt
+    out without logging in.
+
+    ``last_sent_week`` is the idempotency marker: the ISO year-week
+    (``"YYYY-Www"``) of the most recent send. The weekly job skips any user whose
+    marker already equals the current week, so a re-run (or an overlapping run)
+    never double-sends. ``created_at``/``updated_at`` are tz-aware UTC.
+    """
+
+    __tablename__ = "digest_preference"
+    __table_args__ = (
+        UniqueConstraint("owner_id", name="uq_digest_preference_owner"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # Off by default — the digest is strictly opt-in (pull-not-push, FR21).
+    opted_in: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    # Per-user secret backing the unauthenticated one-click unsubscribe link.
+    unsubscribe_token: Mapped[str] = mapped_column(
+        String(length=64), nullable=False, unique=True, index=True
+    )
+
+    # ISO year-week ("YYYY-Www") of the last send — the job's idempotency guard.
+    # NULL until the first digest is sent to this user.
+    last_sent_week: Mapped[str | None] = mapped_column(
+        String(length=8), nullable=True
+    )
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

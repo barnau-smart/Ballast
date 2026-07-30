@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from api.brokerage import router as brokerage_router
 from api.coach import router as coach_router
 from api.config import get_settings
+from api.digest import router as digest_router
 from api.portfolio import router as portfolio_router
 from api.precedent import router as precedent_router
 from api.logging_config import configure_logging
@@ -171,6 +172,11 @@ def create_app() -> FastAPI:
     # coach's first HTTP surface. /recommend proposes (degraded-ok, never
     # executes); /approve executes through the Coach Engine on a live session.
     app.include_router(coach_router)
+
+    # Weekly digest opt-in (Story 5.1, FR21): the Settings toggle's
+    # authenticated GET/PUT preference endpoints plus the unauthenticated
+    # one-click unsubscribe link. Email is the only channel; nothing sends here.
+    app.include_router(digest_router)
 
     # --- Routes --------------------------------------------------------------
 

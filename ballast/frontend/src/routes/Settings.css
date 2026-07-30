@@ -1,0 +1,42 @@
+.ballast-digest {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-digest__copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+}
+
+.ballast-digest__title {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-digest__prose {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-digest__toggle {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--ballast-space-8);
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  cursor: pointer;
+  white-space: nowrap;
+}
