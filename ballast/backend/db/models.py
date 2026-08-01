@@ -224,14 +224,27 @@ class DecisionRecord(OwnedEntityMixin, Base):
     and — on a successful execution — transitions ONCE to **cosigned** at
     ``/approve`` time.
 
+    LIFECYCLE (Story 6.1): the status transitions ``proposed → cosigning →
+    cosigned``. A row is inserted **proposed** at ``/recommend`` time; an
+    ``/approve`` first ATOMICALLY claims it (``proposed → cosigning``, the
+    conditional rowcount-gated UPDATE in ``coach/decision_record.claim_for_cosign``)
+    so exactly one concurrent approve places the order; on a successful placement
+    it transitions ONCE to **cosigned**. A refusal/failure RELEASES the claim
+    (``cosigning → proposed``) so the decision stays retryable; a transient
+    ``cosigning`` row is never surfaced in history (``list_cosigned_decisions``
+    filters ``status == "cosigned"``).
+
     IMMUTABILITY: the snapshot columns are WRITE-ONCE at propose —
     ``schema_version``, ``recommendation_snapshot`` (the blessed
     action_label/reasoning/full evidence records/uncertainties/proposed
-    order_intent), and ``created_at`` are NEVER mutated after insert. Co-sign
-    fills the previously-NULL co-sign columns (``co_signed_at``,
-    ``idempotency_key``, ``cosign_snapshot``) EXACTLY once, guarded on
-    ``status == "proposed"``; a cosigned record is only ever READ afterward. The
-    recommendation snapshot is never re-derived or re-touched (AD-5).
+    order_intent), and ``created_at`` are NEVER mutated after insert. The stable
+    per-decision ``idempotency_key`` is minted and persisted at propose (Story
+    6.1) and reused verbatim across every placement; a DB UNIQUE index makes a
+    duplicate key physically un-insertable (in-convention with ``market_daily`` /
+    ``digest_preference`` unique constraints). Co-sign fills the previously-NULL
+    co-sign columns (``co_signed_at``, ``cosign_snapshot``) EXACTLY once, guarded
+    on ``status == "cosigning"``; a cosigned record is only ever READ afterward.
+    The recommendation snapshot is never re-derived or re-touched (AD-5).
 
     SOLE WRITER: ``coach/decision_record.py`` is the ONLY module that constructs
     or persists this model (AD-6). ``api/coach.py`` and everything else delegate
@@ -244,6 +257,11 @@ class DecisionRecord(OwnedEntityMixin, Base):
     """
 
     __tablename__ = "decision_record"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key", name="uq_decision_record_idempotency_key"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
 
@@ -255,8 +273,10 @@ class DecisionRecord(OwnedEntityMixin, Base):
     # Write-once at propose; never mutated.
     recommendation_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
 
-    # "proposed" at insert; transitions ONCE to "cosigned" on a successful
-    # execution (guarded in coach/decision_record.cosign).
+    # "proposed" at insert; ATOMICALLY claimed to "cosigning" (claim_for_cosign),
+    # then transitions ONCE to "cosigned" on a successful execution (cosign) — or
+    # RELEASED back to "proposed" (release_claim) on a refusal/failure. The three
+    # transitions all live in coach/decision_record.py (AD-6).
     status: Mapped[str] = mapped_column(
         String(length=16), nullable=False, default="proposed"
     )
@@ -270,6 +290,11 @@ class DecisionRecord(OwnedEntityMixin, Base):
     co_signed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The stable per-decision idempotency key, minted+persisted at propose (Story
+    # 6.1) and reused verbatim across every placement so a re-place after a
+    # released claim dedupes rather than double-fills. Column stays nullable for
+    # schema simplicity (a NULL never collides in Postgres), but it is populated
+    # from birth; the UNIQUE index (see __table_args__) is the DB-level backstop.
     idempotency_key: Mapped[str | None] = mapped_column(
         String(length=64), nullable=True
     )

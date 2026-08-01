@@ -95,7 +95,7 @@ development_status:
 
   # Epic 6: Go Live — Real Broker & LLM Integration
   epic-6: in-progress
-  6-1-atomic-decision-claim-idempotency-hardening: ready-for-dev
+  6-1-atomic-decision-claim-idempotency-hardening: done
   6-2-live-llm-gateway-enablement-hardening: backlog
   6-3-live-schwab-placement-reconciliation-mapping: backlog
   6-4-fixed-point-money-serialization-pass: backlog

@@ -22,18 +22,26 @@ wire as decimal STRINGS (never binary float), consistent with
 
 PERSISTENCE lands HERE as of Story 4.9 (FR16, AD-5/AD-6): ``/recommend`` persists
 the blessed recommendation as ONE immutable **proposed**
-:class:`~db.models.DecisionRecord` and returns its ``decision_id``; ``/approve``
-carries that ``decision_id`` and, on a successful execution, CO-SIGNS the
-referenced record exactly once (proposed→cosigned). Both delegate to the Coach
-Engine's SOLE decision-record writer (:mod:`coach.decision_record`) — this
-handler never constructs or writes the model itself (AD-6). Re-approving an
-already-cosigned decision returns the RECORDED outcome and never re-touches the
-broker — a SEQUENTIAL re-approve is idempotent via the persisted ``status``.
-Hardening against simultaneous IN-FLIGHT approves of the same ``decision_id``
-(an atomic proposed→cosigned status claim plus a stable per-decision idempotency
-key reused across placements) lands with real-broker wiring; v1 has no live
-broker (the Schwab adapter is a credential-gated stub) so no real order can be
-double-placed today. No replay/history endpoint and no UI (Story 4.10).
+:class:`~db.models.DecisionRecord` (stamped with a STABLE per-decision idempotency
+key at propose time) and returns its ``decision_id``; ``/approve`` carries that
+``decision_id`` and, on a successful execution, CO-SIGNS the referenced record
+exactly once. Both delegate to the Coach Engine's SOLE decision-record writer
+(:mod:`coach.decision_record`) — this handler never constructs or writes the
+model itself (AD-6).
+
+ATOMIC CLAIM (Story 6.1): ``/approve`` closes the in-flight concurrent-approve
+window with a real atomic claim, not merely a sequential guard. It loads the
+referenced record, then: an already-``cosigned`` record returns the RECORDED
+outcome (broker never re-invoked); a record already ``cosigning`` returns a calm
+409 in-progress; otherwise it ATOMICALLY claims ``proposed → cosigning`` via
+:func:`coach.decision_record.claim_for_cosign` (a rowcount-gated conditional
+UPDATE committed BEFORE the broker call). Of two simultaneous in-flight approves
+EXACTLY ONE wins the claim and places the order (with the STABLE persisted key);
+the loser re-loads and gets the recorded outcome or a 409 in-progress — no double
+placement is possible. A session-integrity (409) or scope (422) refusal RELEASES
+the claim (``cosigning → proposed``) so the decision returns to ``proposed`` and
+stays retryable; the broker is never touched. No replay/history endpoint and no
+UI (Story 4.10).
 """
 
 from __future__ import annotations
@@ -53,16 +61,17 @@ from brokers.port import BrokerPort, OrderOutcome
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
 from coach.decision_record import (
+    claim_for_cosign,
     cosign,
     list_cosigned_decisions,
     load_decision,
     record_proposal,
+    release_claim,
 )
 from coach.execution import (
     OrderScopeError,
     SessionIntegrityError,
     execute_approved_order,
-    mint_idempotency_key,
 )
 from coach.pipeline import CoachDecision, run_coach_pipeline
 from coach.recommendation import OrderIntent, OrderSide
@@ -73,6 +82,14 @@ from db.session import get_async_session
 logger = logging.getLogger("ballast.api.coach")
 
 router = APIRouter(prefix="/api/coach", tags=["coach"])
+
+#: The calm 409 surfaced when an approve of THIS decision is already in flight
+#: (another request won the atomic proposed→cosigning claim and is placing now).
+#: Not an error the user caused — a "give it a moment" nudge (Story 6.1).
+IN_PROGRESS_MESSAGE = (
+    "This decision is being approved right now — give it a moment and check "
+    "your Decisions."
+)
 
 
 # --- Schemas -----------------------------------------------------------------
@@ -365,21 +382,27 @@ async def approve(
     is truthful data, NOT coerced into the error envelope and never a phantom
     fill. Only scope/auth/session failures use the error envelope.
 
-    CO-SIGN (Story 4.9): the request carries a ``decision_id``. The referenced
-    proposed record is loaded through the sole writer
+    CO-SIGN + ATOMIC CLAIM (Story 4.9 / 6.1): the request carries a
+    ``decision_id``. The referenced record is loaded through the sole writer
     (:func:`coach.decision_record.load_decision`, per-user scoped — a foreign or
-    unknown id is invisible → 404). If it is ALREADY cosigned, the RECORDED
+    unknown id is invisible → 404). If it is ALREADY ``cosigned``, the RECORDED
     outcome is returned and the broker is NEVER re-invoked (idempotent re-approve;
-    no double-place across requests). Otherwise the idempotency key is minted
-    HERE and passed through to :func:`execute_approved_order`; on success the
-    referenced record is co-signed EXACTLY once (proposed→cosigned) via
-    :func:`coach.decision_record.cosign` and the session committed. The 409
-    (session integrity) and 422 (scope) refusal arms occur BEFORE co-sign, so a
-    refusal leaves the record **proposed** and writes no co-sign.
+    no double-place across requests). If it is ``cosigning``, another approve of
+    this decision is in flight → a calm 409 in-progress. Otherwise this request
+    ATOMICALLY claims ``proposed → cosigning`` via
+    :func:`coach.decision_record.claim_for_cosign`; if it LOSES the claim
+    (``rowcount == 0``, a concurrent approve won) it re-loads and branches
+    (cosigned→recorded / cosigning→409 / missing→404) WITHOUT touching the broker.
+    On a WON claim it places with the STABLE key persisted at propose
+    (``record.idempotency_key``) via :func:`execute_approved_order`; on success it
+    co-signs EXACTLY once (cosigning→cosigned) and commits. A session-integrity
+    (409) or scope (422) refusal RELEASES the claim (cosigning→proposed) and
+    commits that release BEFORE raising, so a refused decision returns to
+    ``proposed`` and stays retryable — the broker was never touched.
 
-    The already-cosigned early-return makes a SEQUENTIAL re-approve idempotent;
-    a fully atomic guard against two simultaneous in-flight approves of the same
-    ``decision_id`` is deferred to real-broker wiring (see the module docstring).
+    Because exactly one concurrent approve wins the atomic claim, ``place_order``
+    runs at most once per decision even for two simultaneous in-flight approves —
+    the in-flight double-place window is structurally closed (no longer deferred).
     Money in the returned outcome is serialized fixed-point (no ``E+``), matching
     the persisted co-sign snapshot so a first approve and its idempotent replay
     return byte-identical money strings.
@@ -393,14 +416,41 @@ async def approve(
     # outcome and never re-touches the broker (cross-request no-double-place).
     if record.status == "cosigned":
         return _recorded_outcome_response(record)
+    # Another approve of this decision is already in flight (won the claim, is
+    # placing now) → calm 409 in-progress, broker never touched.
+    if record.status == "cosigning":
+        raise HTTPException(status_code=409, detail=IN_PROGRESS_MESSAGE)
 
+    # Atomically claim proposed→cosigning; only the winner (rowcount==1) places.
+    won = await claim_for_cosign(body.decision_id, scope=scope, session=session)
+    if not won:
+        # A concurrent approve won the claim. Re-load to return the right calm
+        # answer without ever touching the broker.
+        record = await load_decision(body.decision_id, scope=scope, session=session)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Decision record not found.")
+        if record.status == "cosigned":
+            return _recorded_outcome_response(record)
+        # Still cosigning (the winner is placing) → calm 409 in-progress.
+        raise HTTPException(status_code=409, detail=IN_PROGRESS_MESSAGE)
+
+    # We won the claim: re-load so the ORM instance reflects the committed
+    # ``cosigning`` status (the claim was a Core UPDATE bypassing this instance,
+    # and expire_on_commit is off), then place with the STABLE per-decision key
+    # persisted at propose.
+    record = await load_decision(body.decision_id, scope=scope, session=session)
+    if record is None:
+        # The claimed row vanished (concurrent delete) between the committed
+        # claim and this re-load → calm 404, symmetric with the loser branch
+        # (never an AttributeError/500 on a None instance).
+        raise HTTPException(status_code=404, detail="Decision record not found.")
+    key = record.idempotency_key
     intent = OrderIntent(
         symbol=body.order_intent.symbol,
         side=body.order_intent.side,
         amount=body.order_intent.amount,
     )
     try:
-        key = mint_idempotency_key()
         outcome = await execute_approved_order(
             intent,
             broker=broker,
@@ -408,19 +458,31 @@ async def approve(
             idempotency_key=key,
         )
     except SessionIntegrityError as exc:
-        # Session lapsed or provider mismatched at placement time; refuse with the
-        # same calm reconnect envelope as the entry gate — broker never touched,
-        # record stays proposed (no co-sign written).
+        # Session lapsed or provider mismatched at placement time; release the
+        # claim (cosigning→proposed) so the decision is retryable, then refuse
+        # with the same calm reconnect envelope as the entry gate — broker never
+        # touched.
+        await release_claim(body.decision_id, scope=scope, session=session)
         raise HTTPException(
             status_code=409, detail=RECONNECT_MESSAGE
         ) from exc
     except OrderScopeError as exc:
-        # Rejected before any broker call; surface through the app envelope. The
-        # record stays proposed (no co-sign written).
+        # Rejected before any broker call; release the claim (retryable) and
+        # surface through the app envelope.
+        await release_claim(body.decision_id, scope=scope, session=session)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        # ANY other failure before a successful placement (broker timeout,
+        # connection error, unexpected bug) — the spec mandates the claim is
+        # RELEASED on *any* pre-placement error, not just the two typed refusals.
+        # Release (cosigning→proposed) so the decision is never stranded
+        # mid-claim, then re-raise the original error (surfaces as 500) with the
+        # record left retryable rather than permanently stuck in ``cosigning``.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise
 
     # Order was actually placed and reconciled: co-sign the referenced record
-    # exactly once (delegated to the sole writer — AD-6).
+    # exactly once (cosigning→cosigned, delegated to the sole writer — AD-6).
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
     return _to_approve_response(outcome)

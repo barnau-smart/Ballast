@@ -25,6 +25,7 @@ users and cleans up its own rows. NO real Schwab/Anthropic call is ever made.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -46,6 +47,8 @@ from brokers.port import (
     PortfolioSnapshot,
 )
 from brokers.session import BrokerageSession
+from api.coach import IN_PROGRESS_MESSAGE
+from coach.decision_record import claim_for_cosign, release_claim
 from coach.execution import (
     OrderScopeError,
     SessionIntegrityError,
@@ -54,7 +57,8 @@ from coach.execution import (
 from coach.recommendation import OrderIntent, OrderSide
 from db.connection import get_connection
 from db.models import BrokerageToken, DecisionRecord, MarketDaily, PortfolioCache
-from db.session import engine
+from db.scope import Scope
+from db.session import async_session_maker, engine
 
 PASSWORD = "supersecret123"
 
@@ -69,12 +73,28 @@ BASE_DAY = date(2015, 1, 1)
 
 @pytest_asyncio.fixture(autouse=True)
 async def ensure_tables():
-    """Ensure the owned tables exist (matches the create-all lifecycle)."""
+    """Ensure the owned tables exist (matches the create-all lifecycle).
+
+    ``create(checkfirst=True)`` is a no-op on an ALREADY-existing table, so a test
+    DB carried over from before Story 6.1 would lack the new unique index on
+    ``decision_record.idempotency_key`` (a fresh ``create_all`` would build it).
+    Reconcile that explicitly with ``CREATE UNIQUE INDEX IF NOT EXISTS`` so the
+    test DB matches a fresh schema without an Alembic migration.
+    """
+    from sqlalchemy import text
+
     async with engine.begin() as conn:
         await conn.run_sync(BrokerageToken.__table__.create, checkfirst=True)
         await conn.run_sync(PortfolioCache.__table__.create, checkfirst=True)
         await conn.run_sync(MarketDaily.__table__.create, checkfirst=True)
         await conn.run_sync(DecisionRecord.__table__.create, checkfirst=True)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_decision_record_idempotency_key "
+                "ON decision_record (idempotency_key)"
+            )
+        )
     yield
 
 
@@ -1177,7 +1197,9 @@ def test_recommend_persists_one_proposed_record_scoped(client):
         assert row["status"] == "proposed"
         assert row["schema_version"] == 1
         assert row["co_signed_at"] is None
-        assert row["idempotency_key"] is None
+        # Story 6.1: the STABLE per-decision idempotency key is minted+persisted
+        # at propose time (no longer NULL until co-sign).
+        assert row["idempotency_key"]
         assert row["cosign_snapshot"] is None
         snap = row["recommendation_snapshot"]
         # Snapshot mirrors what the user saw (backend-blessed, not client-authored).
@@ -1211,6 +1233,8 @@ def test_approve_cosigns_referenced_record_immutably(client):
         proposed_snapshot = proposed["recommendation_snapshot"]
         proposed_version = proposed["schema_version"]
         proposed_created = proposed["created_at"]
+        proposed_key = proposed["idempotency_key"]
+        assert proposed_key  # stable key set at propose (Story 6.1)
 
         resp = client.post(
             "/api/coach/approve",
@@ -1228,6 +1252,8 @@ def test_approve_cosigns_referenced_record_immutably(client):
         assert cosigned["status"] == "cosigned"
         assert cosigned["co_signed_at"] is not None
         assert cosigned["idempotency_key"]
+        # Story 6.1: the cosigned key EQUALS the proposed key (stable per decision).
+        assert cosigned["idempotency_key"] == proposed_key
         cosign_snap = cosigned["cosign_snapshot"]
         # Executed order_intent captured (money fixed-point string).
         assert cosign_snap["order_intent"] == {
@@ -1432,6 +1458,305 @@ def test_decision_record_sole_writer_canary():
         "DecisionRecord(...) must be constructed ONLY by coach.decision_record "
         f"(AD-6). Unexpected constructors: {offenders}"
     )
+
+
+# =============================================================================
+# STORY 6.1 — ATOMIC DECISION CLAIM & IDEMPOTENCY HARDENING
+# =============================================================================
+
+
+class _BlockingSpyAdapter(BrokerPort):
+    """A broker whose ``place_order`` BLOCKS until the test releases it.
+
+    Lets a test hold one approve's placement in-flight while a SECOND approve of
+    the SAME decision runs on another thread — proving the atomic claim admits
+    exactly one placer. Coordination uses ``threading.Event`` (cross-thread /
+    cross-event-loop safe, unlike ``asyncio.Event``); the async ``place_order``
+    polls it with ``asyncio.sleep`` so it yields its own loop while waiting.
+    Records call args so ``place_order``-called-exactly-once is asserted.
+    """
+
+    provider = "fake"
+
+    def __init__(self) -> None:
+        import threading
+
+        self.calls: list[tuple[OrderIntent, str]] = []
+        self.status_calls: list[str] = []
+        self.entered = threading.Event()  # set when place_order is first entered
+        self.release = threading.Event()  # test sets this to let place_order finish
+        self._delegate = FakeBrokerAdapter()
+
+    def authorization_url(self, state: str) -> str:
+        return self._delegate.authorization_url(state)
+
+    def exchange_code(self, code: str, state: str) -> BrokerTokens:
+        return self._delegate.exchange_code(code, state)
+
+    def fetch_portfolio(self) -> PortfolioSnapshot:
+        return self._delegate.fetch_portfolio()
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        self.calls.append((order_intent, idempotency_key))
+        self.entered.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.01)
+        return await self._delegate.place_order(
+            order_intent, idempotency_key=idempotency_key
+        )
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        self.status_calls.append(idempotency_key)
+        return await self._delegate.get_order_status(idempotency_key)
+
+
+def _proposed_decision_row(owner: uuid.UUID) -> dict:
+    return _decision_rows(owner)[0]
+
+
+@pytest.mark.asyncio
+async def test_two_session_claim_one_wins_one_loses(client):
+    # (b) Two genuine AsyncSession claim_for_cosign calls on the SAME proposed id
+    # return True then False — only one wins the atomic proposed→cosigning claim.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        decision_id = uuid.UUID(_recommend_decision_id(client, headers))
+        scope = Scope.for_user(uid)
+
+        async with async_session_maker() as s1, async_session_maker() as s2:
+            won_first = await claim_for_cosign(decision_id, scope=scope, session=s1)
+            won_second = await claim_for_cosign(decision_id, scope=scope, session=s2)
+
+        assert won_first is True
+        assert won_second is False
+        # The record is now cosigning (claimed, not yet cosigned).
+        assert _proposed_decision_row(uid)["status"] == "cosigning"
+
+        # release_claim reverses it back to proposed (retryable).
+        async with async_session_maker() as s3:
+            await release_claim(decision_id, scope=scope, session=s3)
+        assert _proposed_decision_row(uid)["status"] == "proposed"
+    finally:
+        _delete_user(email)
+
+
+def test_two_in_flight_approves_place_order_exactly_once(client):
+    # (a) Two overlapping /approve on the same proposed decision with placement
+    # PAUSED (blocking broker): place_order is called EXACTLY once, one caller
+    # 200s and the other gets 409-in-progress, and the record ends cosigned.
+    email = _unique_email()
+    broker = _BlockingSpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+        body = {
+            "decision_id": decision_id,
+            "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+        }
+
+        import threading
+
+        results: dict[str, int] = {}
+
+        def _approve(tag: str) -> None:
+            resp = client.post("/api/coach/approve", json=body, headers=headers)
+            results[tag] = resp.status_code
+
+        # Winner starts and blocks inside place_order (claim already committed to
+        # cosigning). The second approve then runs and must see cosigning → 409.
+        t1 = threading.Thread(target=_approve, args=("first",))
+        t1.start()
+        # Wait until the winner is inside place_order (claim committed).
+        assert broker.entered.wait(timeout=10), "place_order was never entered"
+
+        # Second approve of the SAME decision while the first is in-flight.
+        resp2 = client.post("/api/coach/approve", json=body, headers=headers)
+
+        # Let the winner finish and join.
+        broker.release.set()
+        t1.join(timeout=10)
+        assert not t1.is_alive()
+
+        # EXACTLY one placement, ever.
+        assert len(broker.calls) == 1
+        # One 200 (winner), one 409-in-progress (loser saw cosigning).
+        assert results["first"] == 200
+        assert resp2.status_code == 409
+        assert resp2.json()["error"]["message"] == IN_PROGRESS_MESSAGE
+        # The record ends cosigned.
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "cosigned"
+    finally:
+        broker.release.set()  # ensure no thread is left blocked on teardown
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_refusal_releases_claim_record_back_to_proposed(client):
+    # (c) A won claim that then hits an integrity 409 (provider mismatch) or a
+    # scope 422 (out-of-scope symbol) RELEASES the claim: the record is back at
+    # proposed (not stuck cosigning) and the broker was never touched.
+    email = _unique_email()
+    spy = _SpyAdapter()  # provider "fake"
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    # A live session whose provider disagrees → SessionIntegrityError after claim.
+    client.app.dependency_overrides[require_live_broker_session] = (
+        lambda: _live_session(provider="schwab")
+    )
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        assert spy.calls == []  # broker NEVER touched
+        # Claim released → record back to proposed (retryable, not stuck).
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        client.app.dependency_overrides.pop(require_live_broker_session, None)
+        _delete_user(email)
+
+    # Scope-422 variant: an out-of-scope symbol releases the claim too.
+    email2 = _unique_email()
+    spy2 = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy2
+    try:
+        _register(client, email2)
+        token2 = _login(client, email2)
+        headers2 = {"Authorization": f"Bearer {token2}"}
+        uid2 = _user_id_for(email2)
+        _insert_token_sync(uid2, _live())
+        decision_id2 = _recommend_decision_id(client, headers2)
+
+        resp2 = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id2,
+                "order_intent": {"symbol": "AAPL", "side": "buy", "amount": "500"},
+            },
+            headers=headers2,
+        )
+        assert resp2.status_code == 422, resp2.text
+        assert spy2.calls == []
+        rows2 = _decision_rows(uid2)
+        assert len(rows2) == 1 and rows2[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email2)
+
+
+def test_generic_placement_error_releases_claim(client):
+    # (c2) A won claim whose placement raises an UNEXPECTED error (not one of the
+    # two typed refusals) STILL releases the claim: the record returns to
+    # proposed (retryable), never stranded in cosigning. This is the spec's
+    # "any error before a successful placement, the claim is RELEASED"
+    # guarantee — without it a real broker timeout/bug would leave the decision
+    # stuck cosigning forever (every retry a calm 409, invisible to history).
+    class _BoomAdapter(_SpyAdapter):
+        async def place_order(self, order_intent, *, idempotency_key):
+            self.calls.append((order_intent, idempotency_key))
+            raise RuntimeError("broker exploded mid-placement")
+
+    email = _unique_email()
+    boom = _BoomAdapter()  # provider "fake" → passes the integrity gate
+    client.app.dependency_overrides[get_broker] = lambda: boom
+    client.app.dependency_overrides[require_live_broker_session] = (
+        lambda: _live_session(provider="fake")
+    )
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        with pytest.raises(RuntimeError, match="broker exploded"):
+            client.post(
+                "/api/coach/approve",
+                json={
+                    "decision_id": decision_id,
+                    "order_intent": {
+                        "symbol": "VTI",
+                        "side": "buy",
+                        "amount": "500",
+                    },
+                },
+                headers=headers,
+            )
+        # Placement was ATTEMPTED once, then the claim was released: the record
+        # is back at proposed (retryable), NOT stuck cosigning.
+        assert len(boom.calls) == 1
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        client.app.dependency_overrides.pop(require_live_broker_session, None)
+        _delete_user(email)
+
+
+def test_duplicate_idempotency_key_is_uninsertable(client):
+    # (d) The DB unique index on decision_record.idempotency_key rejects a
+    # duplicate key (the structural backstop; unreachable via the normal flow).
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        decision_id = _recommend_decision_id(client, headers)
+        existing_key = _proposed_decision_row(uid)["idempotency_key"]
+        assert existing_key
+
+        # Attempt to insert a second decision_record reusing the SAME key.
+        import psycopg
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO decision_record "
+                        "(id, owner_id, schema_version, recommendation_snapshot, "
+                        " status, idempotency_key, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            str(uuid.uuid4()),
+                            str(uid),
+                            1,
+                            "{}",
+                            "proposed",
+                            existing_key,  # DUPLICATE → UniqueViolation
+                            datetime.now(timezone.utc),
+                        ),
+                    )
+                conn.commit()
+    finally:
+        _delete_user(email)
 
 
 # =============================================================================

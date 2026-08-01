@@ -8,13 +8,19 @@ comes from the ``user`` table (the owner, not an owned entity), read directly.
 
 Design guarantees (mirroring :mod:`marketdata.ingest`):
 
-- **Idempotent:** each user carries a ``last_sent_week`` ISO year-week marker. A
-  user whose marker already equals the current week is skipped, so a re-run (or
-  an overlapping run) never double-sends. Only a successful send advances the
-  marker (committed per-user).
+- **Atomic claim-before-send (Story 6.1):** each user carries a ``last_sent_week``
+  ISO year-week marker. Before composing/sending, the job CLAIMS the week with a
+  conditional ``UPDATE DigestPreference SET last_sent_week=:week WHERE owner_id AND
+  last_sent_week IS DISTINCT FROM :week`` — Postgres serializes the row update, so
+  of any number of overlapping runs EXACTLY ONE gets ``rowcount == 1`` (proceeds
+  to send) and the rest get ``rowcount == 0`` (skip, no send). A send failure AFTER
+  the claim rolls it back so the user is UNMARKED and retried next run. This closes
+  the in-flight double-send window (the send-then-mark ordering could double-send
+  under concurrency; NFR8 never-nag).
 - **Failure-isolated:** each user's send is wrapped so one failure logs a warning
-  and the run CONTINUES with the rest; that user is left UNMARKED and picked up
-  next run. Commit is per-user so one failure can't discard another's progress.
+  and the run CONTINUES with the rest; that user is left UNMARKED (claim rolled
+  back) and picked up next run. Commit is per-user so one failure can't discard
+  another's progress.
 
 Scheduling is a deployment concern, intentionally not built here: :func:`main` is
 a thin CLI (``python -m digest.job``) a weekly cron / task-runner would invoke;
@@ -99,13 +105,16 @@ async def send_weekly_digests(
     for owner_id, pref_last_sent_week, unsubscribe_token in targets:
         label = str(owner_id)
         try:
-            # Idempotent: never a second send in the same ISO week.
+            # Fast idempotency short-circuit: a marker already at this week means a
+            # prior run sent — skip without even attempting the claim.
             if pref_last_sent_week == week_key:
                 result.skipped.append(label)
                 continue
 
             # Recipient email from the user table (the owner, not an owned/scoped
-            # entity) — read directly under the system context.
+            # entity) — read directly under the system context. Resolved BEFORE
+            # the claim so a deactivated/missing account is skipped WITHOUT
+            # consuming the week's claim (leaving it retryable if reactivated).
             user = (
                 await session.execute(select(User).where(User.id == owner_id))
             ).scalars().first()
@@ -118,9 +127,37 @@ async def send_weekly_digests(
             label = user.email
             if not user.is_active:
                 # A deactivated/disabled account never receives the proactive
-                # email — skip quietly (not a failure); a reactivated user is
-                # picked up next run.
+                # email — skip quietly (not a failure) WITHOUT claiming, so a
+                # reactivated user is picked up next run (marker stays unset).
                 result.skipped.append(user.email)
+                continue
+
+            # Atomic claim-before-send (Story 6.1): conditionally advance the
+            # marker to this week ONLY IF it is not already this week. Postgres
+            # serializes the row update, so of any overlapping runs EXACTLY ONE
+            # gets rowcount==1 (proceeds to send); a loser gets rowcount==0 and
+            # skips without sending. The claim is committed only after a
+            # successful send (below); a failure rolls it back.
+            claim = await session.execute(
+                update(DigestPreference)
+                .where(
+                    DigestPreference.owner_id == owner_id,
+                    DigestPreference.last_sent_week.is_distinct_from(week_key),
+                )
+                .values(
+                    last_sent_week=week_key,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            if claim.rowcount == 0:
+                # Another overlapping run already claimed this week for this user
+                # → do NOT send. Roll back the uncommitted (no-op) claim and skip.
+                # rollback() EXPIRES every ORM instance (including ``user``), so
+                # use the already-captured ``label`` (== user.email) rather than
+                # re-reading user.email, which would lazy-load outside the async
+                # greenlet and raise MissingGreenlet.
+                await session.rollback()
+                result.skipped.append(label)
                 continue
 
             # Plan status read under the USER's own cage (never cross-user).
@@ -135,18 +172,9 @@ async def send_weekly_digests(
             )
             sender.send(message)
 
-            # Advance the idempotency marker ONLY after a successful send, via an
-            # explicit UPDATE (not ORM-instance mutation) so it never touches
-            # expire-on-rollback state, and commit per-user so one later failure
-            # can't undo this progress.
-            await session.execute(
-                update(DigestPreference)
-                .where(DigestPreference.owner_id == owner_id)
-                .values(
-                    last_sent_week=week_key,
-                    updated_at=datetime.now(timezone.utc),
-                )
-            )
+            # Send succeeded → commit the claim (the marker advance persists), per
+            # user so one later failure can't undo this progress. A failure before
+            # here rolls the claim back (see except) so the user is retried.
             await session.commit()
 
             result.sent.append(user.email)
