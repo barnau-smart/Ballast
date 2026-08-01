@@ -49,7 +49,11 @@ from brokers.port import (
 )
 from brokers.session import BrokerageSession
 from api.coach import IN_PROGRESS_MESSAGE
-from coach.decision_record import claim_for_cosign, release_claim
+from coach.decision_record import (
+    claim_for_cosign,
+    prune_stale_proposed_decisions,
+    release_claim,
+)
 from coach.execution import (
     OrderScopeError,
     SessionIntegrityError,
@@ -103,6 +107,16 @@ async def ensure_tables():
             text(
                 "ALTER TABLE decision_record "
                 "ADD COLUMN IF NOT EXISTS broker_ref VARCHAR(64)"
+            )
+        )
+        # Story 6.6 adds the (owner_id, co_signed_at) composite index backing the
+        # paginated history read; reconcile a carried-over DB the same way (a
+        # fresh create_all would build it). Harmless/no-op once it exists.
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_decision_record_owner_co_signed_at "
+                "ON decision_record (owner_id, co_signed_at)"
             )
         )
     yield
@@ -2180,3 +2194,397 @@ def test_cross_user_isolation_list_and_detail(client):
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(a_email)
         _delete_user(b_email)
+
+
+# =============================================================================
+# DECISIONS HISTORY PAGINATION + RETENTION (Story 6.6)
+# =============================================================================
+
+
+def _insert_decision_row(
+    owner: uuid.UUID,
+    *,
+    status: str,
+    created_at: datetime,
+    co_signed_at: datetime | None = None,
+    symbol: str = "VTI",
+    outcome_status: str = "filled",
+) -> uuid.UUID:
+    """Insert one decision_record row directly (offline fixture for 6.6 tests).
+
+    Drives the same immutable-snapshot shape the sole writer persists, but lets a
+    test cheaply fabricate a mix of ages/statuses (impractical to reach through
+    120 recommend→approve round-trips). ``cosign_snapshot`` is populated for
+    cosigned rows so the summary serializer has an executed symbol/outcome.
+    """
+    decision_id = uuid.uuid4()
+    recommendation_snapshot = {
+        "action_label": "Hold",
+        "reasoning": "steady as she goes",
+        "order_intent": None,
+        "evidence": [],
+        "uncertainties": ["markets move"],
+    }
+    cosign_snapshot = None
+    if status == "cosigned":
+        cosign_snapshot = {
+            "order_intent": {"symbol": symbol, "side": "buy", "amount": "500"},
+            "outcome": {
+                "status": outcome_status,
+                "filled_qty": "1",
+                "avg_price": "500",
+                "broker_ref": "ref-" + uuid.uuid4().hex[:8],
+            },
+        }
+    import json
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO decision_record "
+                "(id, owner_id, schema_version, recommendation_snapshot, status, "
+                " created_at, co_signed_at, idempotency_key, cosign_snapshot) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    str(decision_id),
+                    str(owner),
+                    1,
+                    json.dumps(recommendation_snapshot),
+                    status,
+                    created_at,
+                    co_signed_at,
+                    "idem-" + uuid.uuid4().hex,
+                    None if cosign_snapshot is None else json.dumps(cosign_snapshot),
+                ),
+            )
+        conn.commit()
+    return decision_id
+
+
+def test_list_decisions_default_page_bounded_newest_first_has_more(client):
+    # Default page: with more cosigned rows than one page, exactly
+    # DECISION_PAGE_SIZE newest-first rows return with has_more=true.
+    from api.coach import DECISION_PAGE_SIZE
+
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        total = DECISION_PAGE_SIZE + 5
+        # co_signed_at increases with i, so newest = highest i.
+        for i in range(total):
+            _insert_decision_row(
+                uid,
+                status="cosigned",
+                created_at=base + timedelta(minutes=i),
+                co_signed_at=base + timedelta(minutes=i),
+            )
+
+        resp = client.get("/api/coach/decisions", headers=headers)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["decisions"]) == DECISION_PAGE_SIZE
+        assert body["has_more"] is True
+        assert body["limit"] == DECISION_PAGE_SIZE
+        assert body["offset"] == 0
+        # Newest-first: co_signed_at strictly descending across the page.
+        stamps = [d["co_signed_at"] for d in body["decisions"]]
+        assert stamps == sorted(stamps, reverse=True)
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_deep_page_tail_has_more_false(client):
+    # Deep page via offset returns the tail with has_more=false.
+    from api.coach import DECISION_PAGE_SIZE
+
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        total = DECISION_PAGE_SIZE + 20  # e.g. 70 with default 50
+        for i in range(total):
+            _insert_decision_row(
+                uid,
+                status="cosigned",
+                created_at=base + timedelta(minutes=i),
+                co_signed_at=base + timedelta(minutes=i),
+            )
+
+        resp = client.get(
+            f"/api/coach/decisions?offset={DECISION_PAGE_SIZE}&limit={DECISION_PAGE_SIZE}",
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # The tail beyond the first page: total - page_size rows remain.
+        assert len(body["decisions"]) == total - DECISION_PAGE_SIZE
+        assert body["has_more"] is False
+        assert body["offset"] == DECISION_PAGE_SIZE
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_over_max_limit_is_422(client):
+    # limit above the cap → 422 (bounded, not silently clamped).
+    from api.coach import DECISION_MAX_PAGE_SIZE
+
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = client.get(
+            f"/api/coach/decisions?limit={DECISION_MAX_PAGE_SIZE + 1}",
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_bad_params_are_422(client):
+    # limit=0 and offset=-1 violate the ge floors → 422.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        assert (
+            client.get("/api/coach/decisions?limit=0", headers=headers).status_code
+            == 422
+        )
+        assert (
+            client.get("/api/coach/decisions?offset=-1", headers=headers).status_code
+            == 422
+        )
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_pagination_is_owner_isolated(client):
+    # Under pagination, a second user's cosigned rows never appear in the first
+    # user's results (owner filter in SQL, through the paginated path).
+    a_email = _unique_email()
+    b_email = _unique_email()
+    try:
+        _register(client, a_email)
+        a_token = _login(client, a_email)
+        a_headers = {"Authorization": f"Bearer {a_token}"}
+        a_uid = _user_id_for(a_email)
+
+        _register(client, b_email)
+        b_uid = _user_id_for(b_email)
+
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        a_ids = set()
+        for i in range(3):
+            a_ids.add(
+                str(
+                    _insert_decision_row(
+                        a_uid,
+                        status="cosigned",
+                        created_at=base + timedelta(minutes=i),
+                        co_signed_at=base + timedelta(minutes=i),
+                    )
+                )
+            )
+        # B has MANY rows (more than a page) with LATER co-sign times — if the
+        # owner filter leaked, B's newer rows would dominate A's newest-first page.
+        for i in range(60):
+            _insert_decision_row(
+                b_uid,
+                status="cosigned",
+                created_at=base + timedelta(hours=1, minutes=i),
+                co_signed_at=base + timedelta(hours=1, minutes=i),
+            )
+
+        resp = client.get("/api/coach/decisions?limit=100", headers=a_headers)
+        assert resp.status_code == 200, resp.text
+        ids = {d["decision_id"] for d in resp.json()["decisions"]}
+        assert ids == a_ids  # only A's rows, none of B's
+    finally:
+        _delete_user(a_email)
+        _delete_user(b_email)
+
+
+def test_replay_detail_unchanged_and_404_on_foreign_or_unknown(client):
+    # Replay output of GET /decisions/{id} is unchanged and 404s on foreign/unknown.
+    a_email = _unique_email()
+    b_email = _unique_email()
+    try:
+        _register(client, a_email)
+        a_token = _login(client, a_email)
+        a_headers = {"Authorization": f"Bearer {a_token}"}
+        a_uid = _user_id_for(a_email)
+        _register(client, b_email)
+        b_uid = _user_id_for(b_email)
+
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        a_id = _insert_decision_row(
+            a_uid, status="cosigned", created_at=base, co_signed_at=base
+        )
+        b_id = _insert_decision_row(
+            b_uid, status="cosigned", created_at=base, co_signed_at=base
+        )
+
+        # A's own record replays verbatim (snapshots as persisted, unchanged shape).
+        detail = client.get(f"/api/coach/decisions/{a_id}", headers=a_headers)
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["decision_id"] == str(a_id)
+        assert body["status"] == "cosigned"
+        assert body["recommendation_snapshot"]["action_label"] == "Hold"
+        assert body["cosign_snapshot"]["order_intent"]["symbol"] == "VTI"
+
+        # Foreign id → 404; unknown id → 404.
+        assert (
+            client.get(f"/api/coach/decisions/{b_id}", headers=a_headers).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"/api/coach/decisions/{uuid.uuid4()}", headers=a_headers
+            ).status_code
+            == 404
+        )
+    finally:
+        _delete_user(a_email)
+        _delete_user(b_email)
+
+
+def test_prune_deletes_stale_proposed_only(client):
+    # prune_stale_proposed_decisions deletes ONLY proposed rows older than the
+    # window; recent proposed + cosigned (any age) survive; returned count matches.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        uid = _user_id_for(email)
+
+        now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+        older_than_days = 30
+        stale = now - timedelta(days=45)
+        recent = now - timedelta(days=5)
+
+        # Two stale proposed rows → should be deleted.
+        stale_a = _insert_decision_row(uid, status="proposed", created_at=stale)
+        stale_b = _insert_decision_row(uid, status="proposed", created_at=stale)
+        # One recent proposed row → must survive.
+        recent_proposed = _insert_decision_row(
+            uid, status="proposed", created_at=recent
+        )
+        # An OLD cosigned row → immutable, must survive even though old.
+        old_cosigned = _insert_decision_row(
+            uid, status="cosigned", created_at=stale, co_signed_at=stale
+        )
+
+        async def _run() -> int:
+            async with async_session_maker() as session:
+                return await prune_stale_proposed_decisions(
+                    session=session, older_than_days=older_than_days, now=now
+                )
+
+        deleted = asyncio.run(_run())
+        assert deleted == 2  # exactly the two stale proposed rows
+
+        surviving = {str(r["id"]) for r in _decision_rows(uid)}
+        assert str(stale_a) not in surviving
+        assert str(stale_b) not in surviving
+        assert str(recent_proposed) in surviving  # recent proposed kept
+        assert str(old_cosigned) in surviving  # cosigned never pruned
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_tied_co_signed_at_pages_without_skip_or_dup(client):
+    # Review patch (Story 6.6): with MANY rows sharing an identical co_signed_at,
+    # offset paging must still cover every row exactly once (the primary-key
+    # tiebreaker gives a deterministic total order — no skip, no duplicate).
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+
+        tied = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        total = 25
+        ids = {
+            str(
+                _insert_decision_row(
+                    uid, status="cosigned", created_at=tied, co_signed_at=tied
+                )
+            )
+            for _ in range(total)
+        }
+
+        seen: list[str] = []
+        offset, page = 0, 10
+        while True:
+            resp = client.get(
+                f"/api/coach/decisions?limit={page}&offset={offset}", headers=headers
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            seen.extend(d["decision_id"] for d in body["decisions"])
+            if not body["has_more"]:
+                break
+            offset += page
+
+        # Every row exactly once: no skips (set equality) and no duplicates (len).
+        assert set(seen) == ids
+        assert len(seen) == total
+    finally:
+        _delete_user(email)
+
+
+def test_list_decisions_exact_full_final_page_has_more_false(client):
+    # Review patch (Story 6.6): when the remaining rows equal EXACTLY the page
+    # size (last page is full), has_more must be False (the limit+1 probe finds
+    # no extra row), so a client paging on has_more issues no phantom empty page.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        for i in range(20):  # exactly two full pages of 10
+            _insert_decision_row(
+                uid,
+                status="cosigned",
+                created_at=base + timedelta(minutes=i),
+                co_signed_at=base + timedelta(minutes=i),
+            )
+
+        resp = client.get("/api/coach/decisions?limit=10&offset=10", headers=headers)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["decisions"]) == 10
+        assert body["has_more"] is False
+    finally:
+        _delete_user(email)
+
+
+def test_prune_rejects_negative_window():
+    # Review patch (Story 6.6): a negative retention window would push the cutoff
+    # into the future and delete recent proposed rows — it is refused outright.
+    async def _run() -> None:
+        async with async_session_maker() as session:
+            await prune_stale_proposed_decisions(
+                session=session, older_than_days=-1
+            )
+
+    with pytest.raises(ValueError):
+        asyncio.run(_run())

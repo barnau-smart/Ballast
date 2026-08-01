@@ -103,6 +103,20 @@ class Settings(BaseSettings):
     # backend's GET /api/digest/unsubscribe. Defaults to local dev.
     DIGEST_UNSUBSCRIBE_BASE_URL: str = "http://localhost:8000"
 
+    # --- Decisions history scale / Story 6.6 ---------------------------------
+
+    # Default page size for the paginated GET /api/coach/decisions history read,
+    # and the hard upper cap a client may request (a larger ``limit`` is a 422,
+    # never silently clamped). The composite (owner_id, co_signed_at) index keeps
+    # the scoped/ordered/windowed SQL bounded and fast.
+    DECISION_PAGE_SIZE: int = 50
+    DECISION_MAX_PAGE_SIZE: int = 100
+
+    # Retention window (days) for never-co-signed ``proposed`` decision records:
+    # the cron-invoked ``python -m coach.prune_job`` deletes proposed rows older
+    # than this. Cosigned (on-the-record) rows are immutable and never pruned.
+    DECISION_PROPOSED_RETENTION_DAYS: int = 30
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

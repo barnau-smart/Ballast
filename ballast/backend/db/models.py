@@ -25,6 +25,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     UniqueConstraint,
@@ -312,6 +313,16 @@ class DecisionRecord(OwnedEntityMixin, Base):
     __table_args__ = (
         UniqueConstraint(
             "idempotency_key", name="uq_decision_record_idempotency_key"
+        ),
+        # Composite index backing the paginated history read (Story 6.6): the
+        # scoped ``WHERE owner_id=? AND status='cosigned' ORDER BY co_signed_at
+        # DESC LIMIT ? OFFSET ?`` shape. (Built via ``create_all`` on a fresh DB;
+        # a carried-over DB is reconciled with ``CREATE INDEX IF NOT EXISTS`` in
+        # the test fixture and as a go-live caveat — the model will NOT ALTER an
+        # already-created table, exactly as ``idempotency_key``/``broker_ref``
+        # were.)
+        Index(
+            "ix_decision_record_owner_co_signed_at", "owner_id", "co_signed_at"
         ),
     )
 

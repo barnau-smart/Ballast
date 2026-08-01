@@ -100,7 +100,7 @@ development_status:
   6-3-live-schwab-placement-reconciliation-mapping: done
   6-4-fixed-point-money-serialization-pass: done
   6-5-real-schwab-balances-cash-only-mapping: done
-  6-6-decisions-history-scale-hardening: backlog
+  6-6-decisions-history-scale-hardening: done
   6-7-durable-cross-request-timeout-reconciliation: backlog
   epic-6-retrospective: optional
 

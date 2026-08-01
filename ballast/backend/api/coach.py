@@ -51,10 +51,11 @@ from decimal import Decimal
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.config import get_settings
 from api.deps import RECONNECT_MESSAGE, get_scope, require_live_broker_session
 from brokers.factory import get_execution_broker
 from brokers.port import BrokerPort, OrderNotPlaceableError, OrderOutcome
@@ -83,6 +84,15 @@ from money import format_money
 logger = logging.getLogger("ballast.api.coach")
 
 router = APIRouter(prefix="/api/coach", tags=["coach"])
+
+#: Decisions-history pagination bounds (Story 6.6), resolved from settings ONCE
+#: at import because a FastAPI ``Query`` default must be a concrete value at
+#: function-definition time. These are process-level configuration (page size +
+#: hard cap), not per-request inputs, so freezing them at import is correct; a
+#: change requires a restart, like the other env-driven bounds.
+_DECISION_SETTINGS = get_settings()
+DECISION_PAGE_SIZE = _DECISION_SETTINGS.DECISION_PAGE_SIZE
+DECISION_MAX_PAGE_SIZE = _DECISION_SETTINGS.DECISION_MAX_PAGE_SIZE
 
 #: The calm 409 surfaced when an approve of THIS decision is already in flight
 #: (another request won the atomic proposed→cosigning claim and is placing now).
@@ -204,9 +214,18 @@ class DecisionSummaryOut(BaseModel):
 
 
 class DecisionListResponse(BaseModel):
-    """The user's co-signed decisions, newest-first (Story 4.10)."""
+    """The user's co-signed decisions, newest-first, paginated (Story 4.10/6.6).
+
+    The ``decisions`` array is one bounded page (at most ``limit`` rows). The
+    additive ``has_more``/``limit``/``offset`` fields (Story 6.6) let a client
+    page without guessing; ``decisions`` stays intact so any pre-6.6 consumer
+    keeps working.
+    """
 
     decisions: list[DecisionSummaryOut]
+    has_more: bool
+    limit: int
+    offset: int
 
 
 class DecisionDetailResponse(BaseModel):
@@ -517,20 +536,33 @@ async def approve(
 async def list_decisions(
     scope: Scope = Depends(get_scope),
     session: AsyncSession = Depends(get_async_session),
+    limit: int = Query(DECISION_PAGE_SIZE, ge=1, le=DECISION_MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
 ) -> DecisionListResponse:
-    """LIST the caller's co-signed decisions, newest-first (Story 4.10, FR16).
+    """LIST a bounded page of the caller's co-signed decisions (Story 4.10/6.6).
 
-    Read-only history over the immutable record: delegates to the Coach Engine's
-    sole reader (:func:`coach.decision_record.list_cosigned_decisions`), which
-    returns this user's ``cosigned`` rows ordered by ``co_signed_at`` desc through
-    the fail-closed :class:`~db.repository.ScopedRepository` (a foreign row is
-    never visible; ``proposed`` rows are excluded). This handler never queries the
-    model itself (AD-6) and NEVER re-runs the pipeline or recomputes anything
-    (AD-5). No broker/live-session dependency — history reads work in degraded mode.
+    Read-only, paginated history over the immutable record: delegates to the
+    Coach Engine's sole reader
+    (:func:`coach.decision_record.list_cosigned_decisions`), which returns this
+    user's ``cosigned`` rows ordered by ``co_signed_at`` desc THROUGH the
+    fail-closed :class:`~db.repository.ScopedRepository` — scoping, filter,
+    ordering, and the ``limit``/``offset`` window all execute in SQL (a foreign
+    row is never visible; ``proposed`` rows are excluded). ``limit`` is bounded by
+    ``DECISION_MAX_PAGE_SIZE`` (an over-cap request is a 422, never clamped) and
+    both bounds have floors (Story 6.6). The additive ``has_more``/``limit``/
+    ``offset`` envelope is echoed back so a client can page without guessing. This
+    handler never queries the model itself (AD-6) and NEVER re-runs the pipeline
+    or recomputes anything (AD-5). No broker/live-session dependency — history
+    reads work in degraded mode.
     """
-    records = await list_cosigned_decisions(scope=scope, session=session)
+    page = await list_cosigned_decisions(
+        scope=scope, session=session, limit=limit, offset=offset
+    )
     return DecisionListResponse(
-        decisions=[_decision_summary_out(record) for record in records]
+        decisions=[_decision_summary_out(record) for record in page.rows],
+        has_more=page.has_more,
+        limit=limit,
+        offset=offset,
     )
 
 

@@ -48,10 +48,11 @@ UTC. Callers control ``commit`` on the session (the repository only flushes).
 from __future__ import annotations
 
 import datetime
+from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from brokers.port import OrderOutcome
@@ -220,26 +221,93 @@ async def load_decision(
     return await repo.get(decision_id)
 
 
+@dataclass
+class DecisionPage:
+    """One bounded page of co-signed decision records (Story 6.6).
+
+    ``rows`` are the (at most ``limit``) newest-first cosigned records for the
+    page; ``has_more`` is ``True`` when at least one further row exists beyond
+    this page (computed by fetching ``limit + 1`` and trimming the extra).
+    """
+
+    rows: list[DecisionRecord]
+    has_more: bool
+
+
 async def list_cosigned_decisions(
     *,
     scope: Scope,
     session: AsyncSession,
-) -> list[DecisionRecord]:
-    """List THIS user's co-signed decision records, newest co-sign first (4.10).
+    limit: int,
+    offset: int = 0,
+) -> DecisionPage:
+    """List a bounded page of THIS user's co-signed decisions, newest first (6.6).
 
     Reads the owner's rows THROUGH the fail-closed
-    :class:`~db.repository.ScopedRepository` (a foreign row is never visible),
-    keeps only ``status == "cosigned"`` rows, and sorts by ``co_signed_at``
-    descending in Python (``ScopedRepository.list()`` is unordered; every
-    cosigned row has a ``co_signed_at`` set). Read-only — this SOLE reader never
-    mutates or re-derives a record (AD-5/AD-6). The CALLER owns any commit
-    (there is nothing to commit here).
+    :class:`~db.repository.ScopedRepository` (a foreign row is never visible).
+    Scoping, the ``status == "cosigned"`` filter, ``co_signed_at`` DESC ordering,
+    and the ``limit``/``offset`` window ALL execute in SQL via
+    :meth:`~db.repository.ScopedRepository.list_page` — the whole table is never
+    loaded (Story 6.6, backed by the ``(owner_id, co_signed_at)`` composite
+    index). ``limit + 1`` rows are fetched so an extra row signals a further page
+    (``has_more``) without a second COUNT query; the extra is trimmed off.
+    Read-only — this SOLE reader never mutates or re-derives a record
+    (AD-5/AD-6). The CALLER owns any commit (there is nothing to commit here).
     """
     repo = ScopedRepository(DecisionRecord, scope, session)
-    rows = await repo.list()
-    cosigned = [row for row in rows if row.status == "cosigned"]
-    cosigned.sort(key=lambda row: row.co_signed_at, reverse=True)
-    return cosigned
+    rows = await repo.list_page(
+        order_by=DecisionRecord.co_signed_at,
+        descending=True,
+        limit=limit + 1,
+        offset=offset,
+        filters=(DecisionRecord.status == "cosigned",),
+    )
+    has_more = len(rows) > limit
+    return DecisionPage(rows=rows[:limit], has_more=has_more)
+
+
+async def prune_stale_proposed_decisions(
+    *,
+    session: AsyncSession,
+    older_than_days: int,
+    now: datetime.datetime | None = None,
+) -> int:
+    """Delete never-co-signed **proposed** records older than the window (6.6).
+
+    The SYSTEM-scope retention writer for never-co-signed records: a ``proposed``
+    row was never executed (no order exists, its ``idempotency_key`` never reached
+    the broker), so deleting stale ones bounds the table. Issues a single
+    ``DELETE FROM decision_record WHERE status='proposed' AND created_at < cutoff``
+    where ``cutoff = now - older_than_days``, commits, and returns the number of
+    rows deleted.
+
+    The predicate HARD-PINS ``status == "proposed"`` so a ``cosigned`` (or a
+    transient ``cosigning``) row can NEVER be deleted — cosigned records are
+    immutable and permanent; their on-the-record history is preserved. This is
+    the SOLE writer module for :class:`~db.models.DecisionRecord` (AD-6); the
+    delete lives here and nowhere else.
+
+    ``older_than_days`` must be non-negative: a negative window would push the
+    cutoff into the FUTURE and delete recent (even seconds-old) proposed rows, so
+    a misconfigured retention setting is refused rather than silently destructive.
+    """
+    if older_than_days < 0:
+        raise ValueError(
+            "older_than_days must be >= 0 "
+            f"(got {older_than_days}); a negative window would prune recent "
+            "proposed records."
+        )
+    cutoff = (
+        now or datetime.datetime.now(datetime.timezone.utc)
+    ) - datetime.timedelta(days=older_than_days)
+    result = await session.execute(
+        delete(DecisionRecord).where(
+            DecisionRecord.status == "proposed",
+            DecisionRecord.created_at < cutoff,
+        )
+    )
+    await session.commit()
+    return result.rowcount
 
 
 def cosign(

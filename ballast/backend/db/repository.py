@@ -82,6 +82,49 @@ class ScopedRepository(Generic[ModelT]):
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_page(
+        self,
+        *,
+        order_by,
+        descending: bool = False,
+        limit: int,
+        offset: int = 0,
+        filters=(),
+    ) -> list[ModelT]:
+        """Return a bounded, ordered page of rows visible to this scope.
+
+        The scale-safe counterpart to :meth:`list`: ordering, extra ``filters``,
+        and the ``limit``/``offset`` window all execute in SQL, so the whole table
+        is never loaded into memory (Story 6.6). The owner filter is applied in
+        SQL under a USER scope EXACTLY as :meth:`list` does — a foreign row is
+        never selected — and SYSTEM scope spans all owners (never bypassing the
+        fail-closed guard installed at construction).
+
+        - ``order_by`` is a model column; ``descending`` picks ``.desc()`` vs
+          ``.asc()``.
+        - ``filters`` is an iterable of extra SQL clauses appended via
+          ``.where()`` (e.g. ``DecisionRecord.status == "cosigned"``).
+        - ``limit``/``offset`` bound the page.
+
+        The primary key is ALWAYS appended as a final tiebreaker so the total
+        order is deterministic: without it, rows sharing an ``order_by`` value
+        (e.g. two decisions co-signed in the same instant) have an unspecified
+        relative order that can differ between requests, and offset paging would
+        silently skip or duplicate such a row across a page boundary.
+        """
+        pk = self._model.__mapper__.primary_key[0]
+        stmt = select(self._model)
+        if not self._scope.is_system:
+            stmt = stmt.where(self._model.owner_id == self._scope.user_id)
+        for clause in filters:
+            stmt = stmt.where(clause)
+        primary = order_by.desc() if descending else order_by.asc()
+        tiebreak = pk.desc() if descending else pk.asc()
+        stmt = stmt.order_by(primary, tiebreak)
+        stmt = stmt.limit(limit).offset(offset)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get(self, id: UUID) -> ModelT | None:
         """Return the row with primary key ``id`` if visible to this scope.
 
