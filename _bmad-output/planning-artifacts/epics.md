@@ -491,11 +491,19 @@ As a user,
 I want approved orders to actually reach Schwab and reconcile truthfully,
 So that the Coach moves real money safely.
 
+> **Product & live-trade decisions (MasterB, 2026-08-01 — resolved; these are requirements, not open questions):**
+> 1. **Dollar→share sizing = whole-share MARKET order.** `OrderIntent.amount` is a dollar notional; schwab-py 1.5.1 exposes only share-quantity equity builders. At placement, fetch a Schwab quote (`get_quote`), compute `quantity = floor(amount / ask)`, and place a whole-share market order. If `amount` buys less than one whole share, **refuse calmly** with a clear message (no order placed). NO fractional shares, NO notional/dollar orders.
+> 2. **No-`order_id` timeout = surface `pending`, never guess.** On an in-request indeterminate placement (`timeout`/`pending`), reconcile ONCE via the in-instance `idempotency_key → order_id` cache + `get_order`. On a true timeout with **no** `order_id`, surface `pending` and **never** auto-search or attribute-match recent orders. Persist `broker_ref` as a **queryable column** (not only inside `cosign_snapshot` JSON) so a later explicit reconcile can find the order; reconciliation happens only on an explicit user/status action. Durable **cross-request** timeout reconciliation is **out of scope → Story 6.7**.
+
 **Acceptance Criteria:**
 
-**Given** Story 6.1 has landed and `BROKER_ADAPTER=schwab` with a live brokerage session,
+**Given** Story 6.1 has landed and `BROKER_ADAPTER=schwab` with a live brokerage session, and a mocked schwab-py client for offline proof (the Story 6.2 injection pattern),
 **When** I approve an in-scope order,
-**Then** the real `place_order`/`get_order_status` map Schwab responses to the normalized `OrderOutcome {status, filled_qty, avg_price, broker_ref}`, the same placement-time integrity + provider-match + v1-scope gates fire, indeterminate placements reconcile exactly once via the persisted idempotency key, and no phantom/duplicate order is possible (FR8–FR10, FR22, FR23, NFR3, AD-7, AD-11, AD-13).
+**Then** the adapter builds an authenticated schwab-py trading client from the **decrypted** stored token (`client_from_access_functions`, no disk/network at construction) and resolves the account hash; sizes the order as a **whole-share market order** (`quantity = floor(amount / get_quote ask)`, refusing calmly if `amount` < one share); places exactly once; maps Schwab order-status JSON → the normalized `OrderOutcome {status, filled_qty, avg_price, broker_ref}` and Schwab status strings → the `OrderStatus` enum; wraps httpx/SDK transport errors → `OrderStatus.TIMEOUT` (indeterminate) with no raw exception leaking the port and no phantom fill; the placement-time session-integrity + provider-match + v1-index-scope gates and the **NULL-`idempotency_key` pre-flight guard** (the Story 6.1 deferred item due before go-live) all fire; and no phantom/duplicate order is possible (FR8–FR10, FR22, FR23, NFR3, AD-7, AD-11, AD-13).
+
+**And Given** a placement that times out with **no** `order_id`,
+**When** the Coach Engine reconciles,
+**Then** the outcome is surfaced as `pending` (never optimistic, never re-placed, never fuzzy-matched against recent orders), `broker_ref` is persisted as a queryable column for a later explicit reconcile, and durable cross-request reconciliation is explicitly deferred to Story 6.7 — all ACs provable offline against the mocked client (the one-time live paid placement is a manual go-live step behind real `SCHWAB_*` creds, exactly as Story 6.2 treated its live LLM call).
 
 ### Story 6.4: Fixed-point money serialization pass
 
@@ -532,3 +540,17 @@ So that the on-the-record memory scales.
 **Given** many decision records over time,
 **When** I open Decisions,
 **Then** `GET /decisions` is paginated and backed by a `(owner_id, co_signed_at)` index, and never-co-signed `proposed` records have a retention/pruning policy — with per-user isolation and verbatim replay unchanged (closes deferred-work 4.9/4.10 pagination/index/retention item).
+
+### Story 6.7: Durable cross-request timeout reconciliation
+
+As a user whose order timed out with no confirmation,
+I want the app to safely resolve it later without ever double-placing,
+So that an ambiguous placement is never left hanging or duplicated.
+
+> Carved out of Story 6.3 (MasterB decision, 2026-08-01): 6.3 surfaces `pending` in-request and persists `broker_ref` as a queryable column; this story makes an ambiguous placement recoverable ACROSS requests without a broker-honored idempotency key.
+
+**Acceptance Criteria:**
+
+**Given** a decision whose placement was surfaced `pending` with no confirmed `order_id`,
+**When** the user (or an explicit status action) asks to resolve it,
+**Then** the Coach Engine reconciles authoritative state by the persisted queryable `broker_ref`/`order_id` (never by fuzzy attribute-matching recent orders), surfaces the true `OrderOutcome` honestly, and — because Schwab honors no client idempotency key — **never** re-places on ambiguity: if the order cannot be positively confirmed it stays `pending` and prompts an explicit human re-confirmation (FR22, NFR3, AD-13; upholds never-double-place / never-phantom-fill on real money).
