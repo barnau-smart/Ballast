@@ -67,7 +67,13 @@ from db.connection import get_connection
 from db.models import MarketDaily, PortfolioCache
 from db.session import async_session_maker, engine
 from llm.fake_adapter import FakeLLMGateway
-from llm.port import LLMGateway, LLMResponse
+from llm.port import (
+    LLMGateway,
+    LLMMalformedResponseError,
+    LLMRefusalError,
+    LLMResponse,
+    LLMTransportError,
+)
 from precedent.evidence import EvidenceKind, EvidenceRecord
 
 
@@ -198,6 +204,22 @@ class _RaisingGateway(LLMGateway):
         raise RuntimeError("simulated gateway failure")
 
 
+class _TypedErrorGateway(LLMGateway):
+    """A stub whose .complete() raises a specific typed LLMError subtype.
+
+    Proves the pipeline's never-a-dead-end net degrades on every hardened-adapter
+    failure family (transport / refusal / malformed), not just a generic error.
+    """
+
+    provider = "test-typed-error"
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def complete(self, request):  # noqa: D401 - test stub
+        raise self._exc
+
+
 # --- LLM valid → surface the LLM's recommendation (default NOT used) ----------
 
 
@@ -265,6 +287,42 @@ def test_gate_rejection_falls_back_to_default_plan():
 def test_gateway_raise_falls_back_to_default_plan():
     retrieved = (_strategy_record(), _event_record())
     blessed = surface(_RaisingGateway(), _decision(), retrieved)
+
+    assert isinstance(blessed, BlessedRecommendation)
+    assert blessed == build_default_plan(retrieved)
+
+
+# --- Story 6.2: each typed LLMError subtype degrades to the default plan -------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        LLMTransportError("transport/timeout"),
+        LLMRefusalError("model refused"),
+        LLMMalformedResponseError("truncated/no-text/non-JSON/non-dict"),
+    ],
+)
+def test_each_typed_llm_error_degrades_to_default_plan(exc):
+    # The hardened adapter raises these typed llm.port.LLMError subtypes instead
+    # of leaking raw vendor/parse exceptions; the pipeline's broad net must
+    # degrade EACH of them to the strategy-backed default plan (never a dead-end).
+    retrieved = (_strategy_record(), _event_record())
+    blessed = surface(_TypedErrorGateway(exc), _decision(), retrieved)
+
+    assert isinstance(blessed, BlessedRecommendation)
+    assert blessed == build_default_plan(retrieved)
+    # Cites every retrieved ID, order preserved; a valid recommendation surfaced.
+    assert tuple(e.id for e in blessed.evidence) == ("strat-0001", "ep-0002")
+    assert blessed.order_intent is None
+
+
+def test_validation_error_still_caught_after_hardening():
+    # The 6.2 log change must NOT narrow the net: a RecommendationValidationError
+    # (valid JSON citing a fabricated evidence id) still degrades to the default
+    # plan — the never-a-dead-end guarantee holds for the non-LLMError arm too.
+    retrieved = (_strategy_record(), _event_record())
+    blessed = surface(_FabricatingGateway(), _decision(), retrieved)
 
     assert isinstance(blessed, BlessedRecommendation)
     assert blessed == build_default_plan(retrieved)
@@ -551,6 +609,101 @@ async def test_end_to_end_default_gateway_offline():
         assert len(blessed.evidence) >= 1
     finally:
         _clean([SYM_E2E])
+
+
+# --- Story 6.2: mocked REAL AnthropicGateway clears the 4.2 gate end to end ----
+#
+# This exercises the hardened, REAL AnthropicGateway.complete() (with the SDK
+# client MOCKED — zero credentials, zero network, zero paid tokens) all the way
+# through the 4.2 validation gate. A recommendation whose ``order_intent`` cites
+# a REAL retrieved evidence id must surface blessed with order_intent intact.
+#
+# NOTE: this file (like test_llm_gateway.py) must never contain a literal
+# ``import anthropic`` — the structural sole-caller test scans for it. The SDK
+# module is obtained via importlib.
+
+
+def _install_real_anthropic_gateway(monkeypatch, *, output: dict):
+    """Build a REAL AnthropicGateway whose mocked SDK client returns ``output``.
+
+    Patches ``anthropic.Anthropic`` so the (real) adapter's complete() parses a
+    crafted Message double carrying ``json.dumps(output)`` in a text block. Zero
+    network, zero real key.
+    """
+    import importlib
+    import json as _json
+    import types as _types
+
+    _anthropic = importlib.import_module("anthropic")
+
+    text_block = _types.SimpleNamespace(type="text", text=_json.dumps(output))
+    message = _types.SimpleNamespace(stop_reason="end_turn", content=[text_block])
+
+    class _Messages:
+        def create(self, **kwargs):
+            return message
+
+    def _factory(*, api_key):
+        return _types.SimpleNamespace(messages=_Messages())
+
+    monkeypatch.setattr(_anthropic, "Anthropic", _factory)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+
+    from llm.anthropic_adapter import AnthropicGateway
+
+    return AnthropicGateway()
+
+
+def test_mocked_real_gateway_order_intent_clears_gate_and_surfaces(monkeypatch):
+    # A real (SDK-mocked) AnthropicGateway emits a Recommendation JSON whose
+    # order_intent cites a REAL retrieved evidence id → it clears the 4.2 gate and
+    # surfaces blessed with order_intent intact (not the default plan).
+    retrieved = (_strategy_record(), _event_record())
+    output = {
+        "action_label": "Buy the dip within your plan",
+        "reasoning": (
+            "The retrieved precedent supports staying invested and adding on the "
+            "dip; consistent index investing compounds over time."
+        ),
+        "evidence": ["ep-0002"],
+        "uncertainties": ["Recovery timing is genuinely uncertain."],
+        "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+    }
+    gateway = _install_real_anthropic_gateway(monkeypatch, output=output)
+
+    blessed = surface(gateway, _decision(), retrieved)
+
+    assert isinstance(blessed, BlessedRecommendation)
+    # It is the LLM's blessed recommendation, NOT the default plan.
+    assert blessed != build_default_plan(retrieved)
+    assert blessed.action_label == "Buy the dip within your plan"
+    # Cited real evidence id resolved to the real record through the gate.
+    assert tuple(e.id for e in blessed.evidence) == ("ep-0002",)
+    assert all(isinstance(e, EvidenceRecord) for e in blessed.evidence)
+    # order_intent carried through intact.
+    assert blessed.order_intent is not None
+    assert blessed.order_intent.symbol == "VTI"
+    assert blessed.order_intent.side is OrderSide.BUY
+    assert blessed.order_intent.amount == Decimal("500")
+    # The real adapter reported its provider identity.
+    assert gateway.provider == "anthropic"
+
+
+def test_mocked_real_gateway_fabricated_evidence_degrades(monkeypatch):
+    # A real (SDK-mocked) gateway emitting VALID JSON that cites a FABRICATED id
+    # is rejected by the 4.2 gate (RecommendationValidationError) and degrades to
+    # the default plan — proving the gate still has teeth against the real path.
+    retrieved = (_strategy_record(), _event_record())
+    output = {
+        "action_label": "Do something clever",
+        "reasoning": "A plausible-sounding but unbacked rationale.",
+        "evidence": ["ep-DOES-NOT-EXIST"],
+        "uncertainties": ["something"],
+    }
+    gateway = _install_real_anthropic_gateway(monkeypatch, output=output)
+
+    blessed = surface(gateway, _decision(), retrieved)
+    assert blessed == build_default_plan(retrieved)
 
 
 # --- FR11: self-destructive-move warnings (never block, one reasoning field) --

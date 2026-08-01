@@ -31,7 +31,24 @@ import json
 
 from api.config import get_settings
 from llm.models import route_model
-from llm.port import LLMGateway, LLMRequest, LLMResponse, require_output_schema
+from llm.port import (
+    LLMGateway,
+    LLMMalformedResponseError,
+    LLMRefusalError,
+    LLMRequest,
+    LLMResponse,
+    LLMTransportError,
+    require_output_schema,
+    require_valid_messages,
+)
+
+#: Above this ``max_tokens`` the SDK's non-streaming ``messages.create`` refuses
+#: the request (it may exceed the SDK's ~10-minute non-streaming estimate), so
+#: such requests are routed through the streaming helper
+#: (``with client.messages.stream(...) as s: s.get_final_message()``) — which
+#: returns a full Message of identical shape, parsed by the same helper. The v1
+#: coach uses ``max_tokens=4096``, so this path is DEFENSIVE (but tested).
+STREAMING_MAX_TOKENS = 16000
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -68,14 +85,26 @@ class AnthropicGateway(LLMGateway):
     def complete(self, request: LLMRequest) -> LLMResponse:
         """Run one structured completion against Claude (network call).
 
-        Enforces the structured-output requirement first (raises before any model
-        call), imports the ``anthropic`` SDK lazily (AD-6), routes the model, and
-        calls the synchronous ``messages.create`` with ``output_config.format``.
-        Parses the first text block as JSON into ``output``. The API key and raw
-        bodies are never logged.
+        Enforces the structured-output requirement and the message precondition
+        first (both raise BEFORE any model call — the latter before the client is
+        even constructed), imports the ``anthropic`` SDK lazily (AD-6), routes the
+        model, and issues the call with ``output_config.format``. A request whose
+        ``max_tokens`` exceeds :data:`STREAMING_MAX_TOKENS` is routed through
+        ``messages.stream(...).get_final_message()`` (which avoids the SDK's
+        non-streaming large-``max_tokens`` ``ValueError``); both paths return a
+        Message parsed by the shared :meth:`_parse_message`.
+
+        HARDENING (AD-6/NFR2): every runtime failure surfaces as a typed,
+        vendor-neutral :class:`~llm.port.LLMError` subtype — a raw ``anthropic.*``
+        SDK exception, ``json.JSONDecodeError``, or bare ``StopIteration`` NEVER
+        escapes this port. The API key and raw prompt/response bodies are never
+        logged.
         """
         require_output_schema(request)
         self._require_configured()
+        # Pre-flight precondition — rejects an empty/invalid conversation BEFORE
+        # the SDK is imported or any client is constructed.
+        require_valid_messages(request)
 
         # Lazy import: selecting the fake adapter never loads the anthropic SDK.
         # A missing SDK fails loud and clear like the rest of the adapter.
@@ -112,10 +141,68 @@ class AnthropicGateway(LLMGateway):
         if request.system is not None:
             kwargs["system"] = request.system
 
-        resp = client.messages.create(**kwargs)
+        # Wrap the vendor call so no raw ``anthropic.*`` (its ``APIError`` base
+        # covers timeout/connection/rate-limit/status/overloaded) escapes the
+        # port; chain via ``from``.
+        try:
+            if request.max_tokens > STREAMING_MAX_TOKENS:
+                # Large requests: stream and coalesce to a full Message of the
+                # same shape (avoids the non-streaming large-``max_tokens``
+                # refusal). ``messages.stream(...)`` returns a CONTEXT MANAGER;
+                # ``get_final_message()`` is only available on the object yielded
+                # by entering it — so we must use ``with``. Streaming is an
+                # INTERNAL transport detail — no token-by-token surface leaks.
+                with client.messages.stream(**kwargs) as stream:
+                    resp = stream.get_final_message()
+            else:
+                resp = client.messages.create(**kwargs)
+        except anthropic.APIError as exc:
+            raise LLMTransportError(
+                "The Anthropic API call failed at transport level."
+            ) from exc
 
-        # Parse the first text block as JSON.
-        text = next(b.text for b in resp.content if b.type == "text")
-        output = json.loads(text)
+        return self._parse_message(resp, model)
 
+    def _parse_message(self, resp: object, model: str) -> LLMResponse:
+        """Parse a provider Message into an :class:`LLMResponse`, or raise typed.
+
+        Shared by BOTH the streaming and non-streaming paths (they return an
+        identically-shaped Message). Inspects ``stop_reason`` (refusal /
+        truncation), safely extracts the first ``type == "text"`` block (no bare
+        :class:`StopIteration`), parses its JSON guardedly (no raw
+        ``json.JSONDecodeError``), and requires a ``dict`` root — every failure a
+        typed :class:`~llm.port.LLMError` subtype. No response body is logged.
+        """
+        if resp.stop_reason == "refusal":
+            raise LLMRefusalError("The model refused the request.")
+        # Truncated / incomplete terminal reasons: a partial (or absent) body must
+        # never be blessed as a complete response. ``max_tokens`` and
+        # ``model_context_window_exceeded`` are output-truncation; ``pause_turn``
+        # is an incomplete/paused turn. All degrade — none are parsed.
+        if resp.stop_reason in (
+            "max_tokens",
+            "model_context_window_exceeded",
+            "pause_turn",
+        ):
+            raise LLMMalformedResponseError(
+                "The response was truncated or incomplete "
+                f"(stop_reason={resp.stop_reason!r})."
+            )
+        # ``resp.content or []`` — None-safe; ``next(..., None)`` — no bare
+        # StopIteration if there is no text block.
+        text = next(
+            (b.text for b in (resp.content or []) if b.type == "text"), None
+        )
+        if text is None:
+            raise LLMMalformedResponseError("No text block in the response.")
+        try:
+            output = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LLMMalformedResponseError(
+                "The structured output was not valid JSON."
+            ) from exc
+        if not isinstance(output, dict):
+            raise LLMMalformedResponseError(
+                "The structured output root is not an object."
+            )
         return LLMResponse(output=output, model=model, provider=self.provider)

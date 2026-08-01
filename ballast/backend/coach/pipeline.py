@@ -48,7 +48,7 @@ from coach.recommendation import (
 )
 from coach.validation import BlessedRecommendation, validate_recommendation
 from llm.factory import get_llm_gateway
-from llm.port import LLMGateway, LLMMessage, LLMRequest
+from llm.port import LLMError, LLMGateway, LLMMessage, LLMRequest
 from precedent import EvidenceKind, EvidenceRecord, find_precedent
 from precedent.engine import DEFAULT_BENCHMARK
 
@@ -449,14 +449,20 @@ def surface(
             recommendation_from_output(response.output), retrieved
         )
     except Exception as exc:
+        # KEEP the deliberately-broad net: it MUST still catch
+        # RecommendationValidationError (the "valid JSON, fabricated evidence id"
+        # arm) as well as every typed LLMError the hardened adapter now raises.
         # Silent degradation of a trust-critical path is unobservable; log a
         # structured warning (no secrets, no raw tokens — just provider + error
-        # type) so a coach that has quietly stopped making special calls is
-        # visible in production. Matches find_precedent's degrade-warning style.
+        # type, and whether it was a typed gateway failure) so a coach that has
+        # quietly stopped making special calls is visible in production. Matches
+        # find_precedent's degrade-warning style.
         logger.warning(
-            "coach_llm_path_failed_fallback_to_default provider=%s error=%s",
+            "coach_llm_path_failed_fallback_to_default provider=%s error=%s "
+            "llm_gateway_error=%s",
             getattr(gateway, "provider", "unknown"),
             type(exc).__name__,
+            isinstance(exc, LLMError),
         )
         return build_default_plan(retrieved, warnings)  # never a dead-end
 
