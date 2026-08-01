@@ -225,3 +225,32 @@ class BrokerPort(ABC):
         method never logs token/secret material.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        """Reconcile a previously-placed order **by its persisted broker order id**.
+
+        The DURABLE, cross-request reconciliation primitive (Story 6.7, AD-13).
+        Unlike :meth:`get_order_status` — which keys on the client
+        ``idempotency_key`` and can only read the adapter's in-request cache
+        (empty in any later request) — this keys on the queryable ``broker_ref``
+        (order id) that the co-sign persisted, so an ambiguous
+        ``timeout``/``pending`` placement can be resolved in a LATER request. It
+        is called ONLY by the Coach Engine's ``reconcile_pending_decision``
+        (:func:`coach.execution.reconcile_pending_decision`, AD-7).
+
+        READ-ONLY and single-shot: a single ``get_order`` read — it NEVER places
+        (:meth:`place_order` is never called), NEVER mints a key, NEVER loops or
+        polls, and NEVER calls ``get_orders_for_account`` or attribute/amount/time
+        fuzzy-matching. An unknown/empty/unusable ``broker_ref`` returns an honest
+        ``PENDING`` (``filled_qty=0``, ``avg_price=None``, ``broker_ref=None``)
+        WITHOUT touching the broker — it never searches or guesses. A
+        transport/SDK/parse error on the read is INDETERMINATE → ``TIMEOUT`` with
+        the ``broker_ref`` PRESERVED and NO raw exception leaking past the port
+        (mirrors the :meth:`get_order_status` fence discipline), so a landed order
+        stays reconcilable.
+
+        Money in the returned outcome is ``Decimal`` (never binary float). This
+        method never logs token/secret material.
+        """
+        raise NotImplementedError

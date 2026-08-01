@@ -119,6 +119,20 @@ async def ensure_tables():
                 "ON decision_record (owner_id, co_signed_at)"
             )
         )
+        # Story 6.7 adds the additive durable-reconciliation columns; reconcile a
+        # carried-over DB the same way (create_all won't ALTER an existing table).
+        await conn.execute(
+            text(
+                "ALTER TABLE decision_record "
+                "ADD COLUMN IF NOT EXISTS reconciliation_snapshot JSON"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE decision_record "
+                "ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ"
+            )
+        )
     yield
 
 
@@ -294,6 +308,7 @@ class _SpyAdapter(BrokerPort):
     def __init__(self) -> None:
         self.calls: list[tuple[OrderIntent, str]] = []
         self.status_calls: list[str] = []
+        self.ref_calls: list[str] = []
         self._delegate = FakeBrokerAdapter()
 
     def authorization_url(self, state: str) -> str:
@@ -317,6 +332,10 @@ class _SpyAdapter(BrokerPort):
         self.status_calls.append(idempotency_key)
         return await self._delegate.get_order_status(idempotency_key)
 
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        self.ref_calls.append(broker_ref)
+        return await self._delegate.get_order_status_by_ref(broker_ref)
+
 
 class _ScriptedAdapter(BrokerPort):
     """A broker double that returns a SCRIPTED placement/reconciliation outcome.
@@ -337,11 +356,14 @@ class _ScriptedAdapter(BrokerPort):
         *,
         placement: OrderOutcome,
         reconciled: OrderOutcome | None = None,
+        reconciled_by_ref: OrderOutcome | None = None,
     ) -> None:
         self._placement = placement
         self._reconciled = reconciled
+        self._reconciled_by_ref = reconciled_by_ref
         self.calls: list[tuple[OrderIntent, str]] = []
         self.status_calls: list[str] = []
+        self.ref_calls: list[str] = []
         self._delegate = FakeBrokerAdapter()
 
     def authorization_url(self, state: str) -> str:
@@ -367,6 +389,15 @@ class _ScriptedAdapter(BrokerPort):
                 "scripted — the placement should have been definitive."
             )
         return self._reconciled
+
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        self.ref_calls.append(broker_ref)
+        if self._reconciled_by_ref is None:
+            raise AssertionError(
+                "get_order_status_by_ref was called but no by-ref outcome was "
+                "scripted — the reconcile should not have touched the broker."
+            )
+        return self._reconciled_by_ref
 
 
 # =============================================================================
@@ -653,6 +684,11 @@ class _NotPlaceableAdapter(BrokerPort):
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
         raise AssertionError("get_order_status must not be reached on a refusal")
 
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        raise AssertionError(
+            "get_order_status_by_ref must not be reached on a refusal"
+        )
+
 
 def _broker_ref_for(owner: uuid.UUID) -> str | None:
     """Read this owner's decision_record.broker_ref column (Story 6.3)."""
@@ -664,6 +700,20 @@ def _broker_ref_for(owner: uuid.UUID) -> str | None:
             )
             (ref,) = cur.fetchone()
     return ref
+
+
+def _reconciliation_row(owner: uuid.UUID) -> dict:
+    """Read this owner's reconciliation_snapshot + reconciled_at (Story 6.7)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reconciliation_snapshot, reconciled_at "
+                "FROM decision_record WHERE owner_id = %s",
+                (str(owner),),
+            )
+            cols = [c.name for c in cur.description]
+            (row,) = cur.fetchall()
+    return dict(zip(cols, row))
 
 
 def _null_idempotency_key(owner: uuid.UUID) -> None:
@@ -1019,6 +1069,178 @@ async def test_execution_owner_provider_mismatch_raises_broker_untouched():
         await execute_approved_order(intent, broker=spy, broker_session=session)
     assert spy.calls == []
     assert spy.status_calls == []
+
+
+def _cosigned_record_stub(
+    *, outcome_status: str, broker_ref: str | None
+) -> object:
+    """A minimal cosigned DecisionRecord stand-in for reconcile-engine unit tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        status="cosigned",
+        broker_ref=broker_ref,
+        reconciliation_snapshot=None,
+        cosign_snapshot={
+            "outcome": {
+                "status": outcome_status,
+                "filled_qty": "0",
+                "avg_price": None,
+                "broker_ref": broker_ref,
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_integrity_first_broker_untouched():
+    # (6.7 unit) reconcile_pending_decision asserts session integrity FIRST — a
+    # non-live session → SessionIntegrityError before any broker read.
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()
+    record = _cosigned_record_stub(outcome_status="pending", broker_ref="42")
+    session = BrokerageSession(
+        state="expired", expires_at=_expired(), provider="fake"
+    )
+    with pytest.raises(SessionIntegrityError):
+        await reconcile_pending_decision(
+            record, broker=spy, broker_session=session
+        )
+    assert spy.ref_calls == []
+    assert spy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_provider_mismatch_broker_untouched():
+    # (6.7 unit) a live session whose provider disagrees with the reading adapter →
+    # SessionIntegrityError; the broker is never read.
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()  # provider == "fake"
+    record = _cosigned_record_stub(outcome_status="pending", broker_ref="42")
+    with pytest.raises(SessionIntegrityError):
+        await reconcile_pending_decision(
+            record, broker=spy, broker_session=_live_session(provider="schwab")
+        )
+    assert spy.ref_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_terminal_short_circuits_no_broker_read():
+    # (6.7 unit) a terminal effective status returns the recorded outcome without
+    # touching the broker; reconciled=False, needs_reconfirmation=False.
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()
+    record = _cosigned_record_stub(outcome_status="filled", broker_ref="42")
+    result = await reconcile_pending_decision(
+        record, broker=spy, broker_session=_live_session()
+    )
+    assert result.reconciled is False
+    assert result.needs_reconfirmation is False
+    assert result.outcome.status is OrderStatus.FILLED
+    assert spy.ref_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_no_ref_needs_reconfirmation_no_broker_read():
+    # (6.7 unit) a non-terminal outcome with broker_ref=None never touches the
+    # broker and signals needs_reconfirmation.
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()
+    record = _cosigned_record_stub(outcome_status="pending", broker_ref=None)
+    result = await reconcile_pending_decision(
+        record, broker=spy, broker_session=_live_session()
+    )
+    assert result.reconciled is False
+    assert result.needs_reconfirmation is True
+    assert spy.ref_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_reads_by_ref_when_pending_with_ref():
+    # (6.7 unit) a non-terminal outcome WITH a broker_ref reads by ref exactly once
+    # (never place_order). A successful read that reports a still-working ``pending``
+    # order IS a positive confirmation (the order exists at the broker), so it is
+    # retryable-without-a-human: needs_reconfirmation=False (matrix "Still working").
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()
+    spy._delegate.seed_order_status_by_ref(
+        "42",
+        OrderOutcome(
+            status=OrderStatus.PENDING, filled_qty=Decimal("0"), broker_ref="42"
+        ),
+    )
+    record = _cosigned_record_stub(outcome_status="pending", broker_ref="42")
+    result = await reconcile_pending_decision(
+        record, broker=spy, broker_session=_live_session()
+    )
+    assert result.reconciled is True
+    assert result.needs_reconfirmation is False  # working order is confirmed
+    assert spy.ref_calls == ["42"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_engine_timeout_read_needs_reconfirmation():
+    # (6.7 unit) a by-ref read that is indeterminate (TIMEOUT — a transport error
+    # fenced by the port) CANNOT be positively confirmed, so needs_reconfirmation is
+    # True (matrix "Transport error"). Still read-only, never places, ref preserved.
+    from coach.execution import reconcile_pending_decision
+
+    spy = _SpyAdapter()
+    spy._delegate.seed_order_status_by_ref(
+        "42",
+        OrderOutcome(
+            status=OrderStatus.TIMEOUT, filled_qty=Decimal("0"), broker_ref="42"
+        ),
+    )
+    record = _cosigned_record_stub(outcome_status="pending", broker_ref="42")
+    result = await reconcile_pending_decision(
+        record, broker=spy, broker_session=_live_session()
+    )
+    assert result.reconciled is True
+    assert result.needs_reconfirmation is True  # timeout is unconfirmable
+    assert result.outcome.broker_ref == "42"  # id preserved through the fence
+    assert spy.ref_calls == ["42"]
+    assert spy.calls == []  # never placed
+
+
+def test_record_reconciliation_never_regresses_a_terminal_outcome():
+    # (6.7 writer invariant, AD-6 defense-in-depth) ``record_reconciliation`` is
+    # monotonic toward settlement: handed a non-terminal (pending) outcome for a
+    # record whose newest-known state is ALREADY terminal (filled), it is a NO-OP —
+    # a settled money truth is never walked backward by a stale/racing read.
+    from types import SimpleNamespace
+
+    from brokers.port import OrderOutcome, OrderStatus
+    from coach.decision_record import record_reconciliation
+
+    record = SimpleNamespace(
+        status="cosigned",
+        broker_ref="42",
+        reconciliation_snapshot=None,
+        reconciled_at=None,
+        cosign_snapshot={
+            "outcome": {
+                "status": "filled",
+                "filled_qty": "2",
+                "avg_price": "100.00",
+                "broker_ref": "42",
+            }
+        },
+    )
+    record_reconciliation(
+        record,
+        outcome=OrderOutcome(
+            status=OrderStatus.PENDING, filled_qty=Decimal("0"), broker_ref="42"
+        ),
+    )
+    # No-op: the terminal cosign truth stands; nothing was written.
+    assert record.reconciliation_snapshot is None
+    assert record.reconciled_at is None
 
 
 @pytest.mark.asyncio
@@ -1716,6 +1938,9 @@ class _BlockingSpyAdapter(BrokerPort):
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
         self.status_calls.append(idempotency_key)
         return await self._delegate.get_order_status(idempotency_key)
+
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        return await self._delegate.get_order_status_by_ref(broker_ref)
 
 
 def _proposed_decision_row(owner: uuid.UUID) -> dict:
@@ -2588,3 +2813,537 @@ def test_prune_rejects_negative_window():
 
     with pytest.raises(ValueError):
         asyncio.run(_run())
+
+
+# =============================================================================
+# STORY 6.7 — DURABLE CROSS-REQUEST TIMEOUT RECONCILIATION
+# =============================================================================
+
+
+def _cosign_pending_with_ref(
+    client: TestClient, headers: dict, *, broker_ref: str | None
+) -> str:
+    """Cosign ONE decision surfaced ``pending`` carrying ``broker_ref`` (6.7 setup).
+
+    Drives recommend→approve through a scripted adapter whose placement is
+    indeterminate (pending) and whose in-request reconcile also reports pending
+    with the given ``broker_ref`` — so the cosigned record persists
+    ``status=cosigned``, ``cosign_snapshot.outcome.status=pending``, and
+    ``broker_ref`` in its queryable column. Returns the cosigned decision_id.
+    """
+    placement = OrderOutcome(
+        status=OrderStatus.PENDING, filled_qty=Decimal("0"), avg_price=None
+    )
+    reconciled = OrderOutcome(
+        status=OrderStatus.PENDING,
+        filled_qty=Decimal("0"),
+        avg_price=None,
+        broker_ref=broker_ref,
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    decision_id = _recommend_decision_id(client, headers)
+    resp = client.post(
+        "/api/coach/approve",
+        json={
+            "decision_id": decision_id,
+            "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "pending"
+    return decision_id
+
+
+def test_reconcile_pending_with_ref_resolves_to_filled_and_persists(client):
+    # (matrix: resolves to filled) A cosigned decision surfaced pending whose
+    # broker_ref is set → reconcile reads FILLED by ref, persists
+    # reconciliation_snapshot/reconciled_at, and returns filled,
+    # needs_reconfirmation=false. place_order is NEVER called on the reconcile.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="42")
+        assert _broker_ref_for(uid) == "42"
+
+        # A fresh adapter for the reconcile request: it never placed the order, but
+        # its by-ref read now reports the order FILLED.
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("2"),
+            avg_price=Decimal("100.00"),
+            broker_ref="42",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=filled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "filled"
+        assert body["needs_reconfirmation"] is False
+        assert body["filled_qty"] == "2"
+        assert body["avg_price"] == "100.00"
+        assert body["broker_ref"] == "42"
+        # Read by ref exactly once; NEVER placed on the reconcile path.
+        assert reconcile_adapter.ref_calls == ["42"]
+        assert reconcile_adapter.calls == []
+
+        # Persisted additively; the immutable snapshots are untouched.
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"]["outcome"]["status"] == "filled"
+        assert row["reconciliation_snapshot"]["outcome"]["filled_qty"] == "2"
+        assert row["reconciled_at"] is not None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_no_broker_ref_stays_pending_needs_reconfirmation(client):
+    # (matrix: no order id / true timeout) A cosigned decision surfaced pending
+    # with broker_ref=None → the broker is NEVER touched, it stays pending, and the
+    # response sets needs_reconfirmation=true (never guess, never re-place).
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref=None)
+        assert _broker_ref_for(uid) is None
+
+        # A reconcile adapter that would FAIL LOUDLY if any broker method ran.
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "pending"
+        assert body["needs_reconfirmation"] is True
+        # Broker NEVER touched — no place_order, no by-ref read.
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+        # Nothing persisted (no reconcile read happened).
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"] is None
+        assert row["reconciled_at"] is None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_still_working_stays_pending(client):
+    # (matrix: still working) A by-ref read that is still WORKING → pending. The
+    # order is positively confirmed to exist (a successful read), so it is
+    # retryable-without-a-human: needs_reconfirmation=false, persisted; place_order
+    # never called.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="99")
+
+        still_pending = OrderOutcome(
+            status=OrderStatus.PENDING,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="99",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=still_pending,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "pending"
+        assert body["needs_reconfirmation"] is False
+        assert reconcile_adapter.ref_calls == ["99"]
+        assert reconcile_adapter.calls == []  # never placed
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_timeout_read_needs_reconfirmation(client):
+    # (matrix: transport error) A by-ref read fenced to TIMEOUT is indeterminate —
+    # the order cannot be positively confirmed, so needs_reconfirmation=true. The
+    # ref is preserved, the outcome persisted, and place_order is never called.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="77")
+
+        timed_out = OrderOutcome(
+            status=OrderStatus.TIMEOUT,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="77",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=timed_out,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "timeout"
+        assert body["needs_reconfirmation"] is True
+        assert body["broker_ref"] == "77"
+        assert reconcile_adapter.ref_calls == ["77"]
+        assert reconcile_adapter.calls == []  # never placed
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_already_terminal_is_idempotent_no_broker_call(client):
+    # (matrix: already terminal) A cosigned decision whose outcome is already
+    # FILLED → the broker is NEVER touched; the recorded terminal outcome is
+    # returned, needs_reconfirmation=false.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        # The default fake places FILLED, so a normal cosign is already terminal.
+        spy = _SpyAdapter()
+        client.app.dependency_overrides[get_broker] = lambda: spy
+        decision_id = _cosign_one(client, headers)
+
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "filled"
+        assert body["needs_reconfirmation"] is False
+        # Broker NEVER touched on a terminal outcome.
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+        # Nothing persisted (terminal short-circuit, no reconcile read).
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"] is None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_foreign_id_404_broker_untouched(client):
+    # (matrix: foreign / unknown id) A decision owned by another user → 404; the
+    # broker is never touched.
+    owner_email = _unique_email()
+    attacker_email = _unique_email()
+    try:
+        _register(client, owner_email)
+        owner_token = _login(client, owner_email)
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+        _insert_token_sync(_user_id_for(owner_email), _live())
+        foreign_id = _cosign_pending_with_ref(
+            client, owner_headers, broker_ref="42"
+        )
+
+        _register(client, attacker_email)
+        attacker_token = _login(client, attacker_email)
+        attacker_headers = {"Authorization": f"Bearer {attacker_token}"}
+        _insert_token_sync(_user_id_for(attacker_email), _live())
+
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{foreign_id}/reconcile",
+            headers=attacker_headers,
+        )
+        assert resp.status_code == 404, resp.text
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+
+        # Unknown id → also 404.
+        unknown = client.post(
+            f"/api/coach/decisions/{uuid.uuid4()}/reconcile",
+            headers=attacker_headers,
+        )
+        assert unknown.status_code == 404, unknown.text
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(owner_email)
+        _delete_user(attacker_email)
+
+
+def test_reconcile_not_cosigned_returns_422_broker_untouched(client):
+    # (matrix: not cosigned) A proposed (never-cosigned) decision → calm 422;
+    # nothing placed to reconcile, broker never touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        proposed_id = _recommend_decision_id(client, headers)
+
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{proposed_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 422, resp.text
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_session_not_live_returns_409_broker_untouched(client):
+    # (matrix: session not live) No live session → calm 409 reconnect; broker
+    # never touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="42")
+
+        # Now expire the session so require_live_broker_session gates.
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE brokerage_token SET expires_at = %s WHERE owner_id = %s",
+                    (_expired(), str(_user_id_for(email))),
+                )
+            conn.commit()
+
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_never_places_order_on_any_path(client):
+    # (matrix: never re-places) Across resolve/pending paths, place_order is NEVER
+    # called — the reconcile is strictly read-only.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="42")
+
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("3"),
+            avg_price=Decimal("50.00"),
+            broker_ref="42",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=filled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        # place_order NEVER called on the reconcile path (strictly read-only).
+        assert reconcile_adapter.calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_detail_replay_byte_identical_and_isolation(client):
+    # (AC5) After reconciliation, GET /decisions/{id} replays the IMMUTABLE
+    # recommendation_snapshot/cosign_snapshot byte-identically (only the additive
+    # reconciliation fields are added), and per-user isolation holds on the detail.
+    owner_email = _unique_email()
+    attacker_email = _unique_email()
+    try:
+        _register(client, owner_email)
+        owner_token = _login(client, owner_email)
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+        uid = _user_id_for(owner_email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(
+            client, owner_headers, broker_ref="42"
+        )
+
+        # Snapshot the immutable payloads BEFORE reconciling.
+        before = client.get(
+            f"/api/coach/decisions/{decision_id}", headers=owner_headers
+        ).json()
+
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("2"),
+            avg_price=Decimal("100.00"),
+            broker_ref="42",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=filled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+        client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=owner_headers
+        )
+
+        after = client.get(
+            f"/api/coach/decisions/{decision_id}", headers=owner_headers
+        ).json()
+
+        # The immutable snapshots are BYTE-IDENTICAL before/after reconcile.
+        assert after["recommendation_snapshot"] == before["recommendation_snapshot"]
+        assert after["cosign_snapshot"] == before["cosign_snapshot"]
+        # The additive reconciliation fields now surface truthfully.
+        assert after["reconciliation_snapshot"]["outcome"]["status"] == "filled"
+        assert after["reconciled_at"] is not None
+        # ... and were absent (null) before the reconcile.
+        assert before["reconciliation_snapshot"] is None
+        assert before["reconciled_at"] is None
+
+        # Per-user isolation: an attacker cannot read this decision's detail.
+        _register(client, attacker_email)
+        attacker_token = _login(client, attacker_email)
+        attacker_headers = {"Authorization": f"Bearer {attacker_token}"}
+        foreign = client.get(
+            f"/api/coach/decisions/{decision_id}", headers=attacker_headers
+        )
+        assert foreign.status_code == 404, foreign.text
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(owner_email)
+        _delete_user(attacker_email)
+
+
+def test_reconcile_summary_outcome_status_reflects_effective(client):
+    # (AC5) After reconcile, the /decisions list summary's outcome_status reflects
+    # the NEWEST truth (effective_outcome_status), not the stale cosign status.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="42")
+
+        # Before reconcile: the summary shows the cosign status (pending).
+        listing = client.get("/api/coach/decisions", headers=headers).json()
+        summary = next(
+            d for d in listing["decisions"] if d["decision_id"] == decision_id
+        )
+        assert summary["outcome_status"] == "pending"
+
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("2"),
+            avg_price=Decimal("100.00"),
+            broker_ref="42",
+        )
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            reconciled_by_ref=filled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+        client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+
+        # After reconcile: the summary reflects the newest truth (filled).
+        listing2 = client.get("/api/coach/decisions", headers=headers).json()
+        summary2 = next(
+            d for d in listing2["decisions"] if d["decision_id"] == decision_id
+        )
+        assert summary2["outcome_status"] == "filled"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)

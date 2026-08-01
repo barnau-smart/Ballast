@@ -469,6 +469,76 @@ class SchwabAdapter(BrokerPort):
                 broker_ref=order_ref,
             )
 
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        """Reconcile a placed Schwab order by its persisted order id (Story 6.7).
+
+        The DURABLE cross-request reconciliation read (AD-13): unlike
+        :meth:`get_order_status`, which keys on the client idempotency key and can
+        only see this instance's in-request cache, this keys on the queryable
+        ``broker_ref`` (Schwab order id) the co-sign persisted — so an ambiguous
+        placement is resolvable in a LATER request against a fresh adapter. Called
+        ONLY by :func:`coach.execution.reconcile_pending_decision` (AD-7).
+
+        READ-ONLY, single ``get_order``: an empty / non-usable ``broker_ref``
+        (``None``/blank/non-integer) short-circuits to an honest ``PENDING``
+        (``filled_qty`` 0, no ``avg_price``, no ``broker_ref``) WITHOUT ever
+        building the client or touching the SDK — it NEVER searches
+        (``get_orders_for_account``) and NEVER attribute-matches. With a usable id
+        it builds the client, resolves the account hash, reads the one order
+        (``client.get_order(int(broker_ref), hash)``) and maps it via
+        :meth:`_map_order`. The whole build+read is wrapped in the SAME fence as
+        :meth:`get_order_status` — any transport/SDK/parse failure surfaces
+        ``TIMEOUT`` with the ``broker_ref`` PRESERVED and no raw exception leaking
+        the port, so the landed order stays reconcilable. Never re-places, never
+        logs token/secret material.
+        """
+        self._require_configured()
+        # An empty / non-integer ref cannot address a Schwab order — surface an
+        # honest PENDING WITHOUT touching the SDK. NEVER search, NEVER guess
+        # (decision #2 / FR22 / NFR3); durable recovery is by order id or not at
+        # all. ``int()`` guards a non-numeric ref up front so a garbage value can
+        # never reach ``get_order`` (a wasted call) or raise past the port.
+        if broker_ref is None or not str(broker_ref).strip():
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=None,
+            )
+        try:
+            order_id = int(str(broker_ref).strip())
+        except (ValueError, TypeError):
+            # A non-numeric ref (e.g. "not-an-id") degrades safely to an honest
+            # PENDING — never a search, never a raw exception past the port.
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=None,
+            )
+        try:
+            client = self._trading_client()
+            account_hash = self._account_hash(client)
+            status_resp = client.get_order(order_id, account_hash)
+            return self._map_order(status_resp.json(), broker_ref=broker_ref)
+        except Exception:
+            # The read is over an order KNOWN to have been placed (its id was
+            # persisted at co-sign), so — exactly like ``get_order_status`` — this
+            # is a FENCE (bare ``except Exception``), not a curated blocklist. A
+            # transport failure, a non-JSON/non-dict body, a NaN Decimal
+            # comparison (``ArithmeticError``), an unexpected response shape
+            # (``AttributeError``), a missing token (``SchwabNotConfiguredError``)
+            # or any SDK-specific error is INDETERMINATE — never leak past the
+            # port, never a phantom fill. PRESERVE the known ``broker_ref`` so the
+            # order stays reconcilable. Surface TIMEOUT. This is a READ: it never
+            # re-places, never searches.
+            return OrderOutcome(
+                status=OrderStatus.TIMEOUT,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=broker_ref,
+            )
+
     def _trading_client(self):
         """Build (once) an authenticated schwab-py trading client from the token.
 
@@ -628,15 +698,20 @@ class SchwabAdapter(BrokerPort):
 
         Prefers a direct broker field; otherwise derives a quantity-weighted
         average from the execution legs. Returns ``None`` rather than raising when
-        the shape is absent (fixture-driven; re-confirmed at go-live).
+        the shape is absent (fixture-driven; re-confirmed at go-live). A non-finite
+        parse (``NaN``/``Infinity``) is sanitized to ``None`` — mirroring the
+        sibling :meth:`_decimal_or_zero` — so a non-finite average can never reach
+        the wire or the persisted (reconciliation/cosign) snapshot as the literal
+        ``"NaN"``/``"Infinity"`` (Story 6.7 makes this durably persisted).
         """
         for key in ("avgFillPrice", "averagePrice", "price"):
             val = order_json.get(key)
             if val is not None:
                 try:
-                    return Decimal(str(val))
+                    d = Decimal(str(val))
                 except (InvalidOperation, ValueError):
                     return None
+                return d if d.is_finite() else None
         total_qty = Decimal("0")
         total_cost = Decimal("0")
         for activity in order_json.get("orderActivityCollection") or []:
@@ -651,7 +726,8 @@ class SchwabAdapter(BrokerPort):
                 except (InvalidOperation, ValueError):
                     continue
         if total_qty > 0:
-            return total_cost / total_qty
+            avg = total_cost / total_qty
+            return avg if avg.is_finite() else None
         return None
 
     @staticmethod

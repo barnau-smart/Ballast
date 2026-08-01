@@ -472,3 +472,91 @@ async def test_get_execution_broker_binds_decrypted_schwab_token(monkeypatch):
     assert token["refresh_token"] == "plain-enc-refresh"
     assert token["token_type"] == "Bearer"
     assert token["expires_at"] == int(row.expires_at.timestamp())
+
+
+# --- Story 6.7: fake adapter durable reconcile-by-ref + sole-caller ------------
+
+
+@pytest.mark.asyncio
+async def test_fake_get_order_status_by_ref_placed_resolves():
+    # A placement records the order under its broker_ref, so a durable reconcile
+    # keyed on that ref returns the recorded outcome (the cross-request path).
+    from decimal import Decimal
+
+    from coach.recommendation import OrderIntent, OrderSide
+
+    adapter = FakeBrokerAdapter()
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+    placed = await adapter.place_order(intent, idempotency_key="ref-key")
+
+    resolved = await adapter.get_order_status_by_ref(placed.broker_ref)
+    assert resolved == placed  # recorded outcome round-trips by ref
+
+
+@pytest.mark.asyncio
+async def test_fake_get_order_status_by_ref_seed_helper_resolves():
+    # The test-seed helper registers the broker_ref → OrderOutcome a LATER reconcile
+    # (a fresh adapter that never placed the order) should observe.
+    from decimal import Decimal
+
+    from brokers.port import OrderOutcome, OrderStatus
+
+    adapter = FakeBrokerAdapter()
+    filled = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("2"),
+        avg_price=Decimal("100.00"),
+        broker_ref="42",
+    )
+    adapter.seed_order_status_by_ref("42", filled)
+
+    resolved = await adapter.get_order_status_by_ref("42")
+    assert resolved == filled
+
+
+@pytest.mark.asyncio
+async def test_fake_get_order_status_by_ref_unknown_is_pending():
+    # An unknown / None ref → honest PENDING; the fake never invents a fill and
+    # never searches.
+    from decimal import Decimal
+
+    from brokers.port import OrderStatus
+
+    adapter = FakeBrokerAdapter()
+    for ref in ("never-placed", None):
+        outcome = await adapter.get_order_status_by_ref(ref)  # type: ignore[arg-type]
+        assert outcome.status is OrderStatus.PENDING
+        assert outcome.filled_qty == Decimal("0")
+        assert outcome.avg_price is None
+        assert outcome.broker_ref is None
+
+
+def test_sole_caller_of_get_order_status_by_ref():
+    # AD-7: the ONLY module that calls BrokerPort.get_order_status_by_ref is the
+    # Coach Engine execution owner (coach/execution.py). No API handler, pipeline,
+    # or other module may call it — mirroring the place_order/get_order_status
+    # canary. The port ABC and the two adapter implementations declare/define it;
+    # the sole CALLER is coach/execution.py.
+    import pathlib
+
+    backend = pathlib.Path(__file__).resolve().parent.parent
+    allowed = {
+        "brokers/port.py",  # abstract declaration
+        "brokers/fake_adapter.py",  # implementation
+        "brokers/schwab_adapter/adapter.py",  # implementation
+        "coach/execution.py",  # the sole caller
+    }
+    offenders: list[str] = []
+    for path in backend.rglob("*.py"):
+        rel = path.relative_to(backend)
+        parts = rel.parts
+        if parts and parts[0] in {"tests", ".venv"}:
+            continue
+        if rel.as_posix() in allowed:
+            continue
+        if ".get_order_status_by_ref(" in path.read_text(encoding="utf-8"):
+            offenders.append(rel.as_posix())
+    assert offenders == [], (
+        "get_order_status_by_ref must be called ONLY by coach.execution (AD-7). "
+        f"Unexpected callers: {offenders}"
+    )

@@ -373,6 +373,23 @@ class DecisionRecord(OwnedEntityMixin, Base):
     broker_ref: Mapped[str | None] = mapped_column(
         String(length=64), nullable=True, index=True
     )
+    # The DURABLE cross-request reconciliation of an ambiguous placement (Story
+    # 6.7). ADDITIVE and write-LATEST (reconciliation may run repeatedly as an
+    # order progresses ``pending → filled``, latest-known-truth). The immutable
+    # ``recommendation_snapshot``/``cosign_snapshot`` are NEVER mutated — the
+    # broker's later truth lands HERE — so verbatim replay of those snapshots
+    # stays byte-identical. ``reconciliation_snapshot`` holds the reconciled
+    # ``OrderOutcome`` in the SAME shape as ``cosign_snapshot.outcome`` (money as
+    # fixed-point strings); ``reconciled_at`` is tz-aware UTC. Both NULL until a
+    # reconcile runs. (Built via ``create_all``; adding these to the model will
+    # NOT ALTER an already-created table — a go-live schema step, exactly as
+    # ``idempotency_key``/``broker_ref`` were.)
+    reconciliation_snapshot: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True
+    )
+    reconciled_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class DigestPreference(OwnedEntityMixin, Base):

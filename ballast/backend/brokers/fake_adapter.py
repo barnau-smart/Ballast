@@ -92,6 +92,13 @@ class FakeBrokerAdapter(BrokerPort):
         # structural: a re-place with a seen key returns the recorded order and
         # records it only once (AD-13).
         self._orders: dict[str, OrderOutcome] = {}
+        # Per-instance ``broker_ref -> OrderOutcome`` store for the DURABLE
+        # cross-request reconcile read (Story 6.7). Populated in ``place_order``
+        # whenever the recorded outcome carries a non-``None`` ``broker_ref``, plus
+        # via ``seed_order_status_by_ref`` so a test can register the state a LATER
+        # reconcile should observe (the real cross-request path reads a persisted
+        # ``broker_ref``, which a fresh in-instance ``_orders`` cache would miss).
+        self._orders_by_ref: dict[str, OrderOutcome] = {}
 
     def authorization_url(self, state: str) -> str:
         """Return a deterministic fake authorization URL embedding ``state``."""
@@ -163,6 +170,10 @@ class FakeBrokerAdapter(BrokerPort):
             broker_ref=f"fake-order-{idempotency_key}",
         )
         self._orders[idempotency_key] = outcome
+        # Also index by the broker reference so the durable cross-request reconcile
+        # read (Story 6.7) can find this order by its persisted ``broker_ref``.
+        if outcome.broker_ref is not None:
+            self._orders_by_ref[outcome.broker_ref] = outcome
         return outcome
 
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
@@ -176,6 +187,48 @@ class FakeBrokerAdapter(BrokerPort):
         token/secret material.
         """
         recorded = self._orders.get(idempotency_key)
+        if recorded is not None:
+            return recorded
+        return OrderOutcome(
+            status=OrderStatus.PENDING,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref=None,
+        )
+
+    def seed_order_status_by_ref(
+        self, broker_ref: str, outcome: OrderOutcome
+    ) -> None:
+        """Register the :class:`OrderOutcome` a later reconcile-by-ref should see.
+
+        A small TEST-SEED helper (Story 6.7): the durable cross-request reconcile
+        reads an order by its persisted ``broker_ref``, but a fresh per-request
+        adapter never placed that order (its ``_orders_by_ref`` is empty). This
+        lets a test register the ``broker_ref → OrderOutcome`` state a subsequent
+        :meth:`get_order_status_by_ref` should observe — the offline stand-in for
+        "the broker now reports this order FILLED". Deterministic, no network.
+        """
+        self._orders_by_ref[broker_ref] = outcome
+
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        """Reconcile a placed order by its ``broker_ref`` (Story 6.7, no network).
+
+        The durable cross-request reconciliation read (AD-13). A ``broker_ref``
+        that was placed on (or seeded into) this adapter returns its recorded
+        :class:`OrderOutcome`. An UNKNOWN or ``None`` ref returns an honest
+        ``PENDING`` (``filled_qty`` 0, no ``avg_price``, no ``broker_ref``) — the
+        fake NEVER invents a fill and NEVER searches for a matching order.
+        Deterministic (no wall-clock, no randomness). Never logs token/secret
+        material.
+        """
+        if broker_ref is None:
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=None,
+            )
+        recorded = self._orders_by_ref.get(broker_ref)
         if recorded is not None:
             return recorded
         return OrderOutcome(

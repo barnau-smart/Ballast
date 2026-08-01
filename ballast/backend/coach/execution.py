@@ -48,12 +48,16 @@ What this owner is NOT (deliberately deferred):
 from __future__ import annotations
 
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from brokers.port import BrokerPort, OrderOutcome, OrderStatus
 from brokers.session import BrokerageSession
 from coach.recommendation import OrderIntent
 from strategy.index_core import is_index_core
+
+if TYPE_CHECKING:  # avoid a runtime import cycle (decision_record imports us)
+    from db.models import DecisionRecord
 
 # An indeterminate placement is one whose true state is not yet known from the
 # placement call itself — it MUST be reconciled by reading authoritative state
@@ -86,6 +90,47 @@ class SessionIntegrityError(ValueError):
     no phantom idempotency key. The API layer maps it to the same calm 409
     reconnect envelope the request-entry live-session gate uses.
     """
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """The result of a durable cross-request reconcile (Story 6.7).
+
+    ``outcome`` is the truthful :class:`~brokers.port.OrderOutcome` (the recorded
+    terminal one, or the fresh broker read, or a still-pending indeterminate);
+    ``reconciled`` is ``True`` iff the broker was actually READ this call (so the
+    caller knows to persist ``reconciliation_snapshot``); ``needs_reconfirmation``
+    is ``True`` when the true outcome could NOT be positively confirmed
+    (``broker_ref is None``, or the read is still ``pending``/``timeout``), so a
+    human is prompted to decide — never an auto-resolve, never a re-place.
+    """
+
+    outcome: OrderOutcome
+    needs_reconfirmation: bool
+    reconciled: bool
+
+
+def _assert_session_integrity(
+    broker: BrokerPort, broker_session: BrokerageSession
+) -> None:
+    """Assert placement-time session + provider integrity (Story 4.8, FR23/AD-11).
+
+    The shared gate reused by BOTH :func:`execute_approved_order` and
+    :func:`reconcile_pending_decision`: the handed ``broker_session`` must be live
+    AND its ``provider`` must match the placing/reading ``broker``'s ``provider``,
+    else it raises :class:`SessionIntegrityError` and the broker is NEVER touched.
+    Providers are compared case/whitespace-insensitively and via ``getattr`` so a
+    stored-provider casing drift, a ``None`` on either side, or a misconfigured
+    adapter missing ``provider`` refuses with the calm 409 rather than a raw
+    ``AttributeError`` 500 — the owner never touches the broker on doubt.
+    """
+    session_provider = (broker_session.provider or "").strip().lower()
+    adapter_provider = (getattr(broker, "provider", None) or "").strip().lower()
+    if not broker_session.is_live or session_provider != adapter_provider:
+        raise SessionIntegrityError(
+            "Your brokerage connection needs a quick reconnect before this order "
+            "can go through."
+        )
 
 
 def mint_idempotency_key() -> str:
@@ -129,18 +174,10 @@ async def execute_approved_order(
     """
     # Placement-time integrity FIRST (before scope/key/place_order): the session
     # must be live and its provider must match the placing adapter, else refuse
-    # without ever touching the broker (Story 4.8, FR23/AD-11). Providers are
-    # compared case/whitespace-insensitively and via getattr so a stored-provider
-    # casing drift, a None on either side, or a misconfigured adapter missing
-    # ``provider`` refuses with the calm 409 rather than a raw AttributeError 500
-    # — the placer never places on doubt.
-    session_provider = (broker_session.provider or "").strip().lower()
-    adapter_provider = (getattr(broker, "provider", None) or "").strip().lower()
-    if not broker_session.is_live or session_provider != adapter_provider:
-        raise SessionIntegrityError(
-            "Your brokerage connection needs a quick reconnect before this order "
-            "can go through."
-        )
+    # without ever touching the broker (Story 4.8, FR23/AD-11). Factored into the
+    # shared ``_assert_session_integrity`` so the durable reconcile path (Story
+    # 6.7) enforces the EXACT same gate before any broker read.
+    _assert_session_integrity(broker, broker_session)
 
     normalized_symbol = (order_intent.symbol or "").strip().upper()
     if not is_index_core(normalized_symbol):
@@ -179,3 +216,104 @@ async def _reconcile(
     if placement.status not in INDETERMINATE:
         return placement
     return await broker.get_order_status(idempotency_key)
+
+
+async def reconcile_pending_decision(
+    record: "DecisionRecord",
+    *,
+    broker: BrokerPort,
+    broker_session: BrokerageSession,
+) -> ReconcileResult:
+    """Durably reconcile a cosigned decision by its persisted ``broker_ref`` (6.7).
+
+    The SOLE caller of :meth:`~brokers.port.BrokerPort.get_order_status_by_ref`
+    (AD-7). READ-ONLY: it NEVER calls ``place_order``, never mints a key, never
+    loops/polls (one read), never searches. As its FIRST action it asserts the
+    EXACT placement-time session + provider integrity gate
+    (:func:`_assert_session_integrity`, shared with
+    :func:`execute_approved_order`), raising :class:`SessionIntegrityError` before
+    any broker read — so a reconcile can never read against a dead or
+    mismatched-provider session.
+
+    Then, keyed on the newest-known truth (:func:`effective_outcome_status`):
+
+    - If the effective status is TERMINAL (``filled``/``partial``/``rejected``) the
+      broker is NEVER touched — the recorded outcome is returned, ``reconciled``
+      False, ``needs_reconfirmation`` False (idempotent).
+    - If NON-terminal (``pending``/``timeout``) but ``record.broker_ref is None``
+      the broker is NEVER touched — the order is unconfirmable by id, so it stays
+      pending with ``needs_reconfirmation`` True (never search/guess/re-place).
+    - Otherwise it reads the one order by ``record.broker_ref`` via
+      ``get_order_status_by_ref``; ``needs_reconfirmation`` is True iff that read is
+      ``timeout`` — the ONLY outcome that cannot be positively confirmed (a
+      successful read, even a still-``pending``/working order, IS a positive
+      confirmation the order exists and is retryable-without-a-human) — and
+      ``reconciled`` is True (the caller persists the reconciled outcome).
+    """
+    # Import here (not at module load) to avoid the import cycle: decision_record
+    # imports ``mint_idempotency_key`` from this module.
+    from coach.decision_record import effective_outcome_status, _is_terminal
+
+    # Session + provider integrity FIRST — identical gate to a placement, so a
+    # reconcile never reads against a dead/mismatched session (broker untouched).
+    _assert_session_integrity(broker, broker_session)
+
+    status = effective_outcome_status(record)
+    if _is_terminal(status):
+        # Already settled — return the recorded terminal outcome; NEVER re-read the
+        # broker (idempotent, no needless round-trip).
+        return ReconcileResult(
+            outcome=_recorded_outcome(record),
+            needs_reconfirmation=False,
+            reconciled=False,
+        )
+
+    if record.broker_ref is None:
+        # A true no-order_id timeout: no confirmed id, so the order is
+        # unconfirmable by ref — NEVER touch the broker, NEVER search. Stay pending
+        # and prompt an explicit human re-confirmation.
+        return ReconcileResult(
+            outcome=_recorded_outcome(record),
+            needs_reconfirmation=True,
+            reconciled=False,
+        )
+
+    outcome = await broker.get_order_status_by_ref(record.broker_ref)
+    # ``needs_reconfirmation`` is True ONLY when the order could not be positively
+    # confirmed — i.e. the read itself was indeterminate (``timeout``). A successful
+    # read that reports a still-working ``pending`` order IS a positive confirmation
+    # (the order exists at the broker), so it is retryable-without-a-human, NOT a
+    # re-confirmation prompt (I/O matrix "Still working"; epic 6.7 AC "cannot be
+    # positively confirmed"). Flagging a live working order would wrongly nudge a
+    # human toward re-placing a duplicate.
+    needs_reconfirmation = outcome.status is OrderStatus.TIMEOUT
+    return ReconcileResult(
+        outcome=outcome,
+        needs_reconfirmation=needs_reconfirmation,
+        reconciled=True,
+    )
+
+
+def _recorded_outcome(record: "DecisionRecord") -> OrderOutcome:
+    """Rebuild the newest recorded :class:`OrderOutcome` from a cosigned record.
+
+    Reads the ``reconciliation_snapshot.outcome`` if a durable reconcile has
+    already run, else the ``cosign_snapshot.outcome`` (the state surfaced at
+    co-sign). Money strings round-trip back to ``Decimal``. Read-only; mutates
+    nothing.
+    """
+    from decimal import Decimal
+
+    reconciliation = record.reconciliation_snapshot or {}
+    outcome = reconciliation.get("outcome") or (
+        (record.cosign_snapshot or {}).get("outcome")
+    ) or {}
+    status = outcome.get("status") or OrderStatus.PENDING.value
+    filled_raw = outcome.get("filled_qty")
+    avg_raw = outcome.get("avg_price")
+    return OrderOutcome(
+        status=OrderStatus(status),
+        filled_qty=Decimal(filled_raw) if filled_raw is not None else Decimal("0"),
+        avg_price=None if avg_raw is None else Decimal(avg_raw),
+        broker_ref=outcome.get("broker_ref"),
+    )

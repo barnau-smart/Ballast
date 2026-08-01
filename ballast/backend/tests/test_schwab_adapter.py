@@ -821,6 +821,149 @@ async def test_trading_without_token_refuses(monkeypatch):
         await adapter.place_order(_intent(), idempotency_key="k11")
 
 
+# --- get_order_status_by_ref (Story 6.7 — durable cross-request reconcile) -----
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_resolves_to_filled(monkeypatch):
+    # A durable reconcile keyed on the PERSISTED order id (a fresh adapter with an
+    # empty in-request cache) reads the one order by ``get_order(int(ref), hash)``
+    # and maps a FILLED body — no placement, no account search.
+    client = _FakeClient(
+        order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": 100},
+    )
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("42")
+
+    assert outcome.status == OrderStatus.FILLED
+    assert outcome.filled_qty == Decimal("2")
+    assert outcome.avg_price == Decimal("100")
+    assert outcome.broker_ref == "42"
+    # Read exactly the one order by its INTEGER id + resolved hash.
+    assert client.get_order_calls == [(42, "HASH123")]
+    # NEVER placed anything on a read-only reconcile.
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_non_finite_avg_price_is_none(monkeypatch):
+    # A FILLED body carrying a non-finite avg price (``NaN``/``Infinity``) must be
+    # sanitized to ``avg_price=None`` — never the literal "NaN"/"Infinity" — so the
+    # value cannot reach the wire OR the durably-persisted reconciliation snapshot
+    # (Story 6.7 persists the reconciled outcome). filled_qty stays honest.
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        client = _FakeClient(
+            order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": bad},
+        )
+        _install_client(monkeypatch, client)
+
+        outcome = await _adapter().get_order_status_by_ref("42")
+
+        assert outcome.status == OrderStatus.FILLED
+        assert outcome.filled_qty == Decimal("2")
+        assert outcome.avg_price is None, bad
+        assert outcome.broker_ref == "42"
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_working_is_pending(monkeypatch):
+    # A still-working order reconciles to an honest PENDING (retryable), ref set.
+    client = _FakeClient(order={"status": "WORKING", "filledQuantity": 0})
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("42")
+
+    assert outcome.status == OrderStatus.PENDING
+    assert outcome.filled_qty == Decimal("0")
+    assert outcome.broker_ref == "42"
+    assert client.get_order_calls == [(42, "HASH123")]
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_transport_error_is_timeout_no_leak(
+    monkeypatch,
+):
+    # A transport failure on the read is INDETERMINATE → TIMEOUT with the ref
+    # PRESERVED and NO raw exception escaping the port (mirrors get_order_status).
+    client = _FakeClient(get_order_exc=httpx.TimeoutException("slow"))
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("42")
+
+    assert outcome.status == OrderStatus.TIMEOUT
+    assert outcome.broker_ref == "42"  # PRESERVED — reconcilable later
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_nonenumerated_exc_is_fenced(monkeypatch):
+    # A non-enumerated type on the read (a bare RuntimeError) must be fenced — no
+    # raw leak past the port, TIMEOUT with the known ref preserved.
+    client = _FakeClient()
+    client.get_order = lambda order_id, account_hash: (_ for _ in ()).throw(
+        RuntimeError("SDK blew up on the reconcile read")
+    )
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("42")
+
+    assert outcome.status == OrderStatus.TIMEOUT
+    assert outcome.broker_ref == "42"
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_empty_ref_is_pending_no_sdk_call(
+    monkeypatch,
+):
+    # An empty/None ref short-circuits to an honest PENDING WITHOUT building the
+    # client or touching the SDK — never a search, never a guess. Even a bound
+    # token is not needed for this path.
+    client = _FakeClient()
+    _install_client(monkeypatch, client)
+
+    for empty in ("", "   ", None):
+        outcome = await _adapter().get_order_status_by_ref(empty)  # type: ignore[arg-type]
+        assert outcome.status == OrderStatus.PENDING
+        assert outcome.filled_qty == Decimal("0")
+        assert outcome.broker_ref is None
+    # The SDK was never asked for an order or an account.
+    assert client.get_order_calls == []
+    assert client.get_account_calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_non_numeric_ref_is_pending_no_search(
+    monkeypatch,
+):
+    # A non-numeric ref (cannot address a Schwab order id) degrades safely to an
+    # honest PENDING and NEVER searches the account (no get_orders_for_account).
+    client = _FakeClient()
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("not-an-id")
+
+    assert outcome.status == OrderStatus.PENDING
+    assert outcome.broker_ref is None
+    assert client.get_order_calls == []
+
+
+def test_schwab_client_has_no_get_orders_for_account_call():
+    # The reconcile path must NEVER search: assert the adapter source references
+    # neither ``get_orders_for_account`` nor any attribute/amount fuzzy-matching
+    # helper. A structural guard so a future refactor cannot quietly add a search.
+    adapter_src = (
+        Path(__file__).resolve().parent.parent
+        / "brokers"
+        / "schwab_adapter"
+        / "adapter.py"
+    ).read_text(encoding="utf-8")
+    # A CALL is ``.get_orders_for_account(`` — the prose docstrings that name the
+    # method (to document it is deliberately never used) are fine, an actual call
+    # is not.
+    assert ".get_orders_for_account(" not in adapter_src
+
+
 # --- Structural sole-caller invariant (AD-8) ----------------------------------
 
 

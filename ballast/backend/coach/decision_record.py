@@ -356,3 +356,89 @@ def cosign(
             "broker_ref": outcome.broker_ref,
         },
     }
+
+
+#: The terminal (settled) outcome statuses — a reconcile short-circuits on these
+#: (nothing more to read; the broker's answer is final). ``timeout``/``pending``
+#: are NON-terminal (indeterminate): the true state is not yet known, so a durable
+#: reconcile may still resolve them (mirrors ``coach.execution.INDETERMINATE``).
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"filled", "partial", "rejected"})
+
+
+def _is_terminal(status: str) -> bool:
+    """True iff ``status`` is a settled/terminal outcome (filled/partial/rejected).
+
+    A terminal outcome is the broker's final answer — a reconcile returns it
+    unchanged and never re-reads the broker. ``timeout``/``pending`` are NON-terminal
+    (still resolvable by a later durable reconcile).
+    """
+    return status in _TERMINAL_STATUSES
+
+
+def effective_outcome_status(record: DecisionRecord) -> str:
+    """Return the newest-known outcome status for a decision (Story 6.7).
+
+    Layers the durable reconciliation truth over the original co-sign: the
+    ``reconciliation_snapshot.outcome.status`` when a reconcile has run (the newest
+    broker truth), else the ``cosign_snapshot.outcome.status`` (the state first
+    surfaced at co-sign). Returns ``""`` when neither snapshot carries an outcome
+    (a not-yet-cosigned record). Read-only — never mutates the immutable snapshots,
+    so verbatim replay of ``recommendation_snapshot``/``cosign_snapshot`` stays
+    byte-identical; this is a projection for the history surface only.
+    """
+    reconciliation = record.reconciliation_snapshot or {}
+    reconciled_outcome = reconciliation.get("outcome") or {}
+    status = reconciled_outcome.get("status")
+    if status:
+        return status
+    cosign = record.cosign_snapshot or {}
+    outcome = cosign.get("outcome") or {}
+    return outcome.get("status", "")
+
+
+def record_reconciliation(
+    record: DecisionRecord,
+    *,
+    outcome: OrderOutcome,
+    now: datetime.datetime | None = None,
+) -> None:
+    """Persist a durable reconciliation of a cosigned decision ADDITIVELY (6.7).
+
+    Writes the reconciled :class:`OrderOutcome` into the ADDITIVE
+    ``reconciliation_snapshot`` (money as fixed-point strings, the SAME shape as
+    ``cosign_snapshot.outcome``) and stamps ``reconciled_at`` (tz-aware UTC now).
+    Asserts ``record.status == "cosigned"`` — only a placed decision has an order
+    to reconcile. It NEVER mutates ``recommendation_snapshot``, ``cosign_snapshot``,
+    ``status``, or ``broker_ref`` (the immutable record of what was decided/first
+    surfaced stays byte-identical for verbatim replay). Write-LATEST, not
+    write-once: reconciliation may run repeatedly (latest-known-truth) as an order
+    progresses ``pending → filled``, so these two fields are overwritten each time.
+    The CALLER commits.
+
+    Monotonic toward settlement: if the record's newest-known outcome is ALREADY
+    terminal (``filled``/``rejected``), this is a no-op — a settled money truth is
+    never walked backward to a less-settled state. The sole caller only reconciles
+    a non-terminal record, so this is defense-in-depth at the writer (AD-6) against
+    a stale/racing read regressing a confirmed outcome.
+    """
+    if record.status != "cosigned":
+        raise ValueError(
+            "Only a cosigned decision record can be reconciled (there is no "
+            f"placed order to reconcile otherwise); record status is "
+            f"{record.status!r}."
+        )
+    if _is_terminal(effective_outcome_status(record)):
+        # Already settled — never regress a terminal outcome (monotonic toward
+        # settlement); the confirmed money truth stands.
+        return
+    record.reconciliation_snapshot = {
+        "outcome": {
+            "status": outcome.status.value,
+            "filled_qty": _money(outcome.filled_qty),
+            "avg_price": (
+                None if outcome.avg_price is None else _money(outcome.avg_price)
+            ),
+            "broker_ref": outcome.broker_ref,
+        },
+    }
+    record.reconciled_at = now or datetime.datetime.now(datetime.timezone.utc)

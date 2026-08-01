@@ -64,15 +64,18 @@ from brokers.session import BrokerageSession
 from coach.decision_record import (
     claim_for_cosign,
     cosign,
+    effective_outcome_status,
     list_cosigned_decisions,
     load_decision,
     record_proposal,
+    record_reconciliation,
     release_claim,
 )
 from coach.execution import (
     OrderScopeError,
     SessionIntegrityError,
     execute_approved_order,
+    reconcile_pending_decision,
 )
 from coach.pipeline import CoachDecision, run_coach_pipeline
 from coach.recommendation import OrderIntent, OrderSide
@@ -244,6 +247,29 @@ class DecisionDetailResponse(BaseModel):
     co_signed_at: str | None = None
     recommendation_snapshot: dict
     cosign_snapshot: dict | None = None
+    # ADDITIVE durable-reconciliation fields (Story 6.7), passed through as stored.
+    # The immutable ``recommendation_snapshot``/``cosign_snapshot`` above are
+    # UNCHANGED, so verbatim replay of them stays byte-identical; these two carry
+    # the broker's LATER truth (null until a reconcile runs).
+    reconciliation_snapshot: dict | None = None
+    reconciled_at: str | None = None
+
+
+class ReconcileResponse(BaseModel):
+    """The result of a durable cross-request reconcile (Story 6.7), money as strings.
+
+    ``status``/``filled_qty``/``avg_price``/``broker_ref`` are the truthful reconciled
+    :class:`~brokers.port.OrderOutcome`. ``needs_reconfirmation`` is ``True`` when
+    the true outcome could NOT be positively confirmed (no ``broker_ref``, or the
+    read is still ``pending``/``timeout``) — a calm signal that a human should
+    decide; NEVER an auto-resolve and NEVER a re-place.
+    """
+
+    status: str
+    filled_qty: str
+    avg_price: str | None = None
+    broker_ref: str | None = None
+    needs_reconfirmation: bool
 
 
 # --- Serialization helpers ---------------------------------------------------
@@ -304,13 +330,15 @@ def _decision_summary_out(record) -> DecisionSummaryOut:
     snapshot = record.recommendation_snapshot or {}
     cosign_snapshot = record.cosign_snapshot or {}
     order_intent = cosign_snapshot.get("order_intent") or {}
-    outcome = cosign_snapshot.get("outcome") or {}
     return DecisionSummaryOut(
         decision_id=str(record.id),
         action_label=snapshot.get("action_label", ""),
         symbol=order_intent.get("symbol"),
         co_signed_at=record.co_signed_at.isoformat(),
-        outcome_status=outcome.get("status", ""),
+        # The NEWEST-known truth (Story 6.7): the durable reconciliation status
+        # when present, else the original co-sign status. The immutable snapshots
+        # are untouched, so this layering is a projection only.
+        outcome_status=effective_outcome_status(record),
     )
 
 
@@ -598,4 +626,79 @@ async def get_decision(
         ),
         recommendation_snapshot=record.recommendation_snapshot,
         cosign_snapshot=record.cosign_snapshot,
+        reconciliation_snapshot=record.reconciliation_snapshot,
+        reconciled_at=(
+            None if record.reconciled_at is None else record.reconciled_at.isoformat()
+        ),
+    )
+
+
+@router.post(
+    "/decisions/{decision_id}/reconcile", response_model=ReconcileResponse
+)
+async def reconcile_decision(
+    decision_id: UUID,
+    scope: Scope = Depends(get_scope),
+    broker_session: BrokerageSession = Depends(require_live_broker_session),
+    broker: BrokerPort = Depends(get_execution_broker),
+    session: AsyncSession = Depends(get_async_session),
+) -> ReconcileResponse:
+    """RECONCILE a cosigned decision's ambiguous placement durably (Story 6.7).
+
+    The explicit, cross-request recovery for a placement surfaced
+    ``pending``/``timeout`` in an earlier request (Story 6.3): it reads the true
+    :class:`~brokers.port.OrderOutcome` by the persisted queryable ``broker_ref``
+    and persists it ADDITIVELY, so an order stranded ``pending`` can finally be
+    resolved. READ-ONLY — it NEVER calls ``place_order`` and never re-places.
+
+    Only reached on an authenticated user AND a live brokerage session
+    (:func:`require_live_broker_session` → calm 409 reconnect otherwise). Loads the
+    record through the sole reader (:func:`load_decision`, per-user scoped — a
+    foreign/unknown id is invisible → 404). A record not yet ``cosigned`` has no
+    placed order to reconcile → calm 422. Otherwise it delegates to the Coach
+    Engine's :func:`reconcile_pending_decision` (the SOLE caller of
+    ``get_order_status_by_ref``, AD-7), which re-asserts placement-time integrity
+    (mapped HERE to the same calm 409 ``RECONNECT_MESSAGE`` as ``approve`` on a
+    :class:`SessionIntegrityError`). When the reconcile actually READ the broker
+    (``reconciled=True``) the true outcome is persisted via
+    :func:`record_reconciliation` (additive; the immutable snapshots are never
+    mutated) and committed. The response surfaces the honest outcome + the
+    ``needs_reconfirmation`` signal (True when unconfirmable — no ``broker_ref``, or
+    still ``pending``/``timeout``). Money crosses the wire as fixed-point strings.
+    """
+    record = await load_decision(decision_id, scope=scope, session=session)
+    if record is None:
+        # Unknown or foreign decision_id → invisible under this user's scope.
+        raise HTTPException(status_code=404, detail="Decision record not found.")
+    if record.status != "cosigned":
+        # A proposed/cosigning record placed no order — nothing to reconcile yet.
+        raise HTTPException(
+            status_code=422,
+            detail="This decision has no placed order to reconcile yet.",
+        )
+
+    try:
+        result = await reconcile_pending_decision(
+            record, broker=broker, broker_session=broker_session
+        )
+    except SessionIntegrityError as exc:
+        # Session lapsed or provider mismatched at reconcile time — the same calm
+        # reconnect envelope as the entry gate; the broker was never touched.
+        raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
+
+    if result.reconciled:
+        # The broker was actually read — persist the reconciled outcome
+        # ADDITIVELY (immutable snapshots untouched) via the sole writer (AD-6).
+        record_reconciliation(record, outcome=result.outcome)
+        await session.commit()
+
+    outcome = result.outcome
+    return ReconcileResponse(
+        status=outcome.status.value,
+        filled_qty=format_money(outcome.filled_qty),
+        avg_price=(
+            None if outcome.avg_price is None else format_money(outcome.avg_price)
+        ),
+        broker_ref=outcome.broker_ref,
+        needs_reconfirmation=result.needs_reconfirmation,
     )
