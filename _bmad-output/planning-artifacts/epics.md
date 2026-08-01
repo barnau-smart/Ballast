@@ -456,3 +456,79 @@ So that I feel on-track without ever being nagged.
 **Given** I opt in from Settings,
 **When** the weekly digest sends,
 **Then** it's an email (no push/SMS) with plan status + on-track reinforcement in the calm coach voice, never alarmist or FOMO-inducing, with an easy unsubscribe (FR21, NFR8, pull-not-push).
+
+## Epic 6: Go Live — Real Broker & LLM Integration
+
+Retire the deferred integration risk from Epics 4–5: harden the money/email seams against concurrency, then wire the real Anthropic and Schwab adapters behind the existing gates so the Coach works against live services — not just fakes. **No real credential may reach a placement or send path until Story 6.1 lands.** Scope is v1 index funds/ETFs; the trust invariants (structural teeth, sole-writer, per-user isolation, never-a-dead-end, calm/honest/never-red) are unchanged and must still hold.
+
+### Story 6.1: Atomic decision claim & idempotency hardening (GATING)
+
+As a user whose money can actually move,
+I want a double-approval or overlapping job to be structurally impossible,
+So that no race can place two orders or send two emails.
+
+**Acceptance Criteria:**
+
+**Given** two concurrent in-flight `/approve` calls carrying the same `decision_id` (and, separately, an overlapping digest run),
+**When** they execute,
+**Then** exactly one wins via an atomic proposed→cosigning→cosigned claim (conditional `UPDATE … WHERE status='proposed'` gated on `rowcount==1`, or `SELECT … FOR UPDATE`), a **stable per-decision idempotency key is persisted at proposal time and reused across placements**, a DB **unique index on `idempotency_key`** backs it, and the digest marker advances via a conditional `UPDATE … WHERE last_sent_week IS DISTINCT FROM :week` gated on `rowcount==1` — with tests that exercise the in-flight window, not just sequential re-runs (closes deferred-work 4.9 concurrency + 5.1 double-send; NFR2, NFR8, AD-5, AD-7). **Blocks 6.3.**
+
+### Story 6.2: Live LLM Gateway enablement & hardening
+
+As the system,
+I want the real Anthropic adapter proven against the live structured-output path,
+So that the coach can emit real, parseable recommendations — not just fall back to the default plan.
+
+**Acceptance Criteria:**
+
+**Given** `anthropic` installed and `LLM_ADAPTER=anthropic` with a valid key,
+**When** the coach runs `retrieve → compose → validate → surface` against the live API,
+**Then** the real gateway is the sole Anthropic caller, enforces structured output and deterministic model routing, its runtime robustness is hardened (timeouts, malformed/refused responses degrade to the default plan — never a dead-end), and a real LLM-emitted `order_intent` citing a retrieved evidence ID passes the 4.2 gate and surfaces — verified once end-to-end behind the existing gates (closes deferred-work 4.1 real-adapter hardening; FR7, FR12–FR14, NFR2, AD-6).
+
+### Story 6.3: Live Schwab placement & reconciliation mapping
+
+As a user,
+I want approved orders to actually reach Schwab and reconcile truthfully,
+So that the Coach moves real money safely.
+
+**Acceptance Criteria:**
+
+**Given** Story 6.1 has landed and `BROKER_ADAPTER=schwab` with a live brokerage session,
+**When** I approve an in-scope order,
+**Then** the real `place_order`/`get_order_status` map Schwab responses to the normalized `OrderOutcome {status, filled_qty, avg_price, broker_ref}`, the same placement-time integrity + provider-match + v1-scope gates fire, indeterminate placements reconcile exactly once via the persisted idempotency key, and no phantom/duplicate order is possible (FR8–FR10, FR22, FR23, NFR3, AD-7, AD-11, AD-13).
+
+### Story 6.4: Fixed-point money serialization pass
+
+As a user,
+I want every money value on the wire to read as a plain decimal,
+So that amounts are never shown in confusing exponent notation.
+
+**Acceptance Criteria:**
+
+**Given** any endpoint serializing money (`amount`, `filled_qty`, `avg_price`),
+**When** the value is large or unusual,
+**Then** a shared fixed-point formatter (`format(Decimal, "f")`) is applied everywhere so no `E+` notation can cross the wire, round-tripping cleanly through the documented `Decimal(str(...))` consumer (closes deferred-work 4.6/4.7 money-format item).
+
+### Story 6.5: Real Schwab balances & cash-only mapping (AD-14)
+
+As a user holding mostly cash,
+I want the app to see my real idle cash,
+So that the missed-growth meter and oversized-lump warning tell me the truth.
+
+**Acceptance Criteria:**
+
+**Given** real Schwab balances available after 6.3,
+**When** the portfolio cache is built for an all-cash or cash-heavy account,
+**Then** idle cash is mapped from a dedicated balances source (not derived from a holdings row), so the missed-growth meter stops falsely reporting "no idle cash" and the FR11 oversized-lump warning has a real portfolio value to measure against (closes deferred-work AD-14 cash-only gap; FR11).
+
+### Story 6.6: Decisions history scale hardening
+
+As a user with a long history,
+I want Decisions to stay fast and bounded as records accumulate,
+So that the on-the-record memory scales.
+
+**Acceptance Criteria:**
+
+**Given** many decision records over time,
+**When** I open Decisions,
+**Then** `GET /decisions` is paginated and backed by a `(owner_id, co_signed_at)` index, and never-co-signed `proposed` records have a retention/pruning policy — with per-user isolation and verbatim replay unchanged (closes deferred-work 4.9/4.10 pagination/index/retention item).
