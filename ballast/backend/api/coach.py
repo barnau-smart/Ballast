@@ -78,6 +78,7 @@ from coach.recommendation import OrderIntent, OrderSide
 from coach.validation import BlessedRecommendation
 from db.scope import Scope
 from db.session import get_async_session
+from money import format_money
 
 logger = logging.getLogger("ballast.api.coach")
 
@@ -235,7 +236,7 @@ def _order_intent_out(intent: OrderIntent | None) -> OrderIntentOut | None:
     return OrderIntentOut(
         symbol=intent.symbol,
         side=intent.side,
-        amount=str(intent.amount),
+        amount=format_money(intent.amount),
     )
 
 
@@ -260,8 +261,9 @@ def _money_str(value: Decimal) -> str:
     idempotent replay (rebuilt from the snapshot) return byte-identical money
     strings — and an extreme amount never surfaces as e.g. ``"1E+27"`` on the wire
     (the money-format gap the Story 4.7 ledger flagged, closed for this path).
+    Delegates to the shared :func:`money.format_money` single serializer.
     """
-    return format(value, "f")
+    return format_money(value)
 
 
 def _to_approve_response(outcome: OrderOutcome) -> ApproveResponse:

@@ -389,6 +389,35 @@ def _assert_no_float(obj) -> None:
             _assert_no_float(v)
 
 
+def test_evidence_stats_decimals_are_fixed_point_no_exponent():
+    """Story 6.4: extreme-large/tiny `Decimal`s in `EvidenceRecord.stats` serialize
+    fixed-point (no E+/E-) through `_json_safe`, including nested in lists."""
+    big = Decimal("1E29") / Decimal("100")  # str() → "1E+27"
+    tiny = Decimal("1E-8")  # str() → "1E-8"
+    rec = EvidenceRecord(
+        id="deadbeef",
+        kind=EvidenceKind.EVENT_PRECEDENT,
+        statement="",
+        stats={
+            "big": big,
+            "tiny": tiny,
+            "windows": [{"drop": big}, {"drop": tiny}],
+        },
+        source="test",
+        as_of=BASE_DAY,
+    )
+    d = rec.to_dict()
+    stats = d["stats"]
+    assert stats["big"] == "1000000000000000000000000000"
+    assert stats["tiny"] == "0.00000001"
+    assert stats["windows"][0]["drop"] == "1000000000000000000000000000"
+    assert stats["windows"][1]["drop"] == "0.00000001"
+    # No exponent anywhere, and round-trips via Decimal(str(...)).
+    assert "E" not in json.dumps(stats) and "e" not in json.dumps(stats)
+    assert Decimal(stats["big"]) == big
+    assert Decimal(stats["tiny"]) == tiny
+
+
 @pytest.mark.asyncio
 async def test_record_is_json_safe_and_never_float():
     _clean([SYM_QUALIFY])

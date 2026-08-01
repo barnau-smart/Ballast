@@ -284,6 +284,54 @@ async def test_negative_idle_cash_is_no_idle_cash():
     assert est.forgone_growth == Decimal("0.00")
 
 
+# --- Fixed-point money serialization (Story 6.4, no DB) ----------------------
+
+
+def test_to_dict_money_fields_are_fixed_point_no_exponent():
+    """`MissedGrowthEstimate.to_dict()` money fields render fixed-point (no E+/E-)
+    for extreme-large/tiny values; None optional stays None; round-trips."""
+    big = Decimal("1E29") / Decimal("100")  # str() → "1E+27"
+    tiny = Decimal("1E-8")  # str() → "1E-8"
+    est = MissedGrowthEstimate(
+        idle_cash=big,
+        benchmark="TEST",
+        window_return=tiny,
+        window_start=BASE_DAY,
+        window_end=BASE_DAY,
+        forgone_growth=big,
+        trading_days=252,
+        statement="",
+        source="test",
+        as_of=BASE_DAY,
+        sufficient=True,
+        reason=None,
+    )
+    d = est.to_dict()
+    for key in ("idle_cash", "forgone_growth", "window_return"):
+        assert "E" not in d[key] and "e" not in d[key], (key, d[key])
+    assert d["idle_cash"] == "1000000000000000000000000000"
+    assert d["forgone_growth"] == "1000000000000000000000000000"
+    assert d["window_return"] == "0.00000001"
+    assert Decimal(d["idle_cash"]) == big
+    assert Decimal(d["window_return"]) == tiny
+    # None-guarded optional stays None (never "None").
+    none_est = MissedGrowthEstimate(
+        idle_cash=Decimal("0.00"),
+        benchmark="TEST",
+        window_return=None,
+        window_start=None,
+        window_end=None,
+        forgone_growth=Decimal("0.00"),
+        trading_days=0,
+        statement="",
+        source="test",
+        as_of=None,
+        sufficient=False,
+        reason="no_idle_cash",
+    )
+    assert none_est.to_dict()["window_return"] is None
+
+
 # --- Determinism + JSON-safety -----------------------------------------------
 
 

@@ -165,6 +165,60 @@ def client() -> TestClient:
         yield c
 
 
+# --- Fixed-point money serialization (Story 6.4, no DB) ----------------------
+
+
+def test_portfolio_out_serializes_money_fixed_point_no_exponent():
+    """`cash` + holding `quantity`/`market_value` render fixed-point (no E+/E-)
+    for extreme-large and tiny-fractional values, and round-trip via Decimal(str)."""
+    from api.portfolio import HoldingOut, PortfolioOut
+
+    big = Decimal("1E29") / Decimal("100")  # str() → "1E+27"
+    tiny = Decimal("1E-8")  # str() → "1E-8"
+    out = PortfolioOut(
+        holdings=[
+            HoldingOut(
+                symbol="VTI",
+                quantity=tiny,
+                market_value=big,
+                cost_basis=None,
+            )
+        ],
+        cash=big,
+        as_of=None,
+    )
+    dumped = out.model_dump(mode="json")
+    holding = dumped["holdings"][0]
+    for field, value in (
+        ("cash", dumped["cash"]),
+        ("quantity", holding["quantity"]),
+        ("market_value", holding["market_value"]),
+    ):
+        assert "E" not in value and "e" not in value, (field, value)
+    assert dumped["cash"] == "1000000000000000000000000000"
+    assert holding["quantity"] == "0.00000001"
+    # Optional None money field stays null (never "None").
+    assert holding["cost_basis"] is None
+    # Round-trips through the documented Decimal(str(...)) consumer.
+    assert Decimal(str(dumped["cash"])) == big
+    assert Decimal(str(holding["quantity"])) == tiny
+
+
+def test_holding_cost_basis_serializes_fixed_point_when_present():
+    from api.portfolio import HoldingOut
+
+    tiny = Decimal("1E-8")
+    dumped = HoldingOut(
+        symbol="VTI",
+        quantity=Decimal("1"),
+        market_value=Decimal("100.00"),
+        cost_basis=tiny,
+    ).model_dump(mode="json")
+    assert "E" not in dumped["cost_basis"]
+    assert dumped["cost_basis"] == "0.00000001"
+    assert Decimal(str(dumped["cost_basis"])) == tiny
+
+
 # --- Fake adapter snapshot ---------------------------------------------------
 
 

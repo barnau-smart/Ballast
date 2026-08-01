@@ -29,6 +29,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from money import format_money
 from precedent.engine import DEFAULT_BENCHMARK, _load_series, _q, _source_str
 
 logger = logging.getLogger("ballast.precedent.missed_growth")
@@ -87,12 +88,18 @@ class MissedGrowthEstimate:
     reason: str | None
 
     def to_dict(self) -> dict:
-        """Return a JSON-safe dict (Decimal→str, date→ISO, None preserved)."""
+        """Return a JSON-safe dict (Decimal→fixed-point str, date→ISO, None preserved).
+
+        Money/Decimal fields render via :func:`money.format_money` so extreme or
+        tiny values never surface as ``E+``/``E-`` exponent on the wire.
+        """
         return {
-            "idle_cash": str(self.idle_cash),
+            "idle_cash": format_money(self.idle_cash),
             "benchmark": self.benchmark,
             "window_return": (
-                str(self.window_return) if self.window_return is not None else None
+                format_money(self.window_return)
+                if self.window_return is not None
+                else None
             ),
             "window_start": (
                 self.window_start.isoformat() if self.window_start is not None else None
@@ -100,7 +107,7 @@ class MissedGrowthEstimate:
             "window_end": (
                 self.window_end.isoformat() if self.window_end is not None else None
             ),
-            "forgone_growth": str(self.forgone_growth),
+            "forgone_growth": format_money(self.forgone_growth),
             "trading_days": self.trading_days,
             "statement": self.statement,
             "source": self.source,

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import datetime
 import logging
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -28,6 +27,7 @@ from brokers.port import BrokerPort
 from brokers.portfolio import PortfolioView, get_portfolio, reconcile_portfolio
 from db.scope import Scope
 from db.session import get_async_session
+from money import WireMoney
 from strategy.index_core import is_index_core
 
 logger = logging.getLogger("ballast.api.portfolio")
@@ -49,9 +49,9 @@ class HoldingOut(BaseModel):
     """
 
     symbol: str
-    quantity: Decimal
-    market_value: Decimal
-    cost_basis: Decimal | None = None
+    quantity: WireMoney
+    market_value: WireMoney
+    cost_basis: WireMoney | None = None
     is_core: bool = False
 
 
@@ -63,7 +63,7 @@ class PortfolioOut(BaseModel):
     """
 
     holdings: list[HoldingOut]
-    cash: Decimal
+    cash: WireMoney
     as_of: datetime.datetime | None
 
 

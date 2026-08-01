@@ -61,6 +61,7 @@ from coach.validation import BlessedRecommendation
 from db.models import DecisionRecord
 from db.repository import ScopedRepository
 from db.scope import Scope
+from money import format_money
 
 #: The snapshot-shape version stamped onto every proposed record (AD-5). Bump
 #: this when the persisted snapshot shape changes so replay can adapt.
@@ -72,9 +73,11 @@ def _money(value: Decimal) -> str:
 
     ``format(Decimal, "f")`` renders in plain fixed-point notation, so an extreme
     amount serializes as e.g. ``"1000000000000000000000000000"`` rather than the
-    lossy/exponent ``str(Decimal)`` form ``"1E+27"``.
+    lossy/exponent ``str(Decimal)`` form ``"1E+27"``. Delegates to the shared
+    :func:`money.format_money` (the single money→wire serializer) so this snapshot
+    string and the live ``/approve`` outcome cannot silently diverge.
     """
-    return format(value, "f")
+    return format_money(value)
 
 
 def _order_intent_json(order_intent: OrderIntent) -> dict:

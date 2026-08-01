@@ -28,6 +28,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from money import format_money
+
 
 class EvidenceKind(str, Enum):
     """The closed set of evidence kinds (AD-12).
@@ -45,12 +47,14 @@ class EvidenceKind(str, Enum):
 def _json_safe(value: Any) -> Any:
     """Recursively convert a value into a JSON-serializable, deterministic form.
 
-    ``Decimal`` → its canonical string (never a lossy float), ``date`` → ISO-8601
-    string, :class:`EvidenceKind` (and any ``Enum``) → its value. Dicts and lists
-    are converted element-wise, preserving structure.
+    ``Decimal`` → its fixed-point string via :func:`money.format_money` (never a
+    lossy float, never ``E+``/``E-`` exponent — so extreme/tiny evidence stats
+    stay plain on the wire), ``date`` → ISO-8601 string, :class:`EvidenceKind`
+    (and any ``Enum``) → its value. Dicts and lists are converted element-wise,
+    preserving structure.
     """
     if isinstance(value, Decimal):
-        return str(value)
+        return format_money(value)
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Enum):

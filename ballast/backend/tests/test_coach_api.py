@@ -826,6 +826,24 @@ def test_recommend_returns_blessed_and_never_places(client):
         _delete_user(email)
 
 
+def test_recommend_order_intent_amount_is_fixed_point():
+    # (6.4) The /recommend order_intent.amount serializer renders an extreme
+    # amount as plain fixed-point (no E+/E-) — the 4.7-ledger bug (str(Decimal)
+    # → "1E+27") is closed, and the wire string round-trips via Decimal(str(...)).
+    from api.coach import _order_intent_out
+
+    extreme = Decimal("1E29") / Decimal("100")
+    intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=extreme)
+    out = _order_intent_out(intent)
+    assert out is not None
+    dumped = out.model_dump(mode="json")
+    assert "E" not in dumped["amount"]
+    assert dumped["amount"] == "1000000000000000000000000000"
+    assert Decimal(dumped["amount"]) == extreme
+    # None intent stays None (never "None").
+    assert _order_intent_out(None) is None
+
+
 def test_recommend_works_while_session_expired_degraded(client):
     # (g) recommend works in degraded mode: an EXPIRED session still gets advice.
     email = _unique_email()
