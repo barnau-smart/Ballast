@@ -271,6 +271,11 @@ def cosign(
         )
     record.status = "cosigned"
     record.co_signed_at = datetime.datetime.now(datetime.timezone.utc)
+    # Hoist the broker reference into its queryable column (Story 6.3) in addition
+    # to the snapshot JSON below, so a later explicit reconcile (Story 6.7) can
+    # find the order by ``broker_ref`` directly. NULL when the broker assigned
+    # none (e.g. a no-order_id timeout surfaced as pending).
+    record.broker_ref = outcome.broker_ref
     record.cosign_snapshot = {
         "order_intent": _order_intent_json(order_intent),
         "outcome": {

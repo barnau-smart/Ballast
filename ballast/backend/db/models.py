@@ -300,6 +300,16 @@ class DecisionRecord(OwnedEntityMixin, Base):
     )
     # The executed order_intent + reconciled OrderOutcome (what was EXECUTED).
     cosign_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The broker's stable order reference, hoisted OUT of ``cosign_snapshot`` into
+    # a queryable column (Story 6.3) so a later explicit reconcile (Story 6.7) can
+    # find an ambiguous placement by ``broker_ref`` without parsing JSON. NULL when
+    # the broker assigned no reference (e.g. a true no-order_id timeout). Indexed
+    # for the explicit-reconcile lookup. (Built via ``create_all``; adding this to
+    # the model will NOT ALTER an already-created table — a go-live caveat,
+    # exactly as ``idempotency_key`` was.)
+    broker_ref: Mapped[str | None] = mapped_column(
+        String(length=64), nullable=True, index=True
+    )
 
 
 class DigestPreference(OwnedEntityMixin, Base):

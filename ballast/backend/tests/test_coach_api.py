@@ -42,6 +42,7 @@ from brokers.fake_adapter import FAKE_FILL_PRICE, FakeBrokerAdapter
 from brokers.port import (
     BrokerPort,
     BrokerTokens,
+    OrderNotPlaceableError,
     OrderOutcome,
     OrderStatus,
     PortfolioSnapshot,
@@ -93,6 +94,15 @@ async def ensure_tables():
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "uq_decision_record_idempotency_key "
                 "ON decision_record (idempotency_key)"
+            )
+        )
+        # Story 6.3 hoists broker_ref into a queryable column; reconcile a
+        # carried-over test DB the same way (create_all won't ALTER an existing
+        # table). Harmless/no-op once the column exists.
+        await conn.execute(
+            text(
+                "ALTER TABLE decision_record "
+                "ADD COLUMN IF NOT EXISTS broker_ref VARCHAR(64)"
             )
         )
     yield
@@ -595,6 +605,168 @@ def test_approve_live_matched_session_places_once_and_reconciles(client):
         _delete_user(email)
 
 
+class _NotPlaceableAdapter(BrokerPort):
+    """A broker double whose place_order refuses via OrderNotPlaceableError (6.3).
+
+    Models the adapter's sub-minimum / unusable-quote calm refusal so the API's
+    claim-release + calm-422 handling can be asserted without the real SDK.
+    """
+
+    provider = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._delegate = FakeBrokerAdapter()
+
+    def authorization_url(self, state: str) -> str:
+        return self._delegate.authorization_url(state)
+
+    def exchange_code(self, code: str, state: str) -> BrokerTokens:
+        return self._delegate.exchange_code(code, state)
+
+    def fetch_portfolio(self) -> PortfolioSnapshot:
+        return self._delegate.fetch_portfolio()
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        self.calls.append(idempotency_key)
+        raise OrderNotPlaceableError(
+            "$100.00 buys less than one whole share of VTI at about $500.00 — "
+            "no order was placed."
+        )
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        raise AssertionError("get_order_status must not be reached on a refusal")
+
+
+def _broker_ref_for(owner: uuid.UUID) -> str | None:
+    """Read this owner's decision_record.broker_ref column (Story 6.3)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT broker_ref FROM decision_record WHERE owner_id = %s",
+                (str(owner),),
+            )
+            (ref,) = cur.fetchone()
+    return ref
+
+
+def _null_idempotency_key(owner: uuid.UUID) -> None:
+    """Force the owner's decision_record idempotency_key to NULL (6.1 guard test)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE decision_record SET idempotency_key = NULL "
+                "WHERE owner_id = %s",
+                (str(owner),),
+            )
+        conn.commit()
+
+
+def test_approve_null_idempotency_key_refuses_broker_untouched(client):
+    # (6.1 pre-flight guard, due at 6.3) A decision whose persisted
+    # idempotency_key is NULL is refused calmly (422) BEFORE any placement, the
+    # claim is released (retryable → back to proposed), and the broker is never
+    # touched — a post-fill cosign crash is converted to a pre-fill refusal.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+        _null_idempotency_key(uid)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert spy.calls == []  # broker NEVER touched
+        # Claim released → the record is retryable (proposed), not stranded.
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_not_placeable_refusal_releases_claim(client):
+    # (6.3) A sub-minimum / unusable-quote refusal (OrderNotPlaceableError) from
+    # the adapter surfaces as a calm 422 and RELEASES the claim (retryable),
+    # symmetric with the out-of-scope refusal — no order placed.
+    email = _unique_email()
+    adapter = _NotPlaceableAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert len(adapter.calls) == 1  # the adapter refused at placement time
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"  # released
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_persists_broker_ref_column(client):
+    # (6.3) The reconciled OrderOutcome's broker_ref is hoisted into the queryable
+    # decision_record.broker_ref column (not only the cosign_snapshot JSON) so a
+    # later explicit reconcile (Story 6.7) can find the order.
+    email = _unique_email()
+    placement = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+        broker_ref="schwab-order-42",
+    )
+    adapter = _ScriptedAdapter(placement=placement)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        assert _broker_ref_for(uid) == "schwab-order-42"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
 def test_approve_unauthenticated_returns_401(client):
     # (e) no token → 401 before the handler; no scope built, no broker call.
     spy = _SpyAdapter()
@@ -736,23 +908,23 @@ async def test_fake_place_order_is_deterministic():
 
 
 @pytest.mark.asyncio
-async def test_schwab_place_order_stub_raises_without_creds(monkeypatch):
-    # (j) The Schwab place_order stub NEVER returns a phantom fill — it always
-    # raises SchwabNotConfiguredError. Pinned two ways so a silent-fill
-    # regression fails the test:
-    #   - creds present at construction → the explicit "not wired yet" raise
+async def test_schwab_place_order_without_token_raises_no_phantom_fill(monkeypatch):
+    # (j) The Schwab place_order (now wired, Story 6.3) NEVER returns a phantom
+    # fill when it has no linked/decrypted user token — it refuses loudly with
+    # SchwabNotConfiguredError rather than building a tokenless client. Pinned two
+    # ways so a silent-fill regression fails the test:
+    #   - creds present but NO token bound → the token-required refusal
     #   - captured cred stripped → _require_configured() raises
     from brokers.schwab_adapter import SchwabAdapter, SchwabNotConfiguredError
 
     monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
     monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "secret")
     monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://example.com/cb")
-    adapter = SchwabAdapter()  # constructs (creds present) but network-gated
+    adapter = SchwabAdapter()  # creds present, but NO token_read_func bound
     intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
 
-    # Creds-present path: the explicit "not wired" stub raise. A silent phantom
-    # fill (returning an OrderOutcome) would make the `match` assertion fail.
-    with pytest.raises(SchwabNotConfiguredError, match="not wired"):
+    # No token bound: refuses (a config error), never a silent OrderOutcome fill.
+    with pytest.raises(SchwabNotConfiguredError):
         await adapter.place_order(intent, idempotency_key="k")
 
     # Creds-missing path: setenv after construction is a no-op (the adapter read
@@ -1143,23 +1315,25 @@ async def test_fake_get_order_status_placed_vs_unknown_key():
 
 
 @pytest.mark.asyncio
-async def test_schwab_get_order_status_stub_raises_without_creds(monkeypatch):
-    # (g) The Schwab get_order_status stub always raises SchwabNotConfiguredError
-    # ("not wired"), mirroring place_order/fetch_portfolio — never a phantom fill.
-    from brokers.schwab_adapter import SchwabAdapter, SchwabNotConfiguredError
+async def test_schwab_get_order_status_unknown_key_is_pending_no_phantom_fill(
+    monkeypatch,
+):
+    # (g) The Schwab get_order_status (now wired, Story 6.3) NEVER invents a fill.
+    # An UNKNOWN key (nothing placed on this instance) short-circuits to an honest
+    # PENDING — without touching the network or needing a token — and NEVER
+    # searches the account (no get_orders_for_account, no attribute-matching).
+    from brokers.port import OrderStatus
+    from brokers.schwab_adapter import SchwabAdapter
 
     monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
     monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "secret")
     monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://example.com/cb")
-    adapter = SchwabAdapter()  # constructs (creds present) but network-gated
+    adapter = SchwabAdapter()  # no token bound; unknown-key path needs none
 
-    with pytest.raises(SchwabNotConfiguredError, match="not wired"):
-        await adapter.get_order_status("k")
-
-    # Creds-missing path: strip the captured cred to exercise the guard directly.
-    adapter._client_id = ""
-    with pytest.raises(SchwabNotConfiguredError):
-        await adapter.get_order_status("k")
+    outcome = await adapter.get_order_status("never-placed")
+    assert outcome.status is OrderStatus.PENDING
+    assert outcome.filled_qty == Decimal("0")
+    assert outcome.broker_ref is None
 
 
 # =============================================================================

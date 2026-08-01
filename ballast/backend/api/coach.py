@@ -56,8 +56,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import RECONNECT_MESSAGE, get_scope, require_live_broker_session
-from brokers.factory import get_broker
-from brokers.port import BrokerPort, OrderOutcome
+from brokers.factory import get_execution_broker
+from brokers.port import BrokerPort, OrderNotPlaceableError, OrderOutcome
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
 from coach.decision_record import (
@@ -359,7 +359,7 @@ async def approve(
     body: ApproveRequest,
     scope: Scope = Depends(get_scope),
     broker_session: BrokerageSession = Depends(require_live_broker_session),
-    broker: BrokerPort = Depends(get_broker),
+    broker: BrokerPort = Depends(get_execution_broker),
     session: AsyncSession = Depends(get_async_session),
 ) -> ApproveResponse:
     """APPROVE (execute): the explicit-approval, live-session execution gate.
@@ -445,6 +445,22 @@ async def approve(
         # (never an AttributeError/500 on a None instance).
         raise HTTPException(status_code=404, detail="Decision record not found.")
     key = record.idempotency_key
+    # NULL-idempotency_key pre-flight guard (Story 6.1 deferred item, due before
+    # go-live / Story 6.3): a decision must carry the stable key persisted at
+    # propose. If it is somehow NULL (a data-integrity fault), refuse BEFORE any
+    # placement — a pre-fill refusal, never a post-fill crash in ``cosign`` (which
+    # asserts the placed key matches the persisted one). Release the claim
+    # (cosigning→proposed) so the record is never stranded; the broker is never
+    # touched.
+    if key is None:
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This decision is missing its safety key and can't be placed. "
+                "Please start a new recommendation."
+            ),
+        )
     intent = OrderIntent(
         symbol=body.order_intent.symbol,
         side=body.order_intent.side,
@@ -469,6 +485,13 @@ async def approve(
     except OrderScopeError as exc:
         # Rejected before any broker call; release the claim (retryable) and
         # surface through the app envelope.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OrderNotPlaceableError as exc:
+        # A deliberate, calm pre-placement refusal from the adapter (Story 6.3):
+        # the dollar amount buys less than one whole share, or the quote was
+        # unusable — NO order was placed. Release the claim (retryable) and
+        # surface the calm reason, symmetric with the scope refusal above.
         await release_claim(body.decision_id, scope=scope, session=session)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:

@@ -409,3 +409,66 @@ def test_endpoints_require_auth(client):
         ).status_code
         == 401
     )
+
+
+# --- Story 6.3: get_execution_broker token-binding seam ----------------------
+
+
+@pytest.mark.asyncio
+async def test_get_execution_broker_passes_fake_through():
+    """A non-Schwab adapter (the fake/spy) passes straight through untouched.
+
+    This is what keeps the existing ``dependency_overrides[get_broker]`` in the
+    coach-api tests working: an injected fake is not a SchwabAdapter, so
+    get_execution_broker returns it as-is without any DB / token work.
+    """
+    from brokers.factory import get_execution_broker
+
+    fake = FakeBrokerAdapter()
+    result = await get_execution_broker(scope=None, session=None, broker=fake)
+    assert result is fake
+
+
+@pytest.mark.asyncio
+async def test_get_execution_broker_binds_decrypted_schwab_token(monkeypatch):
+    """The Schwab path loads the user's token, decrypts it, and binds a
+    token_read_func onto a fresh SchwabAdapter (offline — repo + decrypt mocked)."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    import brokers.crypto as crypto_mod
+    import db.repository as repo_mod
+    from brokers.factory import get_execution_broker
+    from brokers.schwab_adapter import SchwabAdapter
+
+    monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
+    monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://example.com/cb")
+
+    row = SimpleNamespace(
+        access_token="enc-access",
+        refresh_token="enc-refresh",
+        expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+
+    class _FakeRepo:
+        def __init__(self, model, scope, session):
+            pass
+
+        async def list(self):
+            return [row]
+
+    monkeypatch.setattr(repo_mod, "ScopedRepository", _FakeRepo)
+    monkeypatch.setattr(crypto_mod, "decrypt_token", lambda ct: "plain-" + ct)
+
+    schwab = SchwabAdapter()
+    bound = await get_execution_broker(
+        scope=object(), session=object(), broker=schwab
+    )
+
+    assert isinstance(bound, SchwabAdapter)
+    token = bound._token_read_func()
+    assert token["access_token"] == "plain-enc-access"
+    assert token["refresh_token"] == "plain-enc-refresh"
+    assert token["token_type"] == "Bearer"
+    assert token["expires_at"] == int(row.expires_at.timestamp())

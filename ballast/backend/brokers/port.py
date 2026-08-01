@@ -111,6 +111,21 @@ class OrderOutcome:
     broker_ref: str | None = None
 
 
+class OrderNotPlaceableError(ValueError):
+    """Raised when a whole-share market order cannot be constructed (Story 6.3).
+
+    A deliberate, calm PRE-PLACEMENT refusal — the broker is never touched. It
+    fires when a dollar ``amount`` buys less than one whole share
+    (``floor(amount / ask) < 1``), or when the placement-time quote is unusable
+    (missing / non-positive ask). This is vendor-neutral and distinct from the
+    transport→``OrderStatus.TIMEOUT`` mapping: a transport failure is an
+    INDETERMINATE placement (an order may have landed), whereas this is a
+    definite "no order was placed, here is a clear reason". The API layer maps it
+    to the same calm 422 as :class:`~coach.execution.OrderScopeError` and
+    RELEASES the atomic claim so the decision stays retryable.
+    """
+
+
 class BrokerPort(ABC):
     """The abstract brokerage boundary — the only type callers depend on.
 
