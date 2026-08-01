@@ -120,9 +120,15 @@ class PortfolioCache(OwnedEntityMixin, Base):
     values, denormalized onto every row: a single reconcile replaces ALL of a
     user's rows atomically with the same snapshot, so they stay consistent, and
     the reconcile-wins rule keys on ``as_of`` (a newer snapshot supersedes older
-    rows; a stale one never clobbers newer truth). A cash-only/empty account
-    yields zero rows (cash surfaces as 0 in that edge case — a dedicated
-    balances row is a later refinement, out of scope for v1 import).
+    rows; a stale one never clobbers newer truth).
+
+    AD-14 (Story 6.5, cash-only gap closed): the AUTHORITATIVE idle-cash source
+    is now the dedicated per-user :class:`PortfolioBalance` row, NOT this table.
+    The per-row ``cash`` here is a retained DENORMALIZED SNAPSHOT COPY — the
+    single writer keeps writing it (harmless; it avoids a nullable ALTER and
+    keeps the change schema-additive), but no reader derives idle cash from a
+    holdings row anymore. A cash-only/empty account yields zero rows here yet
+    still reports its true cash via ``portfolio_balance``.
 
     Money columns are ``Numeric`` (Python ``Decimal``) — NEVER binary float
     (consistency convention). ``as_of`` is timezone-aware UTC.
@@ -153,6 +159,52 @@ class PortfolioCache(OwnedEntityMixin, Base):
     # The broker's snapshot timestamp — the reconcile-wins key (AD-14).
     as_of: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class PortfolioBalance(OwnedEntityMixin, Base):
+    """A user's account-level idle cash — the AUTHORITATIVE balances source
+    (table: ``portfolio_balance``).
+
+    AD-14 (Story 6.5, cash-only gap closed): idle cash used to be denormalized
+    onto every :class:`PortfolioCache` holdings row, so an all-cash / cash-heavy
+    account (few or zero holdings) surfaced ``cash = 0`` — the users with the
+    MOST idle cash saw a confidently-false "no idle cash". This dedicated table
+    fixes that: EXACTLY ONE logical row per user (keyed by ``owner_id`` via the
+    mixin) carries the account-level ``cash`` and its snapshot ``as_of``, so cash
+    survives when the holdings projection is empty.
+
+    Written by the SAME single writer as ``portfolio_cache`` — the portfolio
+    projection in ``brokers.portfolio`` (AD-14) — in the SAME reconcile commit,
+    and read READ-ONLY by every consumer through the fail-closed
+    ``ScopedRepository`` (AD-10, per-user isolation). Reconcile-wins keys on THIS
+    row's ``as_of`` (present even for a cash-only account, unlike zero holdings
+    rows), so a stale re-fetch can never clobber newer cash truth.
+
+    Money is ``Numeric`` (Python ``Decimal``) — NEVER binary float. ``as_of`` is
+    timezone-aware UTC.
+    """
+
+    __tablename__ = "portfolio_balance"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # Account-level settled/idle cash — the authoritative figure (Decimal, never
+    # float). One row per user; upserted in place by the single writer.
+    cash: Mapped[Decimal] = mapped_column(Numeric(precision=20, scale=2), nullable=False)
+
+    # The broker's snapshot timestamp for this balance — the reconcile-wins key
+    # (AD-14), present even when the account has zero holdings.
+    as_of: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # EXACTLY ONE balance row per user — the DB-level backstop for the single
+    # writer's upsert (a concurrent double-insert raises IntegrityError instead
+    # of silently duplicating and stranding a stale-cash row). Same discipline as
+    # ``DigestPreference``.
+    __table_args__ = (
+        UniqueConstraint("owner_id", name="uq_portfolio_balance_owner"),
     )
 
 

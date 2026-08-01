@@ -28,7 +28,7 @@ from brokers.fake_adapter import (
 from brokers.port import BrokerPort, BrokerTokens, PortfolioSnapshot
 from brokers.portfolio import get_portfolio, reconcile_portfolio
 from db.connection import get_connection
-from db.models import BrokerageToken, PortfolioCache
+from db.models import BrokerageToken, PortfolioBalance, PortfolioCache
 from db.scope import Scope
 from db.session import async_session_maker, engine
 
@@ -41,6 +41,10 @@ async def ensure_tables():
     async with engine.begin() as conn:
         await conn.run_sync(BrokerageToken.__table__.create, checkfirst=True)
         await conn.run_sync(PortfolioCache.__table__.create, checkfirst=True)
+        # Story 6.5: the dedicated per-user balances source. ``create(checkfirst=True)``
+        # is a no-op on an already-existing table, so a carried-over test DB gets the
+        # new table without an Alembic migration (matches the create-all lifecycle).
+        await conn.run_sync(PortfolioBalance.__table__.create, checkfirst=True)
     yield
 
 
@@ -260,6 +264,78 @@ async def test_reconcile_writes_cache_matching_snapshot(two_owner_ids):
     assert vti.market_value == Decimal("2500.00")
     assert vti.cost_basis == Decimal("2000.00")
     assert isinstance(vti.market_value, Decimal)
+
+
+# --- Cash-only mapping (AD-14, Story 6.5) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_all_cash_reconcile_reports_true_cash(two_owner_ids):
+    """An all-cash account (cash>0, zero holdings) reports its TRUE cash — not 0
+    — sourced from the dedicated balance row, with holdings empty (AD-14 closed)."""
+    a, _ = two_owner_ids
+    snap = _snapshot(offset=timedelta(0), cash=Decimal("500.00"), symbols=[])
+    async with async_session_maker() as session:
+        await reconcile_portfolio(Scope.for_user(a), session, FakeBrokerAdapter(), snapshot=snap)
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("500.00")  # true cash, NOT 0
+    assert view.holdings == []
+    assert view.is_empty
+    assert view.as_of == FAKE_AS_OF_BASE
+
+
+@pytest.mark.asyncio
+async def test_cash_heavy_with_holdings_reports_cash_and_holdings(two_owner_ids):
+    a, _ = two_owner_ids
+    snap = _snapshot(
+        offset=timedelta(0), cash=Decimal("1000.00"), symbols=["VTI", "BND"]
+    )
+    async with async_session_maker() as session:
+        await reconcile_portfolio(Scope.for_user(a), session, FakeBrokerAdapter(), snapshot=snap)
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("1000.00")
+    assert {h.symbol for h in view.holdings} == {"VTI", "BND"}
+    assert len(view.holdings) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_cash_only_refetch_does_not_clobber(two_owner_ids):
+    """Staleness now protects cash-only accounts too: a stale re-fetch (older
+    as_of, different cash) leaves the balance row untouched."""
+    a, _ = two_owner_ids
+    async with async_session_maker() as session:
+        await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=_snapshot(
+                offset=timedelta(hours=1), cash=Decimal("500.00"), symbols=[]
+            ),
+        )
+    # An OLDER cash-only snapshot with different cash must be ignored.
+    async with async_session_maker() as session:
+        view = await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=_snapshot(
+                offset=timedelta(0), cash=Decimal("999.00"), symbols=[]
+            ),
+        )
+    assert view.cash == Decimal("500.00")  # newer cash truth preserved
+    assert view.as_of == FAKE_AS_OF_BASE + timedelta(hours=1)
+
+
+@pytest.mark.asyncio
+async def test_never_imported_reports_zero_cash_and_no_as_of(two_owner_ids):
+    a, _ = two_owner_ids
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("0")
+    assert view.as_of is None
+    assert view.holdings == []
 
 
 # --- Reconcile-wins keyed on as_of (AC3) -------------------------------------

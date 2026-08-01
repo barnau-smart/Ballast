@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.config import get_settings
 from api.deps import get_scope
 from brokers.crypto import encrypt_token
-from brokers.factory import get_broker
+from brokers.factory import bind_freshly_exchanged_token, get_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import reconcile_portfolio
 from brokers.session import get_brokerage_session
@@ -239,12 +239,15 @@ async def callback(
 
     logger.info("brokerage_linked user_id=%s provider=%s", scope.user_id, provider)
 
-    # Import-on-connect (Story 2.3, AD-14): pull the user's holdings in as soon
-    # as the account is linked, via the single-writer projection. Resilient — a
-    # fetch failure must NOT break the link (the account is linked; the user can
+    # Import-on-connect (Story 2.3, AD-14): pull the user's holdings + cash in as
+    # soon as the account is linked, via the single-writer projection. Resilient —
+    # a fetch failure must NOT break the link (the account is linked; the user can
     # retry the import / it reconciles later). Never surface broker internals.
+    # For Schwab, bind the just-exchanged in-memory token so the reconcile's read
+    # authenticates (no DB round-trip needed — Story 6.5); the fake passes through.
     try:
-        await reconcile_portfolio(scope, session, broker)
+        import_broker = bind_freshly_exchanged_token(broker, tokens)
+        await reconcile_portfolio(scope, session, import_broker)
     except Exception as exc:  # noqa: BLE001 — link must survive any import failure
         logger.warning(
             "portfolio_import_on_connect_failed user_id=%s error_type=%s",

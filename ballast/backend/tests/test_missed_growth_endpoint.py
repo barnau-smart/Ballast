@@ -116,6 +116,21 @@ def _insert_cache_row(owner: uuid.UUID, cash: Decimal) -> None:
         conn.commit()
 
 
+def _insert_balance_row(owner: uuid.UUID, cash: Decimal) -> None:
+    """Seed the dedicated portfolio_balance row (Story 6.5) carrying idle cash —
+    the AUTHORITATIVE source the view reads (never a holdings row). Sync psycopg so
+    it works under the TestClient event loop."""
+    as_of = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO portfolio_balance (id, owner_id, cash, as_of) "
+                "VALUES (%s, %s, %s, %s)",
+                (str(uuid.uuid4()), str(owner), str(cash), as_of),
+            )
+        conn.commit()
+
+
 def _register(client: TestClient, email: str) -> None:
     resp = client.post(
         "/api/auth/register", json={"email": email, "password": PASSWORD}
@@ -152,7 +167,11 @@ def test_missed_growth_returns_figure_for_idle_cash(client):
         headers = {"Authorization": f"Bearer {token}"}
 
         owner = _user_id_for(email)
+        # Idle cash is now sourced from the dedicated balance row (Story 6.5),
+        # not the denormalized holdings-row column; seed both (a holding + the
+        # authoritative balance).
         _insert_cache_row(owner, Decimal("25000.00"))
+        _insert_balance_row(owner, Decimal("25000.00"))
 
         r = client.get(
             f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
@@ -187,6 +206,40 @@ def test_missed_growth_returns_figure_for_idle_cash(client):
         assert body["as_of"]
         assert body["window_start"]
         assert body["statement"]
+    finally:
+        _clean_market([EP_SYMBOL])
+        _delete_user(email)
+
+
+# --- All-cash account (AD-14, Story 6.5) → real idle-cash figure -------------
+
+
+def test_missed_growth_all_cash_account_yields_real_figure(client):
+    """An all-cash account (idle cash in the dedicated balance row, ZERO holdings)
+    now yields a real idle-cash figure and no longer returns ``no_idle_cash`` —
+    proving the AD-14 cash-only gap is closed end-to-end through get_portfolio."""
+    _clean_market([EP_SYMBOL])
+    _insert_series(EP_SYMBOL, _rising_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        owner = _user_id_for(email)
+        # Idle cash lives ONLY in the balance row — NO portfolio_cache holdings row.
+        _insert_balance_row(owner, Decimal("25000.00"))
+
+        r = client.get(
+            f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # No longer a confidently-false "no idle cash": a real figure surfaces.
+        assert body["reason"] is None
+        assert body["idle_cash"] == "25000.00"
+        assert body["forgone_growth"] == "3500.00"  # 25000 × 0.14
+        assert body["sufficient"] is True
     finally:
         _clean_market([EP_SYMBOL])
         _delete_user(email)

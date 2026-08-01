@@ -28,7 +28,11 @@ import httpx
 import pytest
 
 from brokers.port import OrderNotPlaceableError, OrderStatus
-from brokers.schwab_adapter import SchwabAdapter, SchwabNotConfiguredError
+from brokers.schwab_adapter import (
+    SchwabAdapter,
+    SchwabNotConfiguredError,
+    SchwabReadError,
+)
 from coach.recommendation import OrderIntent, OrderSide
 
 _auth = importlib.import_module("schwab.auth")
@@ -52,8 +56,23 @@ class _FakeResponse:
         return self._json
 
 
+class _FakeAccountFields:
+    """Stand-in for schwab-py ``Client.Account.Fields`` (``enforce_enums=False``,
+    so the value is the raw string the adapter passes as ``fields=``)."""
+
+    POSITIONS = "positions"
+
+
+class _FakeAccount:
+    Fields = _FakeAccountFields
+
+
 class _FakeClient:
     """A stand-in for a schwab-py trading ``Client`` — records placements."""
+
+    # The adapter reads ``client.Account.Fields.POSITIONS`` — mirror the SDK's
+    # nested enum namespace (raw string under ``enforce_enums=False``).
+    Account = _FakeAccount
 
     def __init__(
         self,
@@ -62,10 +81,12 @@ class _FakeClient:
         quote=None,
         place_resp=None,
         order=None,
+        account=None,
         account_exc=None,
         quote_exc=None,
         place_exc=None,
         get_order_exc=None,
+        get_account_exc=None,
     ):
         self._account_numbers = account_numbers or [
             {"accountNumber": "123", "hashValue": "HASH123"}
@@ -75,12 +96,15 @@ class _FakeClient:
             headers={"Location": "loc"}
         )
         self._order = order or {}
+        self._account = account if account is not None else {}
         self._account_exc = account_exc
         self._quote_exc = quote_exc
         self._place_exc = place_exc
         self._get_order_exc = get_order_exc
+        self._get_account_exc = get_account_exc
         self.placed: list[tuple] = []
         self.get_order_calls: list[tuple] = []
+        self.get_account_calls: list[tuple] = []
 
     def get_account_numbers(self):
         if self._account_exc is not None:
@@ -103,6 +127,12 @@ class _FakeClient:
         if self._get_order_exc is not None:
             raise self._get_order_exc
         return _FakeResponse(json_data=self._order)
+
+    def get_account(self, account_hash, *, fields=None):
+        self.get_account_calls.append((account_hash, fields))
+        if self._get_account_exc is not None:
+            raise self._get_account_exc
+        return _FakeResponse(json_data=self._account)
 
 
 @pytest.fixture(autouse=True)
@@ -298,6 +328,170 @@ async def test_place_order_no_order_id_is_timeout(monkeypatch):
     reconciled = await adapter.get_order_status("k8")
     assert reconciled.status == OrderStatus.PENDING
     assert reconciled.broker_ref is None
+
+
+# --- fetch_portfolio (Story 6.5) ----------------------------------------------
+
+
+def test_fetch_portfolio_all_cash_maps_cash_no_holdings(monkeypatch):
+    # An all-cash account: positions absent, cashBalance set. Cash comes from the
+    # DEDICATED balances field (never inferred from positions); holdings empty.
+    client = _FakeClient(
+        account={
+            "securitiesAccount": {
+                "currentBalances": {"cashBalance": 750.25},
+            }
+        }
+    )
+    _install_client(monkeypatch, client)
+
+    snap = _adapter().fetch_portfolio()
+
+    assert snap.cash == Decimal("750.25")
+    assert isinstance(snap.cash, Decimal)
+    assert snap.holdings == []
+    assert snap.as_of.tzinfo is not None  # tz-aware UTC now()
+    # Fetched with the POSITIONS field on the resolved account hash.
+    assert client.get_account_calls == [("HASH123", "positions")]
+
+
+def test_fetch_portfolio_mixed_positions_and_cash(monkeypatch):
+    client = _FakeClient(
+        account={
+            "securitiesAccount": {
+                "currentBalances": {"cashBalance": 100},
+                "positions": [
+                    {
+                        "instrument": {"symbol": "VTI"},
+                        "longQuantity": 10,
+                        "marketValue": 2500,
+                        "averagePrice": 200,
+                    }
+                ],
+            }
+        }
+    )
+    _install_client(monkeypatch, client)
+
+    snap = _adapter().fetch_portfolio()
+
+    assert snap.cash == Decimal("100")
+    assert len(snap.holdings) == 1
+    h = snap.holdings[0]
+    assert h.symbol == "VTI"
+    assert h.quantity == Decimal("10")
+    assert h.market_value == Decimal("2500")
+    # cost_basis = averagePrice × quantity = 200 × 10.
+    assert h.cost_basis == Decimal("2000")
+    assert isinstance(h.market_value, Decimal)
+
+
+def test_fetch_portfolio_missing_cash_defaults_zero_and_skips_symbolless(monkeypatch):
+    # Missing cashBalance → 0; a position with no symbol is skipped (defensive).
+    client = _FakeClient(
+        account={
+            "securitiesAccount": {
+                "positions": [
+                    {"instrument": {}, "longQuantity": 5, "marketValue": 50},
+                    {
+                        "instrument": {"symbol": "BND"},
+                        "longQuantity": 3,
+                        "marketValue": 240,
+                    },
+                ],
+            }
+        }
+    )
+    _install_client(monkeypatch, client)
+
+    snap = _adapter().fetch_portfolio()
+
+    assert snap.cash == Decimal("0")
+    assert [h.symbol for h in snap.holdings] == ["BND"]
+    # No averagePrice → cost_basis is None (not fabricated).
+    assert snap.holdings[0].cost_basis is None
+
+
+def test_fetch_portfolio_malformed_body_raises_not_empty(monkeypatch):
+    # A malformed (non-dict) get_account body must RAISE a typed SchwabReadError —
+    # never return an empty snapshot that would reconcile the cache to nothing.
+    client = _FakeClient(account=None)
+    client.get_account = lambda account_hash, *, fields=None: _FakeResponse(
+        json_data=["not", "a", "dict"]
+    )
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(SchwabReadError):
+        _adapter().fetch_portfolio()
+
+
+def test_fetch_portfolio_missing_envelope_raises_not_empty(monkeypatch):
+    # A valid-JSON dict body that lacks the ``securitiesAccount`` envelope (e.g. an
+    # error object) must RAISE — NOT parse to cash=0/holdings=[] and wipe the cache.
+    client = _FakeClient(account={"errors": [{"message": "nope"}]})
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(SchwabReadError):
+        _adapter().fetch_portfolio()
+
+
+def test_fetch_portfolio_error_status_raises_not_empty(monkeypatch):
+    # An HTTP-error response (e.g. expired token / 5xx) must RAISE before parsing,
+    # never be parsed into an empty snapshot.
+    client = _FakeClient(account=None)
+    client.get_account = lambda account_hash, *, fields=None: _FakeResponse(
+        is_error=True
+    )
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(SchwabReadError):
+        _adapter().fetch_portfolio()
+
+
+def test_fetch_portfolio_skips_zero_and_short_positions(monkeypatch):
+    # A closed/zero-long position (longQuantity 0) and a short-only position are
+    # skipped — never emitted as junk holdings — while a real long position maps.
+    client = _FakeClient(
+        account={
+            "securitiesAccount": {
+                "currentBalances": {"cashBalance": 10},
+                "positions": [
+                    {"instrument": {"symbol": "OLD"}, "longQuantity": 0,
+                     "marketValue": 0},
+                    {"instrument": {"symbol": "SHT"}, "shortQuantity": 5,
+                     "marketValue": -500},
+                    {"instrument": {"symbol": "VTI"}, "longQuantity": 4,
+                     "marketValue": 1000},
+                ],
+            }
+        }
+    )
+    _install_client(monkeypatch, client)
+
+    snap = _adapter().fetch_portfolio()
+
+    assert [h.symbol for h in snap.holdings] == ["VTI"]
+    assert snap.holdings[0].quantity == Decimal("4")
+
+
+def test_fetch_portfolio_transport_error_raises_not_empty(monkeypatch):
+    # A transport error on get_account must RAISE (wrapped as SchwabReadError so no
+    # raw httpx exception leaks past the port), never an empty snapshot.
+    client = _FakeClient(get_account_exc=httpx.ConnectError("down"))
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(SchwabReadError):
+        _adapter().fetch_portfolio()
+
+
+def test_fetch_portfolio_without_token_refuses(monkeypatch):
+    # A Schwab read with no bound token refuses loudly (config error), never an
+    # empty import.
+    client = _FakeClient()
+    _install_client(monkeypatch, client)
+    adapter = SchwabAdapter()  # no token_read_func bound
+    with pytest.raises(SchwabNotConfiguredError):
+        adapter.fetch_portfolio()
 
 
 # --- get_order_status ---------------------------------------------------------

@@ -30,6 +30,7 @@ from api.config import get_settings
 from brokers.port import (
     BrokerPort,
     BrokerTokens,
+    Holding,
     OrderNotPlaceableError,
     OrderOutcome,
     OrderStatus,
@@ -47,6 +48,19 @@ class SchwabNotConfiguredError(RuntimeError):
 
     This is a configuration error (fail-loud), deliberately distinct from an
     import failure or a network error.
+    """
+
+
+class SchwabReadError(RuntimeError):
+    """Raised when a Schwab portfolio READ fails (transport/parse/shape error).
+
+    The failure surface of :meth:`SchwabAdapter.fetch_portfolio` (Story 6.5): a
+    FAILED read must RAISE (never return an empty/partial snapshot that would
+    reconcile the cache to nothing — the AD-14 failure contract). It also keeps
+    raw ``schwab-py``/``httpx`` exceptions from leaking past the port (AD-8) by
+    wrapping them. Distinct from :class:`SchwabNotConfiguredError` (a missing
+    token/account is a config error, not a read failure). Never carries token or
+    secret material.
     """
 
 
@@ -164,20 +178,108 @@ class SchwabAdapter(BrokerPort):
         return self._to_broker_tokens(token)
 
     def fetch_portfolio(self) -> PortfolioSnapshot:
-        """Fetch the account's holdings + cash from Schwab (network call).
+        """Fetch the account's holdings + cash from Schwab (network call, Story 6.5).
 
-        CREDENTIAL-GATED like the rest of this adapter: the fake adapter is the
-        default/tested path (Story 2.3 is fake-first). The real schwab-py
-        positions/balances mapping is deferred until the Schwab developer app is
-        approved — wiring it here without live creds/fixtures would be untested
-        code. Fails loudly (config error), never silently returns empty holdings
-        that would reconcile the cache to nothing.
+        The AD-14 balances READ the single-writer projection reconciles on. Cash
+        is sourced from a DEDICATED balances field
+        (``securitiesAccount.currentBalances.cashBalance``), NEVER inferred from
+        positions, so a cash-only account reports its true cash. Positions map to
+        broker-neutral :class:`~brokers.port.Holding` rows. Parsing is DEFENSIVE
+        (missing cash → 0; a position with no symbol is skipped). ``as_of`` is
+        stamped ``now(UTC)`` — this is a live read.
+
+        FAILURE CONTRACT: on ANY transport/parse/shape failure this RAISES
+        :class:`SchwabReadError` — it NEVER returns an empty/partial snapshot
+        (which would reconcile the cache to nothing). An HTTP-error response, a
+        non-dict body, or a body missing the ``securitiesAccount`` envelope all
+        raise; a raw ``httpx``/SDK exception is wrapped so nothing leaks past the
+        port (AD-8). A missing token/account is a plain
+        :class:`SchwabNotConfiguredError` (raised by ``_trading_client`` /
+        ``_account_hash``), deliberately distinct from a read failure. Never logs
+        token/secret material; schwab-py stays lazily imported (via
+        ``_trading_client``).
         """
         self._require_configured()
-        raise SchwabNotConfiguredError(
-            "Schwab portfolio fetch is not wired yet. The fake adapter is the "
-            "tested path for Story 2.3; the real schwab-py positions/balances "
-            "mapping lands when live Schwab access is available."
+        # Build the client + resolve the account hash first — a missing token /
+        # account is a config error that must surface plainly (these raise
+        # SchwabNotConfiguredError), NOT be masked into an empty snapshot.
+        client = self._trading_client()
+        account_hash = self._account_hash(client)
+
+        try:
+            resp = client.get_account(
+                account_hash, fields=client.Account.Fields.POSITIONS
+            )
+            if resp.is_error:
+                # An HTTP-error body (expired token, 5xx, ...) is NOT a portfolio —
+                # raise rather than parse it into an empty snapshot.
+                raise SchwabReadError(
+                    f"Schwab account read failed (status {resp.status_code})."
+                )
+            body = resp.json()
+            if not isinstance(body, dict):
+                raise SchwabReadError("Schwab account body is not an object.")
+            acct = body.get("securitiesAccount")
+            if not isinstance(acct, dict):
+                # A valid account read ALWAYS carries the ``securitiesAccount``
+                # envelope; its absence is an error/unexpected shape — RAISE, never
+                # silently reconcile the cache to empty (AD-14). MISSING SUB-FIELDS
+                # (currentBalances / positions) inside a valid envelope ARE
+                # tolerated below (a sparse-but-real account).
+                raise SchwabReadError(
+                    "Schwab account body is missing the securitiesAccount envelope."
+                )
+            cash = self._decimal_or_zero(
+                (acct.get("currentBalances") or {}).get("cashBalance")
+            )
+
+            holdings: list[Holding] = []
+            for position in acct.get("positions") or []:
+                position = position or {}
+                instrument = position.get("instrument") or {}
+                symbol = instrument.get("symbol")
+                if not symbol:
+                    # A position with no symbol is unusable — skip it (defensive),
+                    # never fabricate a nameless holding.
+                    continue
+                quantity = self._decimal_or_zero(position.get("longQuantity"))
+                if quantity <= 0:
+                    # A short / closed / zero-long position (longQuantity 0 or
+                    # reported only under shortQuantity) is outside the v1 long-only
+                    # index-fund universe — skip it rather than emit a junk holding
+                    # (0 shares with a non-zero market value / bogus 0 cost basis).
+                    continue
+                market_value = self._decimal_or_zero(position.get("marketValue"))
+                # Cost basis: averagePrice × quantity when BOTH are present, else
+                # None (the broker does not always report an average price).
+                avg_price_raw = position.get("averagePrice")
+                cost_basis: Decimal | None = None
+                if avg_price_raw is not None:
+                    avg_price = self._decimal_or_zero(avg_price_raw)
+                    cost_basis = avg_price * quantity
+                holdings.append(
+                    Holding(
+                        symbol=symbol,
+                        quantity=quantity,
+                        market_value=market_value,
+                        cost_basis=cost_basis,
+                    )
+                )
+        except SchwabReadError:
+            raise
+        except Exception as exc:
+            # Any transport/SDK/parse failure is a FAILED read — wrap it as a clear
+            # typed error so no raw SDK/httpx exception leaks past the port (AD-8)
+            # and the cache is NEVER reconciled to an empty snapshot. Message
+            # carries only the exception TYPE name, never body/token material.
+            raise SchwabReadError(
+                f"Schwab account read failed: {type(exc).__name__}."
+            ) from exc
+
+        return PortfolioSnapshot(
+            as_of=datetime.now(timezone.utc),
+            cash=cash,
+            holdings=holdings,
         )
 
     async def place_order(

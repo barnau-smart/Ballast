@@ -1,30 +1,39 @@
-"""The portfolio projection (Story 2.3) — the SINGLE writer of ``portfolio_cache``.
+"""The portfolio projection (Story 2.3 / 6.5) — the SINGLE writer of
+``portfolio_cache`` AND ``portfolio_balance``.
 
-AD-14: ``portfolio_cache`` is a *read model with one writer*. The broker is the
-authoritative source; the cache is a derived projection. This module is that one
-writer — nothing else in the codebase writes ``portfolio_cache``. Every other
-consumer (the dashboard read in ``api.portfolio``, Story 2.4, later coach reads)
-reads it READ-ONLY through the fail-closed :class:`ScopedRepository` (AD-10).
+AD-14: both tables are a *read model with one writer*. The broker is the
+authoritative source; they are derived projections. This module is that one
+writer — nothing else in the codebase writes them. Every other consumer (the
+dashboard read in ``api.portfolio``, missed-growth, coach reads) reads them
+READ-ONLY through the fail-closed :class:`ScopedRepository` (AD-10).
 
-Reconcile-wins, keyed on broker ``as_of``
------------------------------------------
+Idle cash lives in a DEDICATED balances source (Story 6.5, AD-14 cash-only gap
+closed): ``portfolio_balance`` holds ONE row per user (``cash``, ``as_of``), so a
+cash-only / cash-heavy account (few or zero holdings) still reports its true
+cash. Idle cash is NEVER derived from a ``portfolio_cache`` holdings row anymore.
+
+Reconcile-wins, keyed on the persisted balance ``as_of``
+--------------------------------------------------------
 On any conflict a fresh broker reconciliation wins over existing local state.
 :func:`reconcile_portfolio` reads the authoritative :class:`PortfolioSnapshot`
-from the Broker Port, compares its ``as_of`` to what is already cached, and:
+from the Broker Port, compares its ``as_of`` to the persisted
+``portfolio_balance.as_of`` (present even for a cash-only account, unlike zero
+holdings rows), and:
 
-- if the snapshot is NEWER than the cache (or the cache is empty): atomically
-  REPLACES the user's cached rows with the snapshot (delete-then-add — the same
-  atomic-replace discipline the 2.1 link callback uses for token rows);
-- if the snapshot is NOT newer (a stale/duplicate reconcile): leaves the cache
-  untouched, so an out-of-order reconcile never clobbers newer truth.
+- if the snapshot is NEWER (or nothing is cached): UPSERTS the balance row and
+  atomically REPLACES the user's cached holdings rows in ONE commit
+  (delete-then-add — the same atomic-replace discipline the 2.1 link callback
+  uses for token rows);
+- if the snapshot is NOT newer (a stale/duplicate reconcile): leaves the balance
+  and holdings untouched, so an out-of-order reconcile never clobbers newer truth
+  (now protecting cash-only accounts too).
 
 Post-trade optimistic writes (Epic 4) are always superseded by the next broker
-reconcile — the same rule, keyed on the same ``as_of``. There are no trades yet
-in this story, so the reconciler here is the only writer that exists.
+reconcile — the same rule, keyed on the same ``as_of``.
 
 Money stays ``Decimal`` end to end (never binary float). All access is scoped to
 one user via :class:`ScopedRepository`, so a reconcile can only ever touch that
-user's own cache.
+user's own cache + balance.
 """
 
 from __future__ import annotations
@@ -35,7 +44,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from brokers.port import BrokerPort, PortfolioSnapshot
-from db.models import PortfolioCache
+from db.models import PortfolioBalance, PortfolioCache
 from db.repository import ScopedRepository
 from db.scope import Scope
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,8 +56,15 @@ logger = logging.getLogger("ballast.portfolio")
 class PortfolioView:
     """A read-only view of a user's cached portfolio (holdings + cash + as_of).
 
-    Plain projection data — no token/secret values. ``as_of`` is ``None`` only
-    when the user has no cache yet (never imported).
+    Plain projection data — no token/secret values. ``holdings`` come from
+    ``portfolio_cache``; ``cash``/``as_of`` come from the dedicated
+    ``portfolio_balance`` row (AD-14, Story 6.5) so a cash-only account (zero
+    holdings, cash > 0) still reports its true cash. ``as_of`` is ``None`` only
+    when the user has no balance row yet (never imported).
+
+    The public shape (``holdings``, ``cash``, ``as_of``, ``is_empty``) is FIXED —
+    every downstream consumer (dashboard, missed-growth, coach oversized-lump)
+    depends on it unchanged.
     """
 
     holdings: list[PortfolioCache]
@@ -65,40 +81,43 @@ def _normalize_as_of(as_of: datetime) -> datetime:
     return as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
 
 
-def _representative_row(rows: list[PortfolioCache]) -> PortfolioCache | None:
-    """The row carrying the authoritative snapshot as_of/cash for the user.
+def _to_view(
+    rows: list[PortfolioCache], balance: PortfolioBalance | None
+) -> PortfolioView:
+    """Compose the fixed-shape view: holdings from the cache, cash/as_of from the
+    dedicated balance row (0 / None when the user has never imported)."""
+    cash = balance.cash if balance is not None else Decimal("0")
+    as_of = _normalize_as_of(balance.as_of) if balance is not None else None
+    return PortfolioView(holdings=rows, cash=cash, as_of=as_of)
 
-    The single writer replaces all of a user's rows atomically, so they share
-    one snapshot's ``as_of``/``cash``. We still pick the row with the newest
-    ``as_of`` deterministically (rather than trusting ``rows[0]`` — ``list()``
-    has no ORDER BY) so a hypothetical future single-writer violation can never
-    let a stale row mask newer truth.
+
+async def _read_balance(
+    scope: Scope, session: AsyncSession
+) -> PortfolioBalance | None:
+    """Read the user's single ``portfolio_balance`` row (or ``None``) — scoped.
+
+    The single writer keeps exactly one row per user; if the one-row invariant is
+    ever violated we deterministically pick the NEWEST ``as_of`` (``list()`` has
+    no ORDER BY) so a stale row can never mask newer cash truth.
     """
+    repo = ScopedRepository(PortfolioBalance, scope, session)
+    rows = await repo.list()
     if not rows:
         return None
     return max(rows, key=lambda r: _normalize_as_of(r.as_of))
 
 
-def _cached_as_of(rows: list[PortfolioCache]) -> datetime | None:
-    """The snapshot ``as_of`` currently cached, or ``None`` if never imported."""
-    row = _representative_row(rows)
-    return _normalize_as_of(row.as_of) if row is not None else None
-
-
-def _to_view(rows: list[PortfolioCache]) -> PortfolioView:
-    row = _representative_row(rows)
-    cash = row.cash if row is not None else Decimal("0")
-    return PortfolioView(holdings=rows, cash=cash, as_of=_cached_as_of(rows))
-
-
 async def get_portfolio(scope: Scope, session: AsyncSession) -> PortfolioView:
     """Read a user's cached portfolio READ-ONLY (never writes). AD-14/AD-10.
 
-    This is the sanctioned read path for the cache; it must never mutate rows.
+    This is the sanctioned read path; it must never mutate rows. Holdings come
+    from ``portfolio_cache`` and cash/as_of from the dedicated ``portfolio_balance``
+    row (so a cash-only account reports its true cash), both through the scoped repo.
     """
     repo = ScopedRepository(PortfolioCache, scope, session)
     rows = await repo.list()
-    return _to_view(rows)
+    balance = await _read_balance(scope, session)
+    return _to_view(rows, balance)
 
 
 async def reconcile_portfolio(
@@ -108,27 +127,33 @@ async def reconcile_portfolio(
     *,
     snapshot: PortfolioSnapshot | None = None,
 ) -> PortfolioView:
-    """Reconcile a user's ``portfolio_cache`` from the authoritative broker.
+    """Reconcile a user's portfolio cache + balance from the authoritative broker.
 
-    THE single writer of ``portfolio_cache`` (AD-14). Reads the broker snapshot
-    (or uses one passed in — e.g. tests), and applies reconcile-wins keyed on
-    ``as_of``: replaces the cache only when the snapshot is newer than what is
-    cached; a stale/duplicate snapshot leaves the cache untouched. Commits.
+    THE single writer of ``portfolio_cache`` AND ``portfolio_balance`` (AD-14).
+    Reads the broker snapshot (or uses one passed in — e.g. tests), and applies
+    reconcile-wins keyed on the persisted ``portfolio_balance.as_of`` (present
+    even for a cash-only account, so a stale re-fetch never clobbers newer cash
+    truth): on a strictly-newer snapshot it UPSERTS the balance row AND atomically
+    replaces the holdings rows in ONE commit; an equal/older snapshot leaves both
+    untouched.
 
-    All access is via the fail-closed scoped repo, so only THIS user's cache is
-    ever touched. Returns the resulting :class:`PortfolioView`.
+    All access is via the fail-closed scoped repo, so only THIS user's cache +
+    balance is ever touched. Returns the resulting :class:`PortfolioView`.
     """
     snap = snapshot if snapshot is not None else broker.fetch_portfolio()
     incoming_as_of = snap.as_of
     if incoming_as_of.tzinfo is None:
         incoming_as_of = incoming_as_of.replace(tzinfo=timezone.utc)
 
-    repo = ScopedRepository(PortfolioCache, scope, session)
-    existing = await repo.list()
-    cached_as_of = _cached_as_of(existing)
+    cache_repo = ScopedRepository(PortfolioCache, scope, session)
+    existing = await cache_repo.list()
+    balance = await _read_balance(scope, session)
+    cached_as_of = _normalize_as_of(balance.as_of) if balance is not None else None
 
     # Reconcile-wins: only a strictly-newer snapshot supersedes the cache. An
     # equal or older as_of is a stale/duplicate reconcile — leave truth intact.
+    # Keyed on the balance row's as_of, so a cash-only account (zero holdings)
+    # gets the same staleness protection.
     if cached_as_of is not None and incoming_as_of <= cached_as_of:
         logger.info(
             "portfolio_reconcile_skipped_stale owner_id=%s incoming_as_of=%s "
@@ -137,17 +162,28 @@ async def reconcile_portfolio(
             incoming_as_of.isoformat(),
             cached_as_of.isoformat(),
         )
-        return _to_view(existing)
+        return _to_view(existing, balance)
 
-    # Atomic replace: drop the old rows, write the fresh snapshot. Mirrors the
-    # 2.1 callback's delete-then-add discipline (ScopedRepository has no bulk
-    # delete; per-row delete under the same session commits together).
+    # Upsert the dedicated balance row (one per user) — update in place if it
+    # exists, else add — so cash + as_of survive even with zero holdings.
+    balance_repo = ScopedRepository(PortfolioBalance, scope, session)
+    if balance is not None:
+        balance.cash = snap.cash
+        balance.as_of = incoming_as_of
+    else:
+        balance = await balance_repo.add(cash=snap.cash, as_of=incoming_as_of)
+
+    # Atomic replace: drop the old holdings rows, write the fresh snapshot in the
+    # SAME commit. Mirrors the 2.1 callback's delete-then-add discipline
+    # (ScopedRepository has no bulk delete; per-row delete under the same session
+    # commits together). The now-vestigial per-row ``cash`` is still written
+    # (harmless denormalized copy; keeps the change schema-additive).
     for row in existing:
         await session.delete(row)
 
     written: list[PortfolioCache] = []
     for holding in snap.holdings:
-        row = await repo.add(
+        row = await cache_repo.add(
             symbol=holding.symbol,
             quantity=holding.quantity,
             market_value=holding.market_value,
@@ -165,5 +201,7 @@ async def reconcile_portfolio(
         incoming_as_of.isoformat(),
     )
     # Re-read through the scoped repo so the returned view reflects committed
-    # state (and a cash-only/empty snapshot yields an empty, consistent view).
-    return _to_view(await repo.list())
+    # state (and a cash-only/empty snapshot yields a consistent view whose cash
+    # comes from the balance row).
+    rows = await cache_repo.list()
+    return _to_view(rows, await _read_balance(scope, session))

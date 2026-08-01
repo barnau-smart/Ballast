@@ -8,6 +8,10 @@ is present but credentials are absent, and so callers depend only on
 
 from __future__ import annotations
 
-from brokers.schwab_adapter.adapter import SchwabAdapter, SchwabNotConfiguredError
+from brokers.schwab_adapter.adapter import (
+    SchwabAdapter,
+    SchwabNotConfiguredError,
+    SchwabReadError,
+)
 
-__all__ = ["SchwabAdapter", "SchwabNotConfiguredError"]
+__all__ = ["SchwabAdapter", "SchwabNotConfiguredError", "SchwabReadError"]

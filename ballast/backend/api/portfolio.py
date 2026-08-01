@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_scope
-from brokers.factory import get_broker
+from brokers.factory import get_reading_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import PortfolioView, get_portfolio, reconcile_portfolio
 from db.scope import Scope
@@ -105,12 +105,14 @@ async def read_portfolio(
 async def refresh_portfolio(
     scope: Scope = Depends(get_scope),
     session: AsyncSession = Depends(get_async_session),
-    broker: BrokerPort = Depends(get_broker),
+    broker: BrokerPort = Depends(get_reading_broker),
 ) -> PortfolioOut:
     """Force a reconcile of the cache from the authoritative broker (AD-14).
 
     Delegates to the single-writer projection; reconcile-wins keyed on ``as_of``
-    means a stale re-fetch never clobbers newer cached truth.
+    means a stale re-fetch never clobbers newer cached truth. Uses
+    ``get_reading_broker`` so a Schwab refresh authenticates with THIS user's
+    decrypted token (Story 6.5); the fake path passes through untouched.
     """
     view = await reconcile_portfolio(scope, session, broker)
     return _to_out(view)
