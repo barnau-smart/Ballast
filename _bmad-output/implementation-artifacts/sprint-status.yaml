@@ -110,7 +110,7 @@ development_status:
   7-1-production-db-migration-path: done
   7-2-generalized-atomic-claim-recoverable-placement: done
   7-3-calm-envelopes-provider-match-live-broker: done
-  7-4-llm-live-path-latency-robustness: backlog
+  7-4-llm-live-path-latency-robustness: done
   7-5-live-read-robustness-multi-account-safety: backlog
   7-6-gated-live-exercise-real-money: backlog
   epic-7-retrospective: optional

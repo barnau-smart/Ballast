@@ -643,7 +643,7 @@ def _install_real_anthropic_gateway(monkeypatch, *, output: dict):
         def create(self, **kwargs):
             return message
 
-    def _factory(*, api_key):
+    def _factory(*, api_key, **_kwargs):
         return _types.SimpleNamespace(messages=_Messages())
 
     monkeypatch.setattr(_anthropic, "Anthropic", _factory)

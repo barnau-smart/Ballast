@@ -70,7 +70,19 @@ class AnthropicGateway(LLMGateway):
         # source the rest of the app uses and mirroring TiingoAdapter. The value
         # is passed explicitly to the SDK client in complete(), so the key that
         # passes this gate is exactly the key used for the call.
-        self._api_key = get_settings().ANTHROPIC_API_KEY
+        settings = get_settings()
+        self._api_key = settings.ANTHROPIC_API_KEY
+        # Transport budget for the (lazily-built) SDK client — read here (cheap)
+        # but applied in complete(), so a hung call degrades in seconds, not the
+        # SDK's ~10-minute default (Story 7.4). These reads never touch the SDK.
+        self._timeout = settings.LLM_REQUEST_TIMEOUT_SECONDS
+        self._max_retries = settings.LLM_MAX_RETRIES
+        # The SDK client is built LAZILY on the first complete() call and cached
+        # here for connection reuse across calls (an httpx pool that must outlive
+        # a single request). It is NEVER constructed in __init__ — that would
+        # force the anthropic SDK import at construction and break the
+        # "importing this module never loads the SDK" contract.
+        self._client: object | None = None
         # Fail loudly at construction if the key is missing, so the factory's
         # gating is unambiguous. The anthropic SDK is NOT imported here.
         self._require_configured()
@@ -119,9 +131,20 @@ class AnthropicGateway(LLMGateway):
 
         model = route_model(request.hard_reasoning)
 
-        # Pass the validated key explicitly so the SDK uses the same credential
-        # that passed the gate (not an independently-resolved env var / profile).
-        client = anthropic.Anthropic(api_key=self._api_key)
+        # Build the SDK client ONCE (lazy, on first call) and cache it for
+        # connection reuse across subsequent complete() calls. Pass the validated
+        # key explicitly so the SDK uses the same credential that passed the gate
+        # (not an independently-resolved env var / profile), plus an explicit
+        # ``timeout``/``max_retries`` so a hung call surfaces as an
+        # ``APITimeoutError`` (an ``anthropic.APIError``) within the budget —
+        # fenced below and degraded to the default plan — not a ~10-minute stall.
+        if self._client is None:
+            self._client = anthropic.Anthropic(
+                api_key=self._api_key,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+            )
+        client = self._client
 
         # Build kwargs — omit ``system`` when None (None-safe). Adaptive thinking
         # only: no budget_tokens/temperature/top_p/top_k (they 400 on these models).

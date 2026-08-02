@@ -376,8 +376,14 @@ def _install_fake_client(monkeypatch, messages: _FakeMessages):
     """
     captured: dict[str, object] = {}
 
-    def _factory(*, api_key):
+    def _factory(*, api_key, **kwargs):
         captured["api_key"] = api_key
+        # Capture the transport budget (Story 7.4) so a test can assert the
+        # client was built with the timeout/max_retries from Settings, and count
+        # constructions to pin the build-once-reuse contract.
+        captured["timeout"] = kwargs.get("timeout")
+        captured["max_retries"] = kwargs.get("max_retries")
+        captured["build_count"] = captured.get("build_count", 0) + 1
         return _types.SimpleNamespace(messages=messages)
 
     monkeypatch.setattr(_anthropic, "Anthropic", _factory)
@@ -582,7 +588,7 @@ def test_hardened_large_max_tokens_stream_api_error_wrapped(monkeypatch):
 def test_hardened_empty_messages_raises_before_client(monkeypatch):
     called = {"factory": False}
 
-    def _factory(*, api_key):  # pragma: no cover - must NOT be called
+    def _factory(*, api_key, **_kwargs):  # pragma: no cover - must NOT be called
         called["factory"] = True
         raise AssertionError("client must not be constructed for invalid messages")
 
@@ -598,7 +604,7 @@ def test_hardened_empty_messages_raises_before_client(monkeypatch):
 def test_hardened_invalid_role_raises_before_client(monkeypatch):
     called = {"factory": False}
 
-    def _factory(*, api_key):  # pragma: no cover - must NOT be called
+    def _factory(*, api_key, **_kwargs):  # pragma: no cover - must NOT be called
         called["factory"] = True
         raise AssertionError("client must not be constructed for an invalid role")
 
@@ -612,3 +618,153 @@ def test_hardened_invalid_role_raises_before_client(monkeypatch):
     with pytest.raises(EmptyMessagesError):
         gateway.complete(bad)
     assert called["factory"] is False
+
+
+# --- Story 7.4: client reuse, transport budget, factory memoization -----------
+#
+# The live LLM path must build the SDK client ONCE (connection reuse) with an
+# explicit timeout/retry budget from Settings, and the factory must pool the
+# gateway across requests (keyed by API key) so the pool actually outlives one
+# request — while a rotated key rebuilds. These exercise the real code path with
+# the SDK fully mocked; no credentials, no network.
+
+from api.config import get_settings  # noqa: E402
+from llm.factory import _reset_llm_gateway_cache  # noqa: E402
+
+
+def test_client_constructed_once_across_two_complete_calls(monkeypatch):
+    # Two complete() calls on one gateway must build the SDK client exactly once
+    # (the cached httpx pool is reused, not rebuilt per call).
+    payload = json.dumps({"answer": "hold"})
+    messages = _FakeMessages(create_result=_text_message(payload))
+    captured = _install_fake_client(monkeypatch, messages)
+    gateway = _configured_gateway(monkeypatch)
+
+    gateway.complete(_matrix_request())
+    gateway.complete(_matrix_request())
+
+    assert captured["build_count"] == 1
+
+
+def test_client_ctor_receives_configured_timeout_and_max_retries(monkeypatch):
+    # The client is built with the exact timeout/max_retries from Settings.
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "42.5")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
+    payload = json.dumps({"answer": "hold"})
+    messages = _FakeMessages(create_result=_text_message(payload))
+    captured = _install_fake_client(monkeypatch, messages)
+    gateway = _configured_gateway(monkeypatch)
+
+    gateway.complete(_matrix_request())
+
+    settings = get_settings()
+    assert settings.LLM_REQUEST_TIMEOUT_SECONDS == 42.5
+    assert settings.LLM_MAX_RETRIES == 5
+    assert captured["timeout"] == 42.5
+    assert captured["max_retries"] == 5
+
+
+def test_factory_pools_anthropic_gateway_for_stable_key(monkeypatch):
+    # get_llm_gateway() returns the SAME cached anthropic gateway across calls
+    # when the key is unchanged (pooled client reused across requests).
+    _reset_llm_gateway_cache()
+    monkeypatch.setenv("LLM_ADAPTER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stable-key")
+    try:
+        first = get_llm_gateway()
+        second = get_llm_gateway()
+        assert first is second
+        assert isinstance(first, AnthropicGateway)
+    finally:
+        _reset_llm_gateway_cache()
+
+
+def test_factory_rebuilds_anthropic_gateway_when_key_changes(monkeypatch):
+    # A key change yields a FRESH gateway/client (a rotated key is honored, never
+    # served from the stale pool). get_settings() reads env live.
+    _reset_llm_gateway_cache()
+    monkeypatch.setenv("LLM_ADAPTER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-one")
+    try:
+        first = get_llm_gateway()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "key-two")
+        second = get_llm_gateway()
+        assert first is not second
+        assert isinstance(second, AnthropicGateway)
+    finally:
+        _reset_llm_gateway_cache()
+
+
+def test_fake_path_needs_no_new_config_and_builds_no_client(monkeypatch):
+    # The fake adapter reads none of the new Settings and never constructs an SDK
+    # client. Guard the SDK ctor to prove it is never touched on the fake path.
+    def _factory(*, api_key, **_kwargs):  # pragma: no cover - must NOT be called
+        raise AssertionError("the fake path must never build an anthropic client")
+
+    monkeypatch.setattr(_anthropic, "Anthropic", _factory)
+    monkeypatch.setenv("LLM_ADAPTER", "fake")
+    monkeypatch.delenv("LLM_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
+
+    gateway = get_llm_gateway()
+    assert isinstance(gateway, FakeLLMGateway)
+    # A full fake completion runs without ever touching the guarded ctor.
+    resp = gateway.complete(_matrix_request())
+    assert isinstance(resp, LLMResponse)
+
+
+# --- Story 7.4: STREAMING_MAX_TOKENS <-> SDK non-streaming ceiling (canary) ----
+#
+# STREAMING_MAX_TOKENS must stay strictly below the SDK's EFFECTIVE non-streaming
+# max_tokens ceiling for EVERY model route_model can return, so a request at or
+# below the threshold never trips the SDK's non-streaming ValueError (which is
+# NOT an anthropic.APIError and so would escape complete()'s transport fence).
+#
+# This calls the SDK's REAL guard (`_client._calculate_nonstreaming_timeout`, the
+# exact function `messages.create()` invokes with `MODEL_NONSTREAMING_TOKENS.get(
+# model)`) rather than re-deriving its formula from source text — so it tracks any
+# SDK change to the limit, the per-model cap, or the rejection logic, and cannot
+# silently pass by validating its own reconstruction. It is a pure computation
+# (no network, no credentials).
+#
+# NOTE (defense-in-depth): the adapter builds its client with an EXPLICIT
+# `timeout`, and the SDK only runs this guard when `client.timeout ==
+# DEFAULT_TIMEOUT` (anthropic messages.py). So on the live path the raw ValueError
+# is ALREADY unreachable regardless of this coupling — the >STREAMING_MAX_TOKENS
+# streaming route and this canary are belt-and-suspenders that keep the port safe
+# if the explicit timeout were ever removed. This canary pins the coupling the
+# streaming route relies on; it does not claim to be the sole guard.
+
+
+def test_streaming_max_tokens_below_sdk_nonstreaming_ceiling_for_every_routed_model():
+    routed_models = {route_model(True), route_model(False)}
+    # Sanity: the routed set is exactly the two documented model ids.
+    assert routed_models == {HARD_REASONING_MODEL, DEFAULT_MODEL}
+
+    constants = importlib.import_module("anthropic._constants")
+    # A DEFAULT-timeout client so we exercise the SDK's real non-streaming guard
+    # directly (a fake key — never a real one; no network is made by the timeout
+    # calc itself).
+    client = _anthropic.Anthropic(api_key="test-key-not-real")
+
+    for model in routed_models:
+        cap = constants.MODEL_NONSTREAMING_TOKENS.get(model, None)
+
+        # The SDK ACCEPTS STREAMING_MAX_TOKENS non-streaming (no ValueError) — this
+        # is the exact call messages.create() makes for a default-timeout client.
+        # If a future SDK/threshold change pushed the ceiling to/below the
+        # threshold, this raises and the test fails loudly.
+        try:
+            client._calculate_nonstreaming_timeout(STREAMING_MAX_TOKENS, cap)
+        except ValueError:  # pragma: no cover - only on a real regression
+            pytest.fail(
+                f"STREAMING_MAX_TOKENS={STREAMING_MAX_TOKENS} is NOT strictly below "
+                f"the SDK non-streaming ceiling for {model!r}; a request at the "
+                "threshold would trip the SDK's ValueError and escape the port."
+            )
+
+        # Confirm this IS the real guard (not a no-op): a value far above ANY
+        # plausible ceiling DOES raise. Guarantees the accept-assertion above has
+        # teeth — the SDK is genuinely rejecting large non-streaming requests.
+        with pytest.raises(ValueError):
+            client._calculate_nonstreaming_timeout(10_000_000, cap)

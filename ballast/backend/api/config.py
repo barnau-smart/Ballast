@@ -6,6 +6,7 @@ defaults. See .env.example for the documented variables.
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,6 +77,21 @@ class Settings(BaseSettings):
     # error (it never crashes at import, never imports the SDK at import time,
     # and the fake adapter needs no creds). The key is never logged.
     ANTHROPIC_API_KEY: str = ""
+
+    # Per-request transport budget for the live Anthropic path (Story 7.4). The
+    # SDK client is built once (connection reuse) with these values so a hung
+    # call surfaces as a typed LLMTransportError the coach degrades to the
+    # default plan in SECONDS, not the SDK's ~10-minute non-streaming default.
+    # 60s clears a normal interactive Opus structured /recommend completion with
+    # margin; env-tunable so ops can dial it against real latency at Story 7.6.
+    # Applied when the pooled gateway/client is built, so a change is picked up on
+    # the next rebuild (the factory keys its memo on this value); must be > 0
+    # (a 0/negative timeout is fail-loud rather than a degenerate instant-timeout).
+    LLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0)
+    # Retry budget the SDK client is built with (Story 7.4). Makes the SDK's own
+    # default (2) explicit and env-tunable for 7.6 real-world tuning; must be >= 0
+    # (0 disables retries).
+    LLM_MAX_RETRIES: int = Field(default=2, ge=0)
 
     # --- Weekly digest / Story 5.1 -------------------------------------------
 
