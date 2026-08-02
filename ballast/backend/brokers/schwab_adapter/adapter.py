@@ -521,6 +521,20 @@ class SchwabAdapter(BrokerPort):
             account_hash = self._account_hash(client)
             status_resp = client.get_order(order_id, account_hash)
             return self._map_order(status_resp.json(), broker_ref=broker_ref)
+        except SchwabNotConfiguredError:
+            # A DETERMINISTIC config/auth fault — raised ONLY at client build
+            # (``_trading_client``/``_account_hash``), never by the actual
+            # ``client.get_order`` read. Surface it DISTINCTLY instead of
+            # laundering it into TIMEOUT below: a config fault is not an
+            # indeterminate transport blip, and mapping it to TIMEOUT would create
+            # a soft dead-end where every retry re-launders the same fault with no
+            # honest "reconnect" signal. This is SAFE here because the method is
+            # READ-ONLY — the fault means the read never happened, so there is no
+            # phantom fill and no order-status ambiguity; it never re-places and
+            # never searches. Mirrors ``place_order``'s deliberate exclusion of
+            # ``SchwabNotConfiguredError`` from its pre-placement ``except`` tuple.
+            # The reconcile endpoint maps this to a calm 409 reconnect.
+            raise
         except Exception:
             # The read is over an order KNOWN to have been placed (its id was
             # persisted at co-sign), so — exactly like ``get_order_status`` — this

@@ -47,6 +47,7 @@ from brokers.port import (
     OrderStatus,
     PortfolioSnapshot,
 )
+from brokers.schwab_adapter import SchwabNotConfiguredError
 from brokers.session import BrokerageSession
 from api.coach import IN_PROGRESS_MESSAGE
 from coach.decision_record import (
@@ -3098,6 +3099,113 @@ def test_reconcile_timeout_read_needs_reconfirmation(client):
         assert reconcile_adapter.calls == []  # never placed
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+class _ConfigFaultReconcileAdapter(_ScriptedAdapter):
+    """A reconcile double whose by-ref READ raises a DETERMINISTIC config fault.
+
+    Story 7.3: models the exact class ``SchwabAdapter.get_order_status_by_ref``
+    now lets propagate — a ``SchwabNotConfiguredError`` raised at client build
+    (``_trading_client``/``_account_hash``), never by the actual read. It must
+    surface DISTINCTLY as a calm 409 reconnect, NOT be laundered into a
+    ``timeout`` result. ``provider = "fake"`` so it passes the placement-time
+    integrity gate and the endpoint actually reaches the read.
+    """
+
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        self.ref_calls.append(broker_ref)
+        raise SchwabNotConfiguredError(
+            "Schwab trading requires a linked, decrypted brokerage token."
+        )
+
+
+def test_reconcile_config_fault_is_calm_409_persists_nothing(client):
+    # (Story 7.3, matrix: reconcile hits config/auth fault) A live+provider-matched
+    # session whose by-ref read raises a DETERMINISTIC SchwabNotConfiguredError →
+    # the endpoint returns a calm 409 RECONNECT_MESSAGE, DISTINCT from a transport
+    # TIMEOUT, and persists NOTHING (the fault precedes record_reconciliation).
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="55")
+
+        reconcile_adapter = _ConfigFaultReconcileAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        # Calm 409 reconnect — NOT a 200 timeout result.
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        # The read WAS reached (proves it is the read-surfaced config class), but
+        # nothing was placed and nothing was persisted.
+        assert reconcile_adapter.ref_calls == ["55"]
+        assert reconcile_adapter.calls == []
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"] is None
+        assert row["reconciled_at"] is None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_reconcile_provider_mismatch_is_calm_409_broker_untouched(client):
+    # (Story 7.3, matrix: provider mismatch at reconcile) A live session whose
+    # provider disagrees with the configured adapter → refused with the same calm
+    # 409 RECONNECT_MESSAGE BEFORE any broker read (mirrors the /approve
+    # regression). _assert_session_integrity fires first, so the by-ref read is
+    # never reached and nothing is persisted.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        # Cosign the pending record with a provider-MATCHED session (fake==fake).
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref="66")
+
+        # Now force the reconcile session's provider to DISAGREE with the adapter
+        # (adapter provider "fake" vs session provider "schwab").
+        reconcile_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+            # No reconciled_by_ref scripted → the double FAILS LOUDLY if the read
+            # is ever reached, proving the broker was never touched.
+        )
+        client.app.dependency_overrides[get_broker] = lambda: reconcile_adapter
+        client.app.dependency_overrides[require_live_broker_session] = (
+            lambda: _live_session(provider="schwab")
+        )
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/reconcile", headers=headers
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        # Broker NEVER touched — no place_order, no by-ref read.
+        assert reconcile_adapter.calls == []
+        assert reconcile_adapter.ref_calls == []
+        # Nothing persisted (refused before record_reconciliation).
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"] is None
+        assert row["reconciled_at"] is None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        client.app.dependency_overrides.pop(require_live_broker_session, None)
         _delete_user(email)
 
 

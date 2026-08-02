@@ -474,6 +474,107 @@ async def test_get_execution_broker_binds_decrypted_schwab_token(monkeypatch):
     assert token["expires_at"] == int(row.expires_at.timestamp())
 
 
+# --- Story 7.3: undecryptable-token → calm 409 reconnect at the shared seam ----
+
+
+def _stub_undecryptable_token_repo(monkeypatch):
+    """Wire an offline SchwabAdapter whose ONE stored token cannot be decrypted.
+
+    Mirrors ``test_get_execution_broker_binds_decrypted_schwab_token`` (repo +
+    decrypt mocked, no DB, no SDK) but forces ``decrypt_token`` to raise
+    ``TokenEncryptionError`` — the exact fault a rotated ``TOKEN_ENCRYPTION_KEY``
+    or corrupt ciphertext produces DURING FastAPI dependency resolution.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    import brokers.crypto as crypto_mod
+    import db.repository as repo_mod
+    from brokers.schwab_adapter import SchwabAdapter
+
+    monkeypatch.setenv("SCHWAB_CLIENT_ID", "id")
+    monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://example.com/cb")
+
+    row = SimpleNamespace(
+        access_token="enc-access",
+        refresh_token="enc-refresh",
+        expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+
+    class _FakeRepo:
+        def __init__(self, model, scope, session):
+            pass
+
+        async def list(self):
+            return [row]
+
+    def _boom(_ct):
+        raise TokenEncryptionError(
+            "Could not decrypt the stored token (wrong key or tampered data)."
+        )
+
+    monkeypatch.setattr(repo_mod, "ScopedRepository", _FakeRepo)
+    monkeypatch.setattr(crypto_mod, "decrypt_token", _boom)
+
+    return SchwabAdapter()
+
+
+@pytest.mark.asyncio
+async def test_get_execution_broker_undecryptable_token_is_calm_409(monkeypatch):
+    """An undecryptable stored token on the placement seam raises a calm 409.
+
+    The decrypt failure fires DURING dependency resolution (before any handler
+    ``try/except``); the shared ``_bind_user_token`` choke point converts it into
+    the same ``RECONNECT_MESSAGE`` envelope the entry gate uses — never a raw 500.
+    """
+    from fastapi import HTTPException
+
+    from api.deps import RECONNECT_MESSAGE
+    from brokers.factory import get_execution_broker
+
+    schwab = _stub_undecryptable_token_repo(monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        await get_execution_broker(scope=object(), session=object(), broker=schwab)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == RECONNECT_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_get_reading_broker_undecryptable_token_is_calm_409(monkeypatch):
+    """Same calm 409 on the READ/refresh seam — the one choke point covers both.
+
+    ``get_reading_broker`` (``/refresh``) delegates to the SAME
+    ``_bind_user_token`` as ``get_execution_broker`` (``/approve`` + reconcile),
+    so a single decrypt guard fixes all three ledger sites.
+    """
+    from fastapi import HTTPException
+
+    from api.deps import RECONNECT_MESSAGE
+    from brokers.factory import get_reading_broker
+
+    schwab = _stub_undecryptable_token_repo(monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        await get_reading_broker(scope=object(), session=object(), broker=schwab)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == RECONNECT_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_reading_broker_passes_fake_through_no_decrypt():
+    """A non-Schwab adapter passes straight through the reading seam untouched.
+
+    No repo/decrypt work happens for the fake/spy — the decrypt guard is only
+    ever reachable on the real Schwab path, so the credential-free tested path is
+    unaffected.
+    """
+    from brokers.factory import get_reading_broker
+
+    fake = FakeBrokerAdapter()
+    result = await get_reading_broker(scope=None, session=None, broker=fake)
+    assert result is fake
+
+
 # --- Story 6.7: fake adapter durable reconcile-by-ref + sole-caller ------------
 
 

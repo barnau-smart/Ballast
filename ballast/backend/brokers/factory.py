@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import get_settings
-from api.deps import get_scope
+from api.deps import RECONNECT_MESSAGE, get_scope
 from brokers.fake_adapter import FakeBrokerAdapter
 from brokers.port import BrokerPort
 from db.scope import Scope
@@ -98,7 +98,7 @@ async def _bind_user_token(
     if not isinstance(broker, SchwabAdapter):
         return broker
 
-    from brokers.crypto import decrypt_token
+    from brokers.crypto import TokenEncryptionError, decrypt_token
     from db.models import BrokerageToken
     from db.repository import ScopedRepository
 
@@ -117,11 +117,29 @@ async def _bind_user_token(
     )
     from brokers.port import BrokerTokens
 
-    tokens = BrokerTokens(
-        access_token=decrypt_token(row.access_token),
-        refresh_token=decrypt_token(row.refresh_token),
-        expires_at=row.expires_at,
-    )
+    try:
+        tokens = BrokerTokens(
+            access_token=decrypt_token(row.access_token),
+            refresh_token=decrypt_token(row.refresh_token),
+            expires_at=row.expires_at,
+        )
+    except TokenEncryptionError as exc:
+        # An undecryptable stored token (rotated ``TOKEN_ENCRYPTION_KEY`` or
+        # corrupt/tampered ciphertext) raised HERE — during FastAPI dependency
+        # resolution — would otherwise escape the handler's own ``try/except``
+        # entirely (a dependency-resolution error never reaches the handler body)
+        # and surface as a raw 500 through the app's ``Exception`` handler. That
+        # breaks the calm/honest/never-red voice (NFR8). Re-raise as the SAME calm
+        # 409 reconnect envelope the entry gate uses: an undecryptable token is,
+        # from the user's chair, exactly a "reconnect your Schwab" condition. This
+        # single choke point — shared by ``get_execution_broker`` (``/approve`` and
+        # ``/decisions/{id}/reconcile``) and ``get_reading_broker`` (``/refresh``)
+        # — covers all three seams at once. The message never echoes token/key
+        # material or the raw exception text (``from exc`` keeps the chain for
+        # logs, not the response body).
+        raise HTTPException(
+            status_code=409, detail=RECONNECT_MESSAGE
+        ) from exc
     token_dict = _token_dict_from_broker_tokens(tokens)
     return SchwabAdapter(token_read_func=lambda: token_dict)
 

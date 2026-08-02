@@ -948,6 +948,31 @@ async def test_get_order_status_by_ref_non_numeric_ref_is_pending_no_search(
     assert client.get_order_calls == []
 
 
+@pytest.mark.asyncio
+async def test_get_order_status_by_ref_config_fault_surfaces_not_timeout(
+    monkeypatch,
+):
+    # Story 7.3: a DETERMINISTIC config/auth fault at client build must surface
+    # DISTINCTLY as SchwabNotConfiguredError — NOT be laundered into a TIMEOUT.
+    # A configured-but-TOKENLESS adapter (creds set by the autouse fixture, but no
+    # ``token_read_func`` bound) raises SchwabNotConfiguredError from
+    # ``_trading_client`` BEFORE any ``client.get_order`` read. Because the method
+    # is READ-ONLY the read never happened (no phantom fill), so surfacing the
+    # config class is safe and lets the reconcile endpoint map it to a calm 409
+    # reconnect instead of an infinitely-retryable timeout. The usable numeric ref
+    # proves we passed the short-circuits and reached the client-build fence.
+    client = _FakeClient()
+    _install_client(monkeypatch, client)
+    adapter = SchwabAdapter()  # configured, but no token_read_func bound
+
+    with pytest.raises(SchwabNotConfiguredError):
+        await adapter.get_order_status_by_ref("42")
+
+    # Never touched the SDK read (the fault precedes it) — no search, no re-place.
+    assert client.get_order_calls == []
+    assert client.placed == []
+
+
 def test_schwab_client_has_no_get_orders_for_account_call():
     # The reconcile path must NEVER search: assert the adapter source references
     # neither ``get_orders_for_account`` nor any attribute/amount fuzzy-matching

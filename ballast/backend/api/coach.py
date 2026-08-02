@@ -59,6 +59,7 @@ from api.config import get_settings
 from api.deps import RECONNECT_MESSAGE, get_scope, require_live_broker_session
 from brokers.factory import get_execution_broker
 from brokers.port import BrokerPort, OrderNotPlaceableError, OrderOutcome
+from brokers.schwab_adapter import SchwabNotConfiguredError
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
 from coach.decision_record import (
@@ -712,6 +713,16 @@ async def reconcile_decision(
     except SessionIntegrityError as exc:
         # Session lapsed or provider mismatched at reconcile time — the same calm
         # reconnect envelope as the entry gate; the broker was never touched.
+        raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
+    except SchwabNotConfiguredError as exc:
+        # A DETERMINISTIC config/auth fault surfaced by the READ-ONLY reconcile
+        # read (``get_order_status_by_ref`` now lets ``SchwabNotConfiguredError``
+        # propagate rather than laundering it into TIMEOUT). Map it to the SAME
+        # calm 409 reconnect envelope — DISTINCT from a transport blip, which
+        # still flows through below as a normal 200 ``timeout``/``needs_reconfirmation``
+        # result with the ``broker_ref`` preserved (so the order stays
+        # reconcilable). Nothing is persisted here: the fault precedes
+        # ``record_reconciliation``, so no local money truth is touched.
         raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
 
     if result.reconciled:
