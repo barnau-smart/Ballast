@@ -100,7 +100,11 @@ class OrderOutcome:
     ``status`` is an :class:`OrderStatus`; ``filled_qty`` and ``avg_price`` are
     ``Decimal`` (NEVER binary float) — ``avg_price`` may be ``None`` when nothing
     filled; ``broker_ref`` is the broker's stable reference for the order (or
-    ``None`` when the broker did not assign one). Frozen so an outcome is an
+    ``None`` when the broker did not assign one). ``account_ref`` (Story 7.5) is
+    the broker-neutral account the order was placed/read against (the resolved
+    Schwab trading hash), ``None`` for the fake or when unknown; it is persisted
+    into the decision record's ``cosign_snapshot`` (no schema change) as the audit
+    of which account the order actually landed in. Frozen so an outcome is an
     immutable value. Story 4.6 returns exactly one of these from
     :meth:`BrokerPort.place_order`; polling/reconciliation is Story 4.7.
     """
@@ -109,6 +113,7 @@ class OrderOutcome:
     filled_qty: Decimal
     avg_price: Decimal | None = None
     broker_ref: str | None = None
+    account_ref: str | None = None
 
 
 class OrderNotPlaceableError(ValueError):

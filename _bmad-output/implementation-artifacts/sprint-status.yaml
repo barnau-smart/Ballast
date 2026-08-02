@@ -111,7 +111,7 @@ development_status:
   7-2-generalized-atomic-claim-recoverable-placement: done
   7-3-calm-envelopes-provider-match-live-broker: done
   7-4-llm-live-path-latency-robustness: done
-  7-5-live-read-robustness-multi-account-safety: backlog
+  7-5-live-read-robustness-multi-account-safety: done
   7-6-gated-live-exercise-real-money: backlog
   epic-7-retrospective: optional
 

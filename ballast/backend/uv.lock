@@ -170,6 +170,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "anyio" },
     { name = "asyncpg" },
     { name = "cryptography" },
     { name = "fastapi" },
@@ -191,6 +192,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.120,<0.121" },
+    { name = "anyio" },
     { name = "asyncpg" },
     { name = "cryptography" },
     { name = "fastapi", specifier = "==0.136.*" },

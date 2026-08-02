@@ -51,6 +51,21 @@ class SchwabNotConfiguredError(RuntimeError):
     """
 
 
+class SchwabAccountSelectionError(SchwabNotConfiguredError):
+    """Raised when the Schwab login exposes >1 account and no unambiguous choice.
+
+    A configuration/selection fault, DELIBERATELY subclassing
+    :class:`SchwabNotConfiguredError` so the read path (``fetch_portfolio`` /
+    reconcile / import-on-connect) already treats it as a distinct config fault
+    (not a :class:`SchwabReadError`) for free, and import-on-connect keeps
+    swallowing it (the link survives). Fires when a login returns more than one
+    account and ``SCHWAB_ACCOUNT_ID`` is unset (ambiguous — never ``accounts[0]``),
+    or when ``SCHWAB_ACCOUNT_ID`` matches none of the returned account numbers. A
+    pre-placement/pre-read refusal — no order is ever placed. Never carries token
+    or secret material.
+    """
+
+
 class SchwabReadError(RuntimeError):
     """Raised when a Schwab portfolio READ fails (transport/parse/shape error).
 
@@ -322,6 +337,10 @@ class SchwabAdapter(BrokerPort):
         # the transport/parse ``except`` below can PRESERVE it on an indeterminate
         # status-read failure (a landed order must stay reconcilable — Story 6.7).
         order_ref: str | None = None
+        # The resolved account hash (Story 7.5): kept in the outer scope so it can
+        # ride back on every returned ``OrderOutcome.account_ref`` (the audit of
+        # which account the order landed against). ``None`` until resolved.
+        account_hash: str | None = None
         try:
             account_hash = self._account_hash(client)
             ask = self._quote_ask(client, order_intent.symbol)
@@ -369,6 +388,7 @@ class SchwabAdapter(BrokerPort):
                 filled_qty=Decimal("0"),
                 avg_price=None,
                 broker_ref=None,
+                account_ref=account_hash,
             )
         # --- The single placement write has RETURNED. From here on NO exception
         # may escape this method: a landed order plus ANY raise would let
@@ -387,6 +407,7 @@ class SchwabAdapter(BrokerPort):
                     filled_qty=Decimal("0"),
                     avg_price=None,
                     broker_ref=None,
+                    account_ref=account_hash,
                 )
             order_id = Utils(client, account_hash).extract_order_id(resp)
             order_ref = None if order_id is None else str(order_id)
@@ -401,9 +422,12 @@ class SchwabAdapter(BrokerPort):
                     filled_qty=Decimal("0"),
                     avg_price=None,
                     broker_ref=None,
+                    account_ref=account_hash,
                 )
             status_resp = client.get_order(order_id, account_hash)
-            return self._map_order(status_resp.json(), broker_ref=order_ref)
+            return self._map_order(
+                status_resp.json(), broker_ref=order_ref, account_ref=account_hash
+            )
         except Exception:
             # ANY post-placement failure is INDETERMINATE: the order may have
             # landed. Never leak a raw exception past the port; never a phantom
@@ -419,6 +443,7 @@ class SchwabAdapter(BrokerPort):
                 filled_qty=Decimal("0"),
                 avg_price=None,
                 broker_ref=order_ref,
+                account_ref=account_hash,
             )
 
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
@@ -447,10 +472,13 @@ class SchwabAdapter(BrokerPort):
                 broker_ref=None,
             )
         client = self._trading_client()
+        account_hash: str | None = None
         try:
             account_hash = self._account_hash(client)
             status_resp = client.get_order(int(order_ref), account_hash)
-            return self._map_order(status_resp.json(), broker_ref=order_ref)
+            return self._map_order(
+                status_resp.json(), broker_ref=order_ref, account_ref=account_hash
+            )
         except Exception:
             # The reconcile read is over an order KNOWN to have been placed (the key
             # mapped to an id), so — exactly like ``place_order``'s post-placement
@@ -467,6 +495,7 @@ class SchwabAdapter(BrokerPort):
                 filled_qty=Decimal("0"),
                 avg_price=None,
                 broker_ref=order_ref,
+                account_ref=account_hash,
             )
 
     async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
@@ -516,11 +545,14 @@ class SchwabAdapter(BrokerPort):
                 avg_price=None,
                 broker_ref=None,
             )
+        account_hash: str | None = None
         try:
             client = self._trading_client()
             account_hash = self._account_hash(client)
             status_resp = client.get_order(order_id, account_hash)
-            return self._map_order(status_resp.json(), broker_ref=broker_ref)
+            return self._map_order(
+                status_resp.json(), broker_ref=broker_ref, account_ref=account_hash
+            )
         except SchwabNotConfiguredError:
             # A DETERMINISTIC config/auth fault — raised ONLY at client build
             # (``_trading_client``/``_account_hash``), never by the actual
@@ -551,6 +583,7 @@ class SchwabAdapter(BrokerPort):
                 filled_qty=Decimal("0"),
                 avg_price=None,
                 broker_ref=broker_ref,
+                account_ref=account_hash,
             )
 
     def _trading_client(self):
@@ -587,33 +620,96 @@ class SchwabAdapter(BrokerPort):
         return None
 
     def _account_hash(self, client) -> str:
-        """Resolve (once) and cache the account hash Schwab keys placements on."""
+        """Resolve (once) and cache the account hash Schwab keys placements on.
+
+        SELECTION-AWARE (Story 7.5): Schwab returns a list of
+        ``{accountNumber, hashValue}``. The hash — not the raw account number — is
+        what the trading endpoints key on, but the hash is OPAQUE and can rotate,
+        so the stable ``accountNumber`` is the selector (``SCHWAB_ACCOUNT_ID``) and
+        the resolved ``hashValue`` is what gets used + recorded. An empty list or a
+        missing hash on the selected account is a clear account/config problem
+        (surfaced plainly, never a phantom fill), distinct from a transport
+        failure. A malformed non-list body raises a Key/Index/Type error, caught as
+        INDETERMINATE by the callers.
+
+        Selection:
+        - ``SCHWAB_ACCOUNT_ID`` set → pick the account whose ``accountNumber``
+          matches; refuse with :class:`SchwabAccountSelectionError` if none does.
+        - else exactly ONE account → use it (unambiguous).
+        - else (>1 account, no id) → refuse with
+          :class:`SchwabAccountSelectionError`. NEVER ``accounts[0]``.
+        """
         if self._account_hash_cache is None:
             resp = client.get_account_numbers()
             accounts = resp.json()
-            # Schwab returns a list of ``{accountNumber, hashValue}``; v1 uses the
-            # first account. The hash — not the raw account number — is what the
-            # trading endpoints key on. An empty list or a missing hash is a clear
-            # account/config problem (surfaced plainly, never a phantom fill),
-            # distinct from a transport failure. A malformed non-list body raises a
-            # Key/Index/Type error, caught as INDETERMINATE by the callers.
             if not accounts:
                 raise SchwabNotConfiguredError(
                     "Schwab returned no account for this login; cannot place an order."
                 )
-            first = accounts[0]
-            if not isinstance(first, dict):
-                # A non-dict first element (e.g. a bare string/number) would raise
-                # a raw ``AttributeError`` on ``.get`` — surface it plainly as an
-                # account/config problem instead (pre-placement; no order placed).
-                raise SchwabNotConfiguredError(
-                    "Schwab account body is malformed; cannot place an order."
+            # Build ``(accountNumber, hashValue)`` pairs DEFENSIVELY: skip any
+            # malformed / non-dict entry rather than raise a raw ``AttributeError``
+            # on ``.get`` (pre-placement; no order placed). Ambiguity is judged on
+            # the RAW ``accounts`` count, NOT the well-formed survivor count: a
+            # multi-account login with one malformed entry must still REFUSE (never
+            # silently trade the sole survivor), so the never-``accounts[0]``
+            # invariant holds even on a partially-malformed body.
+            raw_count = len(accounts)
+            pairs: list[tuple[str, str]] = []
+            for entry in accounts:
+                if not isinstance(entry, dict):
+                    continue
+                account_number = entry.get("accountNumber")
+                hash_value = entry.get("hashValue")
+                pairs.append((account_number, hash_value))
+
+            # ``.strip()`` so a whitespace-only value (a stray blank in an env
+            # file) is treated as UNSET — falls through to the count-based branch
+            # rather than raising a misleading "does not match any account".
+            account_id = get_settings().SCHWAB_ACCOUNT_ID.strip()
+            if account_id:
+                # Match on the STABLE account number (``str``-normalized so a
+                # numeric ``accountNumber`` from the live API still compares equal).
+                # A DUPLICATE match is ambiguous — refuse rather than pick the first
+                # (the same wrong-account risk this story removes).
+                matches = [h for (num, h) in pairs if str(num) == account_id]
+                if len(matches) == 0:
+                    raise SchwabAccountSelectionError(
+                        "SCHWAB_ACCOUNT_ID does not match any account on this "
+                        "Schwab login; cannot place an order. No order was placed."
+                    )
+                if len(matches) > 1:
+                    raise SchwabAccountSelectionError(
+                        "SCHWAB_ACCOUNT_ID matches more than one Schwab account; "
+                        "cannot safely choose one. No order was placed."
+                    )
+                hash_value = matches[0]
+                if not hash_value:
+                    raise SchwabNotConfiguredError(
+                        "The selected Schwab account is missing its trading hash; "
+                        "cannot place an order."
+                    )
+            elif raw_count == 1:
+                if not pairs:
+                    # The sole account entry was malformed (non-dict): a config
+                    # problem, surfaced plainly (never a phantom placement).
+                    raise SchwabNotConfiguredError(
+                        "Schwab account body is malformed; cannot place an order."
+                    )
+                hash_value = pairs[0][1]
+                if not hash_value:
+                    raise SchwabNotConfiguredError(
+                        "Schwab account is missing its trading hash; "
+                        "cannot place an order."
+                    )
+            else:
+                # More than one account and no explicit selection — NEVER
+                # ``accounts[0]``. Refuse calmly, pre-placement/pre-read.
+                raise SchwabAccountSelectionError(
+                    "This Schwab login exposes more than one account; set "
+                    "SCHWAB_ACCOUNT_ID to choose which one to trade. No order was "
+                    "placed."
                 )
-            hash_value = first.get("hashValue")
-            if not hash_value:
-                raise SchwabNotConfiguredError(
-                    "Schwab account is missing its trading hash; cannot place an order."
-                )
+
             self._account_hash_cache = hash_value
         return self._account_hash_cache
 
@@ -649,7 +745,13 @@ class SchwabAdapter(BrokerPort):
             )
         return ask
 
-    def _map_order(self, order_json: dict, *, broker_ref: str | None) -> OrderOutcome:
+    def _map_order(
+        self,
+        order_json: dict,
+        *,
+        broker_ref: str | None,
+        account_ref: str | None = None,
+    ) -> OrderOutcome:
         """Map a Schwab order-status JSON body → a normalized :class:`OrderOutcome`.
 
         ``FILLED`` → FILLED; ``REJECTED``/``CANCELED``/``EXPIRED`` → REJECTED; a
@@ -689,6 +791,7 @@ class SchwabAdapter(BrokerPort):
             filled_qty=filled_qty,
             avg_price=avg_price if filled_qty > 0 else None,
             broker_ref=broker_ref,
+            account_ref=account_ref,
         )
 
     @staticmethod

@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     SCHWAB_CLIENT_ID: str = ""
     SCHWAB_CLIENT_SECRET: str = ""
     SCHWAB_CALLBACK_URL: str = ""
+    # The stable Schwab account NUMBER selecting which account to trade/read when
+    # a login exposes more than one account. Empty (the default) requires the
+    # login to expose exactly one account; a login exposing more than one with no
+    # SCHWAB_ACCOUNT_ID set refuses (never silently picks the first) — set this to
+    # the account number of the account to trade. The account NUMBER is stable;
+    # the opaque trading hash it resolves to can rotate, so the number is the
+    # selector and the resolved hash is what gets recorded on the decision.
+    SCHWAB_ACCOUNT_ID: str = ""
 
     # --- Market data / Story 3.1 ---------------------------------------------
 

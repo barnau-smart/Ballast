@@ -5,6 +5,7 @@ description = "Ballast — AI investing coach. Backend API."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.136.*",
+    "anyio",
     "uvicorn[standard]",
     "psycopg[binary]",
     "pydantic-settings",

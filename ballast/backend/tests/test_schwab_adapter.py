@@ -712,6 +712,168 @@ async def test_place_order_nondict_account_element_is_config_error(monkeypatch):
     assert client.placed == []
 
 
+# --- Multi-account selection (Story 7.5) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multi_account_unset_id_refuses_no_accounts_zero(monkeypatch):
+    # A login exposing MORE THAN ONE account with no SCHWAB_ACCOUNT_ID set must
+    # REFUSE (SchwabAccountSelectionError) before any place — NEVER accounts[0].
+    from brokers.schwab_adapter import SchwabAccountSelectionError
+
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100}}})
+    client._account_numbers = [
+        {"accountNumber": "111", "hashValue": "HASH_TAXABLE"},
+        {"accountNumber": "222", "hashValue": "HASH_IRA"},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+
+    with pytest.raises(SchwabAccountSelectionError):
+        await _adapter().place_order(_intent(), idempotency_key="ms1")
+    # No order was placed, and no accounts[0] hash was ever used.
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_multi_account_selected_id_uses_matching_hash(monkeypatch):
+    # SCHWAB_ACCOUNT_ID set + matching an accountNumber → that account's hashValue
+    # is resolved and used; no other account is touched.
+    monkeypatch.setenv("SCHWAB_ACCOUNT_ID", "222")
+    client = _FakeClient(
+        quote={"VOO": {"quote": {"askPrice": 100}}},
+        order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": 100},
+    )
+    client._account_numbers = [
+        {"accountNumber": "111", "hashValue": "HASH_TAXABLE"},
+        {"accountNumber": "222", "hashValue": "HASH_IRA"},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+    _set_order_id(monkeypatch, 7001)
+
+    outcome = await _adapter().place_order(_intent(), idempotency_key="ms2")
+
+    assert outcome.status == OrderStatus.FILLED
+    # The SELECTED account's hash was used for placement + status read — never the
+    # first account's hash.
+    assert client.placed == [("HASH_IRA", "buy-order-spec-VOO-2")]
+    assert client.get_order_calls == [(7001, "HASH_IRA")]
+    assert outcome.account_ref == "HASH_IRA"
+
+
+@pytest.mark.asyncio
+async def test_selected_id_not_found_refuses(monkeypatch):
+    # SCHWAB_ACCOUNT_ID set but matching NONE of the returned accountNumbers →
+    # refuse (SchwabAccountSelectionError), no order.
+    from brokers.schwab_adapter import SchwabAccountSelectionError
+
+    monkeypatch.setenv("SCHWAB_ACCOUNT_ID", "999")
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100}}})
+    client._account_numbers = [
+        {"accountNumber": "111", "hashValue": "HASH_TAXABLE"},
+        {"accountNumber": "222", "hashValue": "HASH_IRA"},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+
+    with pytest.raises(SchwabAccountSelectionError):
+        await _adapter().place_order(_intent(), idempotency_key="ms3")
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_single_account_unchanged_and_account_ref_set(monkeypatch):
+    # Exactly ONE account with no SCHWAB_ACCOUNT_ID → unchanged (the sole account's
+    # hash is used) and account_ref rides back on the outcome.
+    client = _FakeClient(
+        quote={"VOO": {"quote": {"askPrice": 100}}},
+        order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": 100},
+    )  # default account_numbers = single {"accountNumber": "123", "hashValue": "HASH123"}
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+    _set_order_id(monkeypatch, 7002)
+
+    outcome = await _adapter().place_order(_intent(), idempotency_key="ms4")
+
+    assert outcome.status == OrderStatus.FILLED
+    assert client.placed == [("HASH123", "buy-order-spec-VOO-2")]
+    assert outcome.account_ref == "HASH123"
+
+
+@pytest.mark.asyncio
+async def test_account_ref_populated_on_reconcile_by_ref(monkeypatch):
+    # The durable reconcile read also carries the resolved account hash back on
+    # account_ref (single-account path).
+    client = _FakeClient(
+        order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": 100},
+    )
+    _install_client(monkeypatch, client)
+
+    outcome = await _adapter().get_order_status_by_ref("42")
+
+    assert outcome.status == OrderStatus.FILLED
+    assert outcome.account_ref == "HASH123"
+
+
+@pytest.mark.asyncio
+async def test_multi_account_one_malformed_entry_still_refuses(monkeypatch):
+    # A MULTI-account login where one entry is malformed (non-dict) must STILL
+    # refuse — ambiguity is judged on the raw account count, so the sole
+    # well-formed survivor is never silently traded (never accounts[0]).
+    from brokers.schwab_adapter import SchwabAccountSelectionError
+
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100}}})
+    client._account_numbers = [
+        "not-a-dict",
+        {"accountNumber": "222", "hashValue": "HASH_IRA"},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+
+    with pytest.raises(SchwabAccountSelectionError):
+        await _adapter().place_order(_intent(), idempotency_key="ms5")
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_selected_id_duplicate_match_refuses(monkeypatch):
+    # SCHWAB_ACCOUNT_ID matching MORE THAN ONE returned accountNumber is ambiguous
+    # — refuse rather than pick the first duplicate's hash (wrong-account risk).
+    from brokers.schwab_adapter import SchwabAccountSelectionError
+
+    monkeypatch.setenv("SCHWAB_ACCOUNT_ID", "111")
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100}}})
+    client._account_numbers = [
+        {"accountNumber": "111", "hashValue": "HASH_A"},
+        {"accountNumber": "111", "hashValue": "HASH_B"},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+
+    with pytest.raises(SchwabAccountSelectionError):
+        await _adapter().place_order(_intent(), idempotency_key="ms6")
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_selected_id_matched_but_null_hash_is_config_error(monkeypatch):
+    # SCHWAB_ACCOUNT_ID matches an account whose hashValue is missing → a distinct
+    # "missing trading hash" config error (NOT the misleading "does not match").
+    monkeypatch.setenv("SCHWAB_ACCOUNT_ID", "222")
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100}}})
+    client._account_numbers = [
+        {"accountNumber": "111", "hashValue": "HASH_TAXABLE"},
+        {"accountNumber": "222", "hashValue": None},
+    ]
+    _install_client(monkeypatch, client)
+    _record_builders(monkeypatch)
+
+    with pytest.raises(SchwabNotConfiguredError):
+        await _adapter().place_order(_intent(), idempotency_key="ms7")
+    assert client.placed == []
+
+
 @pytest.mark.asyncio
 async def test_get_order_status_read_timeout_preserves_broker_ref(monkeypatch):
     # Same F1 preservation on the reconcile path — a known order id survives a

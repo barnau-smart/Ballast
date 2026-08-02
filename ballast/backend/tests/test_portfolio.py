@@ -568,3 +568,121 @@ def test_link_survives_portfolio_fetch_failure(client):
     finally:
         app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
+
+
+# --- Blocking read offloaded off the event loop (Story 7.5) ------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_offloads_fetch_off_event_loop(two_owner_ids, monkeypatch):
+    """When no snapshot is passed, ``reconcile_portfolio`` obtains the snapshot via
+    ``anyio.to_thread.run_sync`` (NOT a direct in-loop call), and still writes both
+    tables correctly on the event loop.
+
+    Asserts two things: (1) ``anyio.to_thread.run_sync`` was invoked with
+    ``broker.fetch_portfolio`` — the blocking network read crosses to a worker
+    thread; and (2) ``fetch_portfolio`` actually ran off the main event-loop
+    thread.
+    """
+    import threading
+
+    import anyio.to_thread
+    import brokers.portfolio as portfolio_mod
+
+    a, _ = two_owner_ids
+    main_thread = threading.get_ident()
+    ran_on: dict[str, int] = {}
+
+    class _ThreadRecordingAdapter(FakeBrokerAdapter):
+        def fetch_portfolio(self) -> PortfolioSnapshot:
+            ran_on["fetch"] = threading.get_ident()
+            return super().fetch_portfolio()
+
+    broker = _ThreadRecordingAdapter()
+
+    real_run_sync = anyio.to_thread.run_sync
+    calls: list[object] = []
+
+    async def _spy_run_sync(func, *args, **kwargs):
+        calls.append(func)
+        return await real_run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(portfolio_mod.anyio.to_thread, "run_sync", _spy_run_sync)
+
+    async with async_session_maker() as session:
+        view = await reconcile_portfolio(Scope.for_user(a), session, broker)
+
+    # (1) The read was routed through anyio.to_thread.run_sync, with the pure
+    # network read (fetch_portfolio) as the offloaded callable.
+    assert broker.fetch_portfolio in calls
+    # (2) It actually executed off the main event-loop thread.
+    assert ran_on["fetch"] != main_thread
+    # Both tables were still written correctly on the event loop.
+    assert not view.is_empty
+    assert view.cash == FAKE_CASH
+    assert view.as_of == FAKE_AS_OF_BASE
+    async with async_session_maker() as session:
+        reread = await get_portfolio(Scope.for_user(a), session)
+    assert reread.cash == FAKE_CASH
+    assert {h.symbol for h in reread.holdings} == {
+        h.symbol for h in FAKE_HOLDINGS
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_with_injected_snapshot_does_not_offload(
+    two_owner_ids, monkeypatch
+):
+    """An injected snapshot (tests) is used directly — no offload call is made."""
+    import brokers.portfolio as portfolio_mod
+
+    a, _ = two_owner_ids
+    calls: list[object] = []
+
+    async def _spy_run_sync(func, *args, **kwargs):
+        calls.append(func)
+        raise AssertionError("run_sync must not be called when a snapshot is passed")
+
+    monkeypatch.setattr(portfolio_mod.anyio.to_thread, "run_sync", _spy_run_sync)
+
+    snap = _snapshot(offset=timedelta(0), cash=Decimal("100.00"), symbols=["X"])
+    async with async_session_maker() as session:
+        view = await reconcile_portfolio(
+            Scope.for_user(a), session, FakeBrokerAdapter(), snapshot=snap
+        )
+    assert calls == []
+    assert view.cash == Decimal("100.00")
+    assert [h.symbol for h in view.holdings] == ["X"]
+
+
+class _MultiAccountRefusesAdapter(_FetchFailsAdapter):
+    """A reading adapter that refuses a multi-account read (Story 7.5)."""
+
+    def fetch_portfolio(self) -> PortfolioSnapshot:
+        from brokers.schwab_adapter import SchwabAccountSelectionError
+
+        raise SchwabAccountSelectionError(
+            "This Schwab login exposes more than one account; set "
+            "SCHWAB_ACCOUNT_ID to choose which one to trade. No order was placed."
+        )
+
+
+def test_refresh_multi_account_selection_is_calm_422_not_500(client):
+    # A multi-account login with no SCHWAB_ACCOUNT_ID surfaces on the READ path as
+    # a calm 422 config fault (never a raw 500 — the spec's I/O matrix promise).
+    from brokers.factory import get_reading_broker
+
+    email = _unique_email()
+    app = client.app
+    app.dependency_overrides[get_reading_broker] = lambda: _MultiAccountRefusesAdapter()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = client.post("/api/portfolio/refresh", headers=headers)
+        assert r.status_code == 422, r.text
+        assert "SCHWAB_ACCOUNT_ID" in r.json()["error"]["message"]
+    finally:
+        app.dependency_overrides.pop(get_reading_broker, None)
+        _delete_user(email)

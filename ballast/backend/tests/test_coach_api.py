@@ -857,6 +857,124 @@ def test_approve_not_placeable_refusal_releases_claim(client):
         _delete_user(email)
 
 
+def test_approve_persists_account_ref_in_cosign_snapshot(client):
+    # (7.5) The placed OrderOutcome's resolved account hash (``account_ref``) is
+    # persisted into the decision record's ``cosign_snapshot["outcome"]`` — the
+    # durable audit of which account the order actually landed in (no schema
+    # change; JSON only).
+    email = _unique_email()
+    placement = OrderOutcome(
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("5"),
+        avg_price=Decimal("100.00"),
+        broker_ref="schwab-order-77",
+        account_ref="HASH_RESOLVED_ACCT",
+    )
+    adapter = _ScriptedAdapter(placement=placement)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        rows = _decision_rows(uid)
+        assert len(rows) == 1
+        snap = rows[0]["cosign_snapshot"]
+        assert snap["outcome"]["account_ref"] == "HASH_RESOLVED_ACCT"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+class _AccountSelectionAdapter(BrokerPort):
+    """A broker double whose place_order raises SchwabAccountSelectionError (7.5).
+
+    Models the adapter's ambiguous-multi-account refusal so the API's
+    claim-release + calm-422 handling can be asserted without the real SDK.
+    """
+
+    provider = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._delegate = FakeBrokerAdapter()
+
+    def authorization_url(self, state: str) -> str:
+        return self._delegate.authorization_url(state)
+
+    def exchange_code(self, code: str, state: str) -> BrokerTokens:
+        return self._delegate.exchange_code(code, state)
+
+    def fetch_portfolio(self) -> PortfolioSnapshot:
+        return self._delegate.fetch_portfolio()
+
+    async def place_order(
+        self, order_intent: OrderIntent, *, idempotency_key: str
+    ) -> OrderOutcome:
+        from brokers.schwab_adapter import SchwabAccountSelectionError
+
+        self.calls.append(idempotency_key)
+        raise SchwabAccountSelectionError(
+            "This Schwab login exposes more than one account; set "
+            "SCHWAB_ACCOUNT_ID to choose which one to trade. No order was placed."
+        )
+
+    async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
+        raise AssertionError("get_order_status must not be reached on a refusal")
+
+    async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
+        raise AssertionError(
+            "get_order_status_by_ref must not be reached on a refusal"
+        )
+
+
+def test_approve_account_selection_refusal_is_calm_422_releases_claim(client):
+    # (7.5) An ambiguous multi-account refusal (SchwabAccountSelectionError) from
+    # the adapter surfaces as a calm 422 and RELEASES the claim (retryable),
+    # symmetric with the OrderNotPlaceableError branch — no order placed.
+    email = _unique_email()
+    adapter = _AccountSelectionAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        # The calm reason is surfaced (never a raw 500).
+        assert "more than one account" in resp.text
+        assert len(adapter.calls) == 1  # the adapter refused at placement time
+        # Claim released → the record is retryable (proposed), not stranded.
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
 def test_approve_persists_broker_ref_column(client):
     # (6.3) The reconciled OrderOutcome's broker_ref is hoisted into the queryable
     # decision_record.broker_ref column (not only the cosign_snapshot JSON) so a

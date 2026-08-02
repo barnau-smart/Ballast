@@ -59,7 +59,10 @@ from api.config import get_settings
 from api.deps import RECONNECT_MESSAGE, get_scope, require_live_broker_session
 from brokers.factory import get_execution_broker
 from brokers.port import BrokerPort, OrderNotPlaceableError, OrderOutcome
-from brokers.schwab_adapter import SchwabNotConfiguredError
+from brokers.schwab_adapter import (
+    SchwabAccountSelectionError,
+    SchwabNotConfiguredError,
+)
 from brokers.portfolio import get_portfolio
 from brokers.session import BrokerageSession
 from coach.decision_record import (
@@ -544,6 +547,14 @@ async def approve(
         # the dollar amount buys less than one whole share, or the quote was
         # unusable — NO order was placed. Release the claim (retryable) and
         # surface the calm reason, symmetric with the scope refusal above.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SchwabAccountSelectionError as exc:
+        # An ambiguous / non-matching multi-account selection (Story 7.5): the
+        # adapter refuses BEFORE any broker call (no order placed). Symmetric with
+        # the ``OrderNotPlaceableError`` branch above — release the claim
+        # (cosigning→proposed) so the decision is retryable, then surface a calm
+        # 422 with the adapter's clear reason, never a raw 500.
         await release_claim(body.decision_id, scope=scope, session=session)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:

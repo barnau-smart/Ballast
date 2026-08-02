@@ -41,7 +41,7 @@ from brokers.factory import bind_freshly_exchanged_token, get_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import reconcile_portfolio
 from brokers.session import get_brokerage_session
-from db.models import BrokerageToken
+from db.models import BrokerageToken, PortfolioBalance, PortfolioCache
 from db.repository import ScopedRepository
 from db.scope import Scope
 from db.session import get_async_session
@@ -235,6 +235,21 @@ async def callback(
         refresh_token=enc_refresh,
         expires_at=tokens.expires_at,
     )
+    # Clear the two-table portfolio projection for this user IN THE SAME
+    # transaction as the token replacement (Story 7.5). A re-link may point at a
+    # DIFFERENT Schwab account; because balance reconcile is ``as_of``-gated and
+    # import-on-connect is best-effort-swallowed, a stale/failed import would
+    # otherwise leave the NEW account inheriting the PRIOR account's cash/holdings.
+    # Deleting both tables here — same scoped delete-then-add discipline as the
+    # token rows above — means the row is gone, so the following import takes the
+    # first-ever-reconcile INSERT branch (no ``as_of`` gate can skip it); if that
+    # import fails, an EMPTY projection is the honest state, never prior cash.
+    cache_repo = ScopedRepository(PortfolioCache, scope, session)
+    for row in await cache_repo.list():
+        await session.delete(row)
+    balance_repo = ScopedRepository(PortfolioBalance, scope, session)
+    for row in await balance_repo.list():
+        await session.delete(row)
     await session.commit()
 
     logger.info("brokerage_linked user_id=%s provider=%s", scope.user_id, provider)

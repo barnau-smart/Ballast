@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from api.deps import get_scope
 from brokers.factory import get_reading_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import PortfolioView, get_portfolio, reconcile_portfolio
+from brokers.schwab_adapter import SchwabAccountSelectionError
 from db.scope import Scope
 from db.session import get_async_session
 from money import WireMoney
@@ -114,5 +115,12 @@ async def refresh_portfolio(
     ``get_reading_broker`` so a Schwab refresh authenticates with THIS user's
     decrypted token (Story 6.5); the fake path passes through untouched.
     """
-    view = await reconcile_portfolio(scope, session, broker)
+    try:
+        view = await reconcile_portfolio(scope, session, broker)
+    except SchwabAccountSelectionError as exc:
+        # A multi-account login with no explicit selection (or a non-matching
+        # SCHWAB_ACCOUNT_ID) is a CONFIG fault the operator can fix — surface it
+        # calmly (never a raw 500), symmetric with the approve path's refusal
+        # (NFR8 calm/honest voice). No cache was written.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _to_out(view)

@@ -39,6 +39,7 @@ user's own cache + balance.
 from __future__ import annotations
 
 import logging
+import anyio.to_thread
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -143,7 +144,17 @@ async def reconcile_portfolio(
     All access is via the fail-closed scoped repo, so only THIS user's cache +
     balance is ever touched. Returns the resulting :class:`PortfolioView`.
     """
-    snap = snapshot if snapshot is not None else broker.fetch_portfolio()
+    # Offload ONLY the blocking network read off the event loop (Story 7.5): a
+    # slow live Schwab ``fetch_portfolio`` must not stall the loop for every
+    # concurrent request. The pure network→``PortfolioSnapshot`` call crosses to a
+    # worker thread via ``anyio.to_thread.run_sync``; the ``AsyncSession`` is never
+    # touched off-thread — all repo/session work below stays on the event loop
+    # (SQLAlchemy async sessions are not thread-safe). An injected ``snapshot``
+    # (tests) is used directly with no offload.
+    if snapshot is not None:
+        snap = snapshot
+    else:
+        snap = await anyio.to_thread.run_sync(broker.fetch_portfolio)
     incoming_as_of = snap.as_of
     if incoming_as_of.tzinfo is None:
         incoming_as_of = incoming_as_of.replace(tzinfo=timezone.utc)

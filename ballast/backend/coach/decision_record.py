@@ -432,6 +432,7 @@ def _recovery_cosign_snapshot(record: DecisionRecord) -> dict:
             "filled_qty": _money(Decimal("0")),
             "avg_price": None,
             "broker_ref": record.broker_ref,
+            "account_ref": None,
         },
     }
 
@@ -571,6 +572,7 @@ def cosign(
             "filled_qty": _money(outcome.filled_qty),
             "avg_price": None if outcome.avg_price is None else _money(outcome.avg_price),
             "broker_ref": outcome.broker_ref,
+            "account_ref": outcome.account_ref,
         },
     }
 
@@ -656,6 +658,11 @@ def record_reconciliation(
                 None if outcome.avg_price is None else _money(outcome.avg_price)
             ),
             "broker_ref": outcome.broker_ref,
+            # Shape parity with ``cosign_snapshot.outcome`` (Story 7.5): the
+            # reconcile read now resolves the account hash onto ``account_ref``,
+            # so persist it here too — the durable audit of which account the
+            # reconciled order landed against, not just the cosign snapshot.
+            "account_ref": outcome.account_ref,
         },
     }
     record.reconciled_at = now or datetime.datetime.now(datetime.timezone.utc)

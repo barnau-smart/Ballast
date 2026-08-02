@@ -29,7 +29,7 @@ from brokers.fake_adapter import (
 from brokers.factory import get_broker
 from brokers.port import BrokerPort, BrokerTokens
 from db.connection import get_connection
-from db.models import BrokerageToken
+from db.models import BrokerageToken, PortfolioBalance, PortfolioCache
 from db.repository import ScopedRepository
 from db.scope import Scope
 from db.session import async_session_maker, engine
@@ -409,6 +409,164 @@ def test_endpoints_require_auth(client):
         ).status_code
         == 401
     )
+
+
+# --- Story 7.5: re-link clears the two-table projection ----------------------
+
+
+def _user_id_for(email: str) -> uuid.UUID:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM "user" WHERE email = %s', (email,))
+            (uid_raw,) = cur.fetchone()
+    return uuid.UUID(str(uid_raw))
+
+
+def _seed_stale_projection(owner: uuid.UUID) -> None:
+    """Seed a PRIOR account's holdings + balance rows (values distinct from the
+    fake adapter's) so a re-link can be proven to CLEAR then repopulate them."""
+    import datetime as _dt
+
+    stale_as_of = _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO portfolio_cache "
+                "(id, owner_id, symbol, quantity, market_value, cost_basis, cash, as_of) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    str(uuid.uuid4()),
+                    str(owner),
+                    "STALE",
+                    "9",
+                    "9999.00",
+                    "9000.00",
+                    "0",
+                    stale_as_of,
+                ),
+            )
+            cur.execute(
+                "INSERT INTO portfolio_balance (id, owner_id, cash, as_of) "
+                "VALUES (%s, %s, %s, %s)",
+                (str(uuid.uuid4()), str(owner), "4242.42", stale_as_of),
+            )
+        conn.commit()
+
+
+def _read_projection(owner: uuid.UUID):
+    """Return (cache_symbols, balance_cash) for a user, read directly via psycopg."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol FROM portfolio_cache WHERE owner_id = %s",
+                (str(owner),),
+            )
+            symbols = sorted(r[0] for r in cur.fetchall())
+            cur.execute(
+                "SELECT cash FROM portfolio_balance WHERE owner_id = %s",
+                (str(owner),),
+            )
+            balances = [r[0] for r in cur.fetchall()]
+    return symbols, balances
+
+
+def test_relink_clears_stale_projection_and_repopulates(client):
+    """A re-link deletes the PRIOR account's portfolio_cache + portfolio_balance in
+    the token-replacement commit, and the fresh import repopulates from the new
+    account — the stale rows never survive."""
+    from brokers.fake_adapter import FAKE_CASH, FAKE_HOLDINGS
+
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        owner = _user_id_for(email)
+
+        # Simulate a prior link's projection.
+        _seed_stale_projection(owner)
+        symbols, balances = _read_projection(owner)
+        assert symbols == ["STALE"]
+        assert balances and balances[0] == __import__("decimal").Decimal("4242.42")
+
+        # Re-link (different account, in this test the fake).
+        state = client.get("/api/brokerage/authorize", headers=headers).json()["state"]
+        cb = client.post(
+            "/api/brokerage/callback",
+            json={"code": "c", "state": state},
+            headers=headers,
+        )
+        assert cb.status_code == 200, cb.text
+
+        # The stale "STALE"/4242.42 rows are gone; the fresh import populated the
+        # fake account's holdings + cash instead.
+        symbols, balances = _read_projection(owner)
+        assert symbols == sorted(h.symbol for h in FAKE_HOLDINGS)
+        assert "STALE" not in symbols
+        assert balances and balances[0] == FAKE_CASH
+    finally:
+        _delete_user(email)
+
+
+class _FetchFailsAdapter(BrokerPort):
+    """Links fine, but the portfolio fetch raises — the re-link projection clear
+    must still leave an EMPTY (honest) projection, never the prior account's data."""
+
+    provider = "fake"
+
+    def authorization_url(self, state: str) -> str:
+        return FakeBrokerAdapter().authorization_url(state)
+
+    def exchange_code(self, code: str, state: str) -> BrokerTokens:
+        return FakeBrokerAdapter().exchange_code(code, state)
+
+    def fetch_portfolio(self):
+        raise RuntimeError("simulated broker fetch failure")
+
+    async def place_order(self, order_intent, *, idempotency_key):
+        return await FakeBrokerAdapter().place_order(
+            order_intent, idempotency_key=idempotency_key
+        )
+
+    async def get_order_status(self, idempotency_key):
+        return await FakeBrokerAdapter().get_order_status(idempotency_key)
+
+    async def get_order_status_by_ref(self, broker_ref):
+        return await FakeBrokerAdapter().get_order_status_by_ref(broker_ref)
+
+
+def test_relink_import_failure_leaves_empty_projection(client):
+    """When the post-clear import fails on re-link, the projection is EMPTY (the
+    honest state) — never the prior account's stale cash/holdings."""
+    email = _unique_email()
+    app = client.app
+    app.dependency_overrides[get_broker] = lambda: _FetchFailsAdapter()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        owner = _user_id_for(email)
+
+        _seed_stale_projection(owner)
+
+        state = client.get("/api/brokerage/authorize", headers=headers).json()["state"]
+        cb = client.post(
+            "/api/brokerage/callback",
+            json={"code": "c", "state": state},
+            headers=headers,
+        )
+        # Link survives the import failure (no 500).
+        assert cb.status_code == 200, cb.text
+        assert cb.json()["linked"] is True
+
+        # The projection is EMPTY — the stale rows were cleared in the token
+        # commit and the failed import repopulated nothing.
+        symbols, balances = _read_projection(owner)
+        assert symbols == []
+        assert balances == []
+    finally:
+        app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
 
 
 # --- Story 6.3: get_execution_broker token-binding seam ----------------------
