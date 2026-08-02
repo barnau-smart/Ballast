@@ -29,8 +29,9 @@ from api.logging_config import configure_logging
 from api.schemas import UserCreate, UserRead
 from api.users import auth_backend, fastapi_users
 from db.connection import check_db
+from db.migrations import run_startup_migrations
 from db.models import User
-from db.session import create_db_and_tables
+from db.session import create_db_and_tables, engine
 
 logger = logging.getLogger("ballast.api")
 
@@ -71,6 +72,12 @@ def create_app() -> FastAPI:
         # Creates the `user` table if it does not yet exist. Alembic can
         # replace this later.
         await create_db_and_tables()
+        # Idempotent startup migration (Story 7.1): create_all never ALTERs an
+        # already-existing table, so patch every Epic 6 addition (columns +
+        # indexes + NULL-key backfill) onto a carried-over DB. Runs strictly
+        # AFTER create_all so any brand-new table already exists; a fresh or
+        # already-migrated DB makes this a clean no-op.
+        await run_startup_migrations(engine)
         yield
 
     app = FastAPI(title="Ballast API", version="0.1.0", lifespan=lifespan)

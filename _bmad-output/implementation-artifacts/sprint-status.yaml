@@ -106,8 +106,8 @@ development_status:
 
   # Epic 7: Go Live — Migrate, Harden the Live Seams & Exercise Real Money Once
   # 7.1–7.5 are code-only/offline-testable (loop-runnable); 7.6 is credential+real-money gated (human pause point).
-  epic-7: backlog
-  7-1-production-db-migration-path: backlog
+  epic-7: in-progress
+  7-1-production-db-migration-path: done
   7-2-generalized-atomic-claim-recoverable-placement: backlog
   7-3-calm-envelopes-provider-match-live-broker: backlog
   7-4-llm-live-path-latency-robustness: backlog

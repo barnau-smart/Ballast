@@ -1,0 +1,42 @@
+# Epic 7 Context: Go Live — Migrate, Harden the Live Seams & Exercise Real Money Once
+
+<!-- Generated from planning artifacts. Regenerate with compile-epic-context if planning docs change. -->
+
+## Goal
+
+Epic 6 made the Coach *ready* to go live but nothing actually ran against real services — "done against fakes" is not production-ready. This epic takes that ready code and makes one safe, real, end-to-end pass against the live Anthropic API and live Schwab. It provisions a real DB migration path (so the correctness-critical indexes and columns actually exist on an already-deployed database), generalizes the atomic-claim pattern into one reusable primitive (the atomicity class kept re-emerging at every new Epic 6 seam), and wraps every live seam in a calm failure envelope — so a real investor can be served without a double-place, a stranded order, a wrong-account fill, a multi-minute stall, or a raw 500. Scope is deliberately the money path only (real LLM + real Schwab place/balances/reconcile); email/SMTP and real market-data go-live are held as separate follow-on epics. No new functional requirements — this epic makes the existing contract true against real money.
+
+## Stories
+
+- Story 7.1: Production database migration path
+- Story 7.2: Generalized atomic-claim primitive & recoverable placement
+- Story 7.3: Calm envelopes & provider-match on the live broker seams
+- Story 7.4: LLM live-path latency & robustness hardening
+- Story 7.5: Live-read robustness & multi-account safety
+- Story 7.6: Gated live exercise — real creds, real money, once
+
+## Requirements & Constraints
+
+- This epic adds no new functional requirements. It hardens the go-live-blocking subset of the deferred-work ledger so the existing FR2–FR11, FR22, FR23 contract holds against real money, upholding NFR1 (secrets/tokens encrypted, per-user isolation), NFR2 (structural trust teeth still un-bypassable), NFR3 (execution reliability — true reconciled state, no phantom/duplicate orders), and NFR8 (calm/honest/never-red voice, even on live failures).
+- All trust invariants from prior epics remain unchanged and must still hold: structural validation teeth, sole-writer ownership, fail-closed per-user isolation, never-a-dead-end (degrade to the default plan), and calm/honest/never-red framing (losses in sky-blue, market up/down as green▲/sky-blue▼ with signs).
+- Order scope stays v1: whole-share market orders on broad index funds/ETFs; rebalance-only selling; no options/shorting/complex/fractional/notional orders.
+- Never double-place and never phantom-fill on real money are absolute. On any ambiguous placement the system stays `pending` and asks for explicit human re-confirmation rather than guessing or re-placing (Schwab honors no client idempotency key).
+- Success criterion for the epic: after Story 7.6, "the Coach works against a live LLM and a live broker" is a proven fact — the guessed live JSON field mappings (order/token/balance) are confirmed against real payloads and any drift fixed.
+- Execution model: Stories 7.1–7.5 are code-only, fake-first, and fully offline-testable (mocked schwab-py client, injected LLM adapter) — the autonomous loop runs them unattended. Story 7.6 is credential- and real-money-gated (real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a funded account) and is a deliberate human pause point, not a loop task.
+
+## Technical Decisions
+
+- **7.1 is a hard blocker and must land first.** `create_all` never ALTERs an existing table, so on a provisioned prod DB the correctness-critical schema simply would not exist. The migration path (Alembic, or an idempotent startup `ADD COLUMN / CREATE INDEX IF NOT EXISTS`) must provision every Epic 6 addition on an already-existing DB: `decision_record.idempotency_key` + its unique index `uq_decision_record_idempotency_key`, `decision_record.broker_ref`, the `portfolio_balance` table + `uq_portfolio_balance_owner`, the `(owner_id, co_signed_at)` composite index, and `decision_record.reconciliation_snapshot`/`reconciled_at`. Any carried-over `proposed` row with NULL `idempotency_key` is backfilled or asserted, and the migration must be idempotent (re-running is a no-op).
+- **Generalized atomic-claim primitive (7.2).** The 6.1 claim proved the conditional-`UPDATE … WHERE`/row-lock pattern at the approve seam only; generalize it into one reusable primitive and apply it at the reconcile endpoint, the two-table balance reconcile, and the placement path. Reconcile-wins must be a conditional update (not a read-modify-write) so concurrent reconciles cannot regress persisted money truth. The `portfolio_balance` + `portfolio_cache` reconcile is one atomic unit (no interleave, no dropped/duplicate holdings). Persist `broker_ref` in the same atomic step as the placement claim, so a post-placement cosign/commit failure leaves a recoverable `broker_ref`-keyed record instead of a `cosigning` zombie with a live order and no ref. A NULL-`idempotency_key` decision is refused before placement (never a post-fill crash). A `cosigning` row orphaned by a mid-claim crash has a bounded reclamation path.
+- **Broker Port contract (AD-13) is unchanged.** Normalized `OrderOutcome {status: filled|partial|rejected|timeout|pending, filled_qty, avg_price, broker_ref}` plus `get_order_status`. Transport/SDK errors map to an indeterminate `TIMEOUT` with no raw exception leaking the port and no phantom fill. Single execution path (AD-7): `propose → approve → Coach Engine → Broker Port → reconcile → persist`.
+- **Calm live-seam envelopes (7.3).** A token that cannot be decrypted (rotated `TOKEN_ENCRYPTION_KEY` / corrupt ciphertext) during dependency resolution on `/approve` or `/refresh`, or a deterministic config/auth fault on reconcile (`SchwabNotConfiguredError`), or a `session.provider != BROKER_ADAPTER` mismatch, must yield a calm 409 reconnect envelope — never a raw 500. Config/auth faults are surfaced distinctly from a transport `TIMEOUT` (no retry dead-end that re-launders the same fault). An order is refused before placement unless `session.provider == broker.provider`.
+- **LLM live-path robustness (7.4).** The Anthropic client is constructed once (connection reuse, not per-call), with an explicit request timeout and retry budget tuned to the interactive `/recommend` latency envelope — a hung call degrades to the default plan in seconds, not the SDK's ~10-minute default. The `STREAMING_MAX_TOKENS` ↔ SDK non-streaming-ceiling coupling is pinned by a test so a future threshold/route change cannot let a raw `ValueError` escape the port. LLM Gateway remains the sole Anthropic caller with deterministic model routing (Opus 4.8 for flagged hard-reasoning, Sonnet 4.6 otherwise).
+- **Live-read robustness & multi-account safety (7.5).** A real `fetch_portfolio` inside an async handler offloads the blocking network read off the event loop (`anyio.to_thread` or an async client) so it can't stall concurrent requests. A login exposing more than one account refuses to place without an explicit account selection, and the chosen account hash is persisted on the decision record — never a silent `accounts[0]` (a taxable buy must never land in an IRA). A re-link clears the user's portfolio projection across both tables in the same transaction that replaces the token rows, so a new account never inherits the prior account's cash under a staleness skip (AD-14, single-writer projection, broker-authoritative, reconcile-wins).
+- **Dollar→share sizing (carried from 6.3, unchanged).** `OrderIntent.amount` is a dollar notional; at placement fetch a Schwab quote, compute `quantity = floor(amount / ask)`, and place a whole-share market order — refuse calmly if `amount` buys less than one whole share.
+
+## Cross-Story Dependencies
+
+- **Story 7.1 gates the entire epic** — every later story's correctness rides on the migrated schema being real on a provisioned DB.
+- **Story 7.2** applies its generalized primitive to the placement path (from 6.3), the balance reconcile (6.5), and the reconcile endpoint (6.7); those Epic 6 seams are its inputs.
+- **Story 7.6** requires all of 7.1–7.5 to have landed and is the only story needing real credentials and a funded account.
+- This epic builds directly on Epic 6 (which closed the Epic 4 blockers and hardened the real Anthropic and Schwab adapters behind fakes). Email/SMTP (Story 5.1) and real market-data/Tiingo (Stories 3.1/3.2) go-live are explicitly out of scope and held as separate follow-on epics.
