@@ -554,3 +554,91 @@ So that an ambiguous placement is never left hanging or duplicated.
 **Given** a decision whose placement was surfaced `pending` with no confirmed `order_id`,
 **When** the user (or an explicit status action) asks to resolve it,
 **Then** the Coach Engine reconciles authoritative state by the persisted queryable `broker_ref`/`order_id` (never by fuzzy attribute-matching recent orders), surfaces the true `OrderOutcome` honestly, and — because Schwab honors no client idempotency key — **never** re-places on ambiguity: if the order cannot be positively confirmed it stays `pending` and prompts an explicit human re-confirmation (FR22, NFR3, AD-13; upholds never-double-place / never-phantom-fill on real money).
+
+## Epic 7: Go Live — Migrate, Harden the Live Seams & Exercise Real Money Once
+
+Take the code Epic 6 made *ready* to go live and actually make one safe, real, end-to-end pass against the live Anthropic API and live Schwab — with a real DB migration path, a generalized atomic-claim primitive, and calm failure envelopes on every live seam — so a real investor can be served without a double-place, a stranded order, a wrong-account fill, a multi-minute stall, or a raw 500.
+
+> **Origin (Epic 6 retrospective, 2026-08-01, `epic-6-retro-2026-08-01.md`):** Epic 6 closed the Epic 4 blockers and hardened the real adapters, but nothing went live — "done against fakes" ≠ production-ready (2nd epic running). This epic burns down the go-live-blocking subset of the 40-item deferred-work ledger. **Scope is deliberately the money path (real LLM + real Schwab place/balances/reconcile).** Email/SMTP go-live (5.1 items) and real market-data/Tiingo (3.1/3.2 items) are held as separate follow-on epics.
+>
+> **Execution note:** Stories 7.1–7.5 are code-only, fake-first, offline-testable — the autonomous loop runs them unattended. Story 7.6 is credential- and real-money-gated (real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a funded account) — it is a deliberate human pause point, not a loop task.
+
+**FRs covered:** go-live hardening of FR2–FR11, FR22, FR23 · NFR1, NFR2, NFR3, NFR8 · AD-6, AD-7, AD-8, AD-13, AD-14 (no new FRs — this epic makes the existing contract true against real money)
+
+### Story 7.1: Production database migration path
+
+As an operator,
+I want every Epic 6 schema change provisioned on an already-deployed database,
+So that a real deployment has the indexes and columns the correctness guarantees depend on.
+
+> **Blocker — must land first.** `create_all` never ALTERs an existing table, so on a provisioned prod DB the unique-index double-place backstop and the queryable columns simply would not exist. Every later story's correctness rides on the schema being real.
+
+**Acceptance Criteria:**
+
+**Given** a database that already exists from an earlier release,
+**When** the app is deployed/started,
+**Then** a real migration path (Alembic, or an idempotent startup `ADD COLUMN / CREATE INDEX IF NOT EXISTS`) provisions **every** Epic 6 schema addition on the existing DB — `decision_record.idempotency_key` + `uq_decision_record_idempotency_key`, `decision_record.broker_ref`, `portfolio_balance` + `uq_portfolio_balance_owner`, the `(owner_id, co_signed_at)` composite index, and `decision_record.reconciliation_snapshot`/`reconciled_at` — with NULL `idempotency_key` on any carried-over `proposed` row backfilled or asserted, and the migration proven idempotent (re-running is a no-op) — closing the go-live schema items logged from 6.1, 6.3, 6.6, 6.7.
+
+### Story 7.2: Generalized atomic-claim primitive & recoverable placement
+
+As a user moving real money,
+I want every concurrent write on my decisions and portfolio to be atomic,
+So that a race or a mid-flight failure can never double-place, regress a settled outcome, strand a live order, or duplicate my holdings.
+
+> The 6.1 claim proved the pattern at the approve seam; it was never generalized, so the same atomicity class re-emerged at every new Epic 6 seam (retro Finding #1). This story makes it one reusable primitive and closes the money-side stranding.
+
+**Acceptance Criteria:**
+
+**Given** a reusable atomic-claim / row-lock (or conditional-`UPDATE … WHERE`) primitive,
+**When** it is applied at the reconcile endpoint (6.7), the two-table balance reconcile (6.5), and the placement path (6.3),
+**Then** two concurrent reconciles of the same decision cannot regress the persisted money truth (reconcile-wins is a conditional update, not a read-modify-write); the `portfolio_balance` + `portfolio_cache` reconcile is one atomic unit (no interleave, no duplicate/dropped holdings); **`broker_ref` is persisted in the same atomic step as the placement claim** so a post-placement cosign/commit failure leaves a recoverable, `broker_ref`-keyed record rather than a `cosigning` zombie with a live order and no ref; a decision whose persisted `idempotency_key` is NULL is **refused before** placement (never a post-fill crash); and a `cosigning` row orphaned by a crash mid-claim has a bounded reclamation path — with concurrency tests proving each window (AD-6, AD-7, AD-13).
+
+### Story 7.3: Calm envelopes & provider-match on the live broker seams
+
+As a user whose broker session has an issue,
+I want a calm "reconnect your account" prompt instead of a scary server error,
+So that the honest/never-red voice holds even when the live connection fails.
+
+**Acceptance Criteria:**
+
+**Given** the credential-gated real Schwab path,
+**When** a token cannot be decrypted (rotated `TOKEN_ENCRYPTION_KEY` / corrupt ciphertext) during dependency resolution on either `/approve` (`get_execution_broker`, 6.3) or `/refresh` (`_bind_user_token`/`get_reading_broker`, 6.5), **or** a reconcile hits a deterministic config/auth fault (`SchwabNotConfiguredError`, 6.7), **or** the live session's `provider` does not match the configured `BROKER_ADAPTER` (4.6/4.8),
+**Then** the user gets a calm 409 reconnect envelope (never a raw 500), config/auth faults are surfaced distinctly from a transport `TIMEOUT` (no retry dead-end that re-launders the same fault), and an order is refused before placement unless `session.provider == broker.provider` — preserving the calm/honest/never-red voice on every live failure mode (NFR8, AD-7).
+
+### Story 7.4: LLM live-path latency & robustness hardening
+
+As a user asking for a recommendation,
+I want the live LLM call to answer promptly or degrade quickly,
+So that a hung model call never leaves me staring at a multi-minute stall.
+
+**Acceptance Criteria:**
+
+**Given** `LLM_ADAPTER=anthropic`,
+**When** `/recommend` calls the live gateway,
+**Then** the Anthropic client is constructed once (connection reuse, not per-call) with an explicit request timeout and retry budget tuned to the interactive `/recommend` latency envelope — so a hung call degrades to the default plan in seconds, not the SDK's ~10-minute default (6.2) — and the `STREAMING_MAX_TOKENS` ↔ SDK non-streaming-ceiling coupling is pinned by a test so a future threshold/route change cannot let a raw `ValueError` escape the port (6.2); the no-raw-leak and never-a-dead-end invariants hold under real transport failures (AD-6).
+
+### Story 7.5: Live-read robustness & multi-account safety
+
+As a user with more than one Schwab account,
+I want the app to never silently trade the wrong account and never stall on a real balance read,
+So that a real order lands where I intend and the app stays responsive.
+
+**Acceptance Criteria:**
+
+**Given** the credential-gated real Schwab read/placement path,
+**When** a real `fetch_portfolio` runs inside an async handler **and** the linked login exposes more than one account,
+**Then** the blocking network read is offloaded off the event loop (`anyio.to_thread` or an async client) so it cannot stall concurrent requests (6.5); a login exposing multiple accounts **refuses to place without an explicit account selection**, and the chosen account hash is persisted on the decision record (no silent `accounts[0]` — a taxable buy must never land in an IRA, 6.3); and a re-link clears the user's portfolio projection (both tables) in the same transaction that replaces the token rows, so a new account never inherits the prior account's cash under a staleness skip (6.5) — a genuine user-harm surface closed before real money (AD-8, AD-14).
+
+### Story 7.6: Gated live exercise — real creds, real money, once
+
+As the product owner,
+I want to prove the entire live path end-to-end exactly once, behind the existing gates,
+So that the guessed live payload shapes are confirmed against reality before any user relies on them.
+
+> **Human pause point — not a loop task.** Requires real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a funded Schwab account. This is a credentials-and-real-money decision performed manually.
+
+**Acceptance Criteria:**
+
+**Given** real credentials, a linked funded Schwab account, and all of 7.1–7.5 landed,
+**When** the live path is exercised once behind the existing gates,
+**Then** a real paid Anthropic structured-output `/recommend` returns a blessed recommendation (or degrades honestly), one small real in-scope Schwab order is placed → reconciled → co-signed with a truthful `OrderOutcome`, and one real `/refresh` imports true cash + positions (confirming the cash-only mapping and missed-growth honesty); the guessed Schwab order/token/balance JSON field mappings are re-confirmed against the live payloads and any drift is fixed; and the partial-fill terminality question (6.7) is decided and encoded — after which "the Coach works against a live LLM and a live broker" is a proven fact, not a deferred cliff.

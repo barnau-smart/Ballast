@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-01
+last_updated: 2026-08-01  # Epic 6 retro complete; epic-6 done; Epic 7 (go-live) planned & registered
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -94,7 +94,7 @@ development_status:
   epic-5-retrospective: optional
 
   # Epic 6: Go Live — Real Broker & LLM Integration
-  epic-6: in-progress
+  epic-6: done
   6-1-atomic-decision-claim-idempotency-hardening: done
   6-2-live-llm-gateway-enablement-hardening: done
   6-3-live-schwab-placement-reconciliation-mapping: done
@@ -102,26 +102,57 @@ development_status:
   6-5-real-schwab-balances-cash-only-mapping: done
   6-6-decisions-history-scale-hardening: done
   6-7-durable-cross-request-timeout-reconciliation: done
-  epic-6-retrospective: optional
+  epic-6-retrospective: done
+
+  # Epic 7: Go Live — Migrate, Harden the Live Seams & Exercise Real Money Once
+  # 7.1–7.5 are code-only/offline-testable (loop-runnable); 7.6 is credential+real-money gated (human pause point).
+  epic-7: backlog
+  7-1-production-db-migration-path: backlog
+  7-2-generalized-atomic-claim-recoverable-placement: backlog
+  7-3-calm-envelopes-provider-match-live-broker: backlog
+  7-4-llm-live-path-latency-robustness: backlog
+  7-5-live-read-robustness-multi-account-safety: backlog
+  7-6-gated-live-exercise-real-money: backlog
+  epic-7-retrospective: optional
 
 action_items:
   - epic: 4
     action: "Atomicity hardening pass: atomic proposed->cosigning->cosigned decision claim + stable persisted per-decision idempotency key + DB unique index on idempotency_key; fold the 5.1 digest double-send guard into the same pass (one root cause). Blocks real-broker wiring."
     owner: "MasterB"
-    status: open
+    status: done  # closed by Story 6.1 (Epic 6 retro 2026-08-01)
   - epic: 4
     action: "Shared money-formatter (format(Decimal, f)) applied across all wire serialization; close the E+ exponent-notation deferred item."
     owner: "MasterB"
-    status: open
+    status: done  # closed by Story 6.4 (Epic 6 retro 2026-08-01)
   - epic: 4
     action: "Plan a real-integration epic/spike: install anthropic, wire the real AnthropicGateway + Schwab place_order/get_order_status, exercise the live path end-to-end behind the existing gates."
     owner: "MasterB"
-    status: open
+    status: in-progress  # code wired+hardened behind gates (6.2/6.3/6.5/6.7); live end-to-end exercise still not run (Epic 6 retro 2026-08-01) -> superseded by Epic 6 action #3
   - epic: 4
     action: "Close AD-14 cash-only balances mapping - unblocks missed-growth-meter honesty and the FR11 oversized-lump warning for highest-idle-cash users."
     owner: "MasterB"
-    status: open
+    status: done  # closed by Story 6.5 (Epic 6 retro 2026-08-01)
   - epic: 4
     action: "Add pagination + (owner_id, co_signed_at) index + proposed-record retention before Decisions history sees volume."
+    owner: "MasterB"
+    status: done  # closed by Story 6.6 (Epic 6 retro 2026-08-01)
+  - epic: 6
+    action: "Production DB migration path (adopt Alembic or equivalent) + migrations for every Epic 6 schema addition (uq_decision_record_idempotency_key, broker_ref, portfolio_balance + uq_portfolio_balance_owner, (owner_id, co_signed_at), reconciliation_snapshot/reconciled_at). create_all never ALTERs a provisioned prod DB; the unique-index double-place backstop must provably exist on prod. HARD GO-LIVE BLOCKER."
+    owner: "MasterB"
+    status: open
+  - epic: 6
+    action: "Generalize the atomic-claim primitive (one reusable row-lock/conditional-UPDATE helper) and apply at the reconcile endpoint (6.7), the two-table balance reconcile (6.5), and close the 6.3 post-placement stranding (persist broker_ref BEFORE cosign so a cosign/commit failure stays recoverable). Money-adjacent."
+    owner: "MasterB"
+    status: open
+  - epic: 6
+    action: "Live go-live spike behind existing gates with real creds: one real paid Anthropic structured-output call + one small real Schwab order (place->reconcile) + one real balance import; re-confirm guessed Schwab order/token/balance JSON shapes against live payloads. Credentials/real-money decision."
+    owner: "MasterB"
+    status: open
+  - epic: 6
+    action: "Partial-fill terminality product decision (6.7): keep 'partial' terminal, or allow re-reconciliation of a partial fill that later completes to 'filled'."
+    owner: "MasterB"
+    status: open
+  - epic: 6
+    action: "Sweep the 40-item deferred-work ledger (21 new in Epic 6) — partition into pre-go-live-spike blockers vs. exercised-and-closed-by-the-spike."
     owner: "MasterB"
     status: open
