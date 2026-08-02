@@ -44,9 +44,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from brokers.port import BrokerPort, PortfolioSnapshot
+from db.atomic import conditional_claim
 from db.models import PortfolioBalance, PortfolioCache
 from db.repository import ScopedRepository
 from db.scope import Scope
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("ballast.portfolio")
@@ -146,38 +149,83 @@ async def reconcile_portfolio(
         incoming_as_of = incoming_as_of.replace(tzinfo=timezone.utc)
 
     cache_repo = ScopedRepository(PortfolioCache, scope, session)
-    existing = await cache_repo.list()
     balance = await _read_balance(scope, session)
-    cached_as_of = _normalize_as_of(balance.as_of) if balance is not None else None
 
-    # Reconcile-wins: only a strictly-newer snapshot supersedes the cache. An
-    # equal or older as_of is a stale/duplicate reconcile — leave truth intact.
-    # Keyed on the balance row's as_of, so a cash-only account (zero holdings)
-    # gets the same staleness protection.
-    if cached_as_of is not None and incoming_as_of <= cached_as_of:
-        logger.info(
-            "portfolio_reconcile_skipped_stale owner_id=%s incoming_as_of=%s "
-            "cached_as_of=%s",
-            scope.user_id,
-            incoming_as_of.isoformat(),
-            cached_as_of.isoformat(),
-        )
-        return _to_view(existing, balance)
-
-    # Upsert the dedicated balance row (one per user) — update in place if it
-    # exists, else add — so cash + as_of survive even with zero holdings.
-    balance_repo = ScopedRepository(PortfolioBalance, scope, session)
     if balance is not None:
-        balance.cash = snap.cash
-        balance.as_of = incoming_as_of
+        # Reconcile-wins as a CONDITIONAL, as_of-gated CLAIM (Story 7.2), not a
+        # bare read-modify-write. The conditional ``UPDATE … WHERE as_of <
+        # :incoming`` advances the row ONLY when the snapshot is strictly newer;
+        # Postgres's row lock on that update serializes two concurrent reconciles
+        # of the same user — the second blocks, then re-evaluates ``as_of <
+        # :incoming`` and no-ops (rowcount 0) if it is now stale. The winner's
+        # holdings replace commits in the SAME transaction as this update, so the
+        # two-table unit lands atomically with no interleave. Routed through the
+        # shared ``conditional_claim`` primitive; ``update(PortfolioBalance)`` stays
+        # in this sole-writer module (AD-14).
+        won = await conditional_claim(
+            session,
+            update(PortfolioBalance)
+            .where(
+                PortfolioBalance.owner_id == scope.user_id,
+                PortfolioBalance.as_of < incoming_as_of,
+            )
+            .values(cash=snap.cash, as_of=incoming_as_of),
+        )
+        if not won:
+            # A stale/equal snapshot (or a concurrent newer reconcile already won):
+            # leave BOTH tables untouched and return the committed view. Roll back
+            # the no-op update, then RE-READ (the prior instances are expired by the
+            # rollback) so the returned view reflects the current committed truth
+            # (which, under a concurrent race, may be the OTHER reconcile's newer
+            # state — correct: newest wins).
+            await session.rollback()
+            logger.info(
+                "portfolio_reconcile_skipped_stale owner_id=%s incoming_as_of=%s",
+                scope.user_id,
+                incoming_as_of.isoformat(),
+            )
+            rows = await cache_repo.list()
+            return _to_view(rows, await _read_balance(scope, session))
     else:
-        balance = await balance_repo.add(cash=snap.cash, as_of=incoming_as_of)
+        # First-ever reconcile: INSERT the dedicated balance row, guarded by
+        # ``uq_portfolio_balance_owner`` (the DB-level one-row backstop). A
+        # concurrent first-insert that lost the race raises IntegrityError → treat
+        # it as a lost race (rollback, re-read, return the current committed view),
+        # never a crash / duplicate row.
+        balance_repo = ScopedRepository(PortfolioBalance, scope, session)
+        try:
+            await balance_repo.add(cash=snap.cash, as_of=incoming_as_of)
+            await session.flush()
+        except IntegrityError as exc:
+            # Only the owner-uniqueness backstop (a concurrent first-insert that lost
+            # the race) is a benign lost race — roll back, re-read, return the
+            # committed view. Any OTHER integrity fault (a NOT NULL / FK / etc. bug)
+            # must NOT be masked as a lost race; roll back and re-raise so it surfaces
+            # instead of silently returning a stale view.
+            await session.rollback()
+            if "uq_portfolio_balance_owner" not in str(exc.orig):
+                raise
+            logger.info(
+                "portfolio_reconcile_lost_first_insert_race owner_id=%s "
+                "incoming_as_of=%s",
+                scope.user_id,
+                incoming_as_of.isoformat(),
+            )
+            rows = await cache_repo.list()
+            return _to_view(rows, await _read_balance(scope, session))
 
-    # Atomic replace: drop the old holdings rows, write the fresh snapshot in the
-    # SAME commit. Mirrors the 2.1 callback's delete-then-add discipline
-    # (ScopedRepository has no bulk delete; per-row delete under the same session
-    # commits together). The now-vestigial per-row ``cash`` is still written
-    # (harmless denormalized copy; keeps the change schema-additive).
+    # We won the balance claim/insert: atomically REPLACE the holdings (delete the
+    # old rows, write the fresh snapshot) in the SAME transaction, so the balance
+    # advance and the holdings replace commit together as one unit with no
+    # interleave. Mirrors the 2.1 callback's delete-then-add discipline. The
+    # now-vestigial per-row ``cash`` is still written (harmless denormalized copy).
+    #
+    # Read the holdings HERE — AFTER winning the balance claim (Story 7.2) — not
+    # before it. The winning ``UPDATE`` holds the ``portfolio_balance`` row lock
+    # until this transaction commits, so a concurrent reconcile is blocked and this
+    # re-read sees the CURRENT committed holdings; deleting a pre-claim snapshot
+    # instead would orphan a racing winner's rows (delete a stale set, add on top).
+    existing = await cache_repo.list()
     for row in existing:
         await session.delete(row)
 

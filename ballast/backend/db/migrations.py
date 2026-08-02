@@ -3,10 +3,11 @@
 ``Base.metadata.create_all`` (``db.session.create_db_and_tables``) creates any
 *missing table* in full, but it NEVER ALTERs an already-existing table. So on a
 database first provisioned before Epic 6, the ``decision_record`` table exists
-yet its Epic 6 additions — ``idempotency_key`` + its unique index, ``broker_ref``
-+ its index, the ``(owner_id, co_signed_at)`` composite index, and
-``reconciliation_snapshot``/``reconciled_at`` — are silently absent, because they
-were only ever declared in the ORM. The unique-index double-place backstop and
+yet its Epic 6/7 additions — ``idempotency_key`` + its unique index,
+``broker_ref`` + its index, the ``(owner_id, co_signed_at)`` composite index,
+``reconciliation_snapshot``/``reconciled_at``, and the Story 7.2 ``cosigning_at``
+reclaimer age key — are silently absent, because they were only ever declared in
+the ORM. The unique-index double-place backstop and
 the queryable columns the go-live correctness guarantees depend on would not be
 there.
 
@@ -72,6 +73,13 @@ COLUMN_STATEMENTS: list[tuple[str, str]] = [
         "ALTER TABLE decision_record "
         "ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ",
     ),
+    (
+        # Story 7.2: the reclaimer's bounded-age key (when the current claim
+        # entered ``cosigning``). Additive/idempotent, same pattern as above.
+        "add_cosigning_at",
+        "ALTER TABLE decision_record "
+        "ADD COLUMN IF NOT EXISTS cosigning_at TIMESTAMPTZ",
+    ),
 ]
 
 # (2) Backfill NULL ``idempotency_key`` on carried-over ``proposed`` rows with a
@@ -88,6 +96,19 @@ BACKFILL_STATEMENTS: list[tuple[str, str]] = [
         "UPDATE decision_record "
         "SET idempotency_key = 'migrated:' || id::text "
         "WHERE idempotency_key IS NULL AND status = 'proposed'",
+    ),
+    (
+        # Story 7.2: any row already stuck in ``cosigning`` at deploy time is, by
+        # definition, orphaned — the process that claimed it has since restarted, so
+        # no legitimate approve is still in flight. Backfill its ``cosigning_at`` from
+        # the immutable ``created_at`` so the reclaimer (which excludes NULL
+        # ``cosigning_at`` to avoid touching in-flight rows) can recover these
+        # carried-over orphans instead of leaving them permanently unreclaimable.
+        # NULL-only, so re-running is a no-op.
+        "backfill_cosigning_at",
+        "UPDATE decision_record "
+        "SET cosigning_at = created_at "
+        "WHERE cosigning_at IS NULL AND status = 'cosigning'",
     ),
 ]
 

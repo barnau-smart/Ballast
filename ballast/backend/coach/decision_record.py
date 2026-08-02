@@ -52,13 +52,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import delete, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from brokers.port import OrderOutcome
+from brokers.port import OrderOutcome, OrderStatus
 from coach.execution import mint_idempotency_key
 from coach.recommendation import OrderIntent
 from coach.validation import BlessedRecommendation
+from db.atomic import conditional_claim, lock_row
 from db.models import DecisionRecord
 from db.repository import ScopedRepository
 from db.scope import Scope
@@ -155,23 +156,34 @@ async def claim_for_cosign(
 
     Requires a USER scope (the approve seam is never system-scoped); the explicit
     ``owner_id`` predicate is what enforces per-user isolation on the raw UPDATE.
+
+    Routes the conditional UPDATE through the generalized
+    :func:`~db.atomic.conditional_claim` primitive (Story 7.2) — the ONE shared
+    atomic-claim mechanism — while KEEPING the commit + system-scope-rejection
+    guards here (the primitive is model-agnostic and does not commit). Also stamps
+    ``cosigning_at`` (tz-aware UTC now) so a later crash-orphaned ``cosigning`` row
+    carries a bounded-age key the reclaimer can safely act on.
     """
     if scope.is_system:
         raise ValueError(
             "claim_for_cosign requires a USER scope; the approve seam is never "
             "system-scoped (fail-closed)."
         )
-    result = await session.execute(
+    won = await conditional_claim(
+        session,
         update(DecisionRecord)
         .where(
             DecisionRecord.id == decision_id,
             DecisionRecord.owner_id == scope.user_id,
             DecisionRecord.status == "proposed",
         )
-        .values(status="cosigning")
+        .values(
+            status="cosigning",
+            cosigning_at=datetime.datetime.now(datetime.timezone.utc),
+        ),
     )
     await session.commit()
-    return result.rowcount == 1
+    return won
 
 
 async def release_claim(
@@ -188,22 +200,99 @@ async def release_claim(
     ``UPDATE … SET status='proposed' WHERE id AND owner AND status='cosigning'``
     is a no-op (``rowcount == 0``) if the row is not currently claimed. Sole
     writer (AD-6); requires a USER scope.
+
+    Routes through the shared :func:`~db.atomic.conditional_claim` primitive (Story
+    7.2), keeping the commit + system-scope guard here. Also CLEARS ``cosigning_at``
+    back to ``NULL`` — the row is no longer in a claim, so it must not carry a stale
+    age key the reclaimer could later act on.
     """
     if scope.is_system:
         raise ValueError(
             "release_claim requires a USER scope; the approve seam is never "
             "system-scoped (fail-closed)."
         )
-    await session.execute(
+    await conditional_claim(
+        session,
         update(DecisionRecord)
         .where(
             DecisionRecord.id == decision_id,
             DecisionRecord.owner_id == scope.user_id,
             DecisionRecord.status == "cosigning",
         )
-        .values(status="proposed")
+        .values(status="proposed", cosigning_at=None),
     )
     await session.commit()
+
+
+async def persist_broker_ref(
+    decision_id: UUID,
+    broker_ref: str,
+    *,
+    scope: Scope,
+    session: AsyncSession,
+) -> bool:
+    """Persist ``broker_ref`` DURABLY on a claimed row, in its own commit (7.2).
+
+    The recoverable-placement step: called the instant ``place_order`` returns a
+    ``broker_ref``, BEFORE the cosign, so the queryable reference is durable
+    independent of the later cosign/commit. If that cosign/commit then fails, the
+    row stays ``cosigning`` but carries ``broker_ref`` (recoverable by the 6.7
+    reconcile or the reclaimer) instead of the old place-then-persist-in-one-commit
+    zombie with a NULL ``broker_ref``.
+
+    A scoped, rowcount-gated conditional ``UPDATE … SET broker_ref WHERE id AND
+    owner_id AND status='cosigning'`` routed through the shared
+    :func:`~db.atomic.conditional_claim` primitive, then committed here. Gated on
+    ``status='cosigning'`` so only the caller's own live claim is written (a raced
+    release/cosign makes it a no-op → ``False``). Sole writer (AD-6); requires a
+    USER scope. Returns whether the ref was persisted (``rowcount == 1``).
+    """
+    if scope.is_system:
+        raise ValueError(
+            "persist_broker_ref requires a USER scope; the approve seam is never "
+            "system-scoped (fail-closed)."
+        )
+    won = await conditional_claim(
+        session,
+        update(DecisionRecord)
+        .where(
+            DecisionRecord.id == decision_id,
+            DecisionRecord.owner_id == scope.user_id,
+            DecisionRecord.status == "cosigning",
+        )
+        .values(broker_ref=broker_ref),
+    )
+    await session.commit()
+    return won
+
+
+async def lock_decision(
+    decision_id: UUID,
+    *,
+    scope: Scope,
+    session: AsyncSession,
+) -> DecisionRecord | None:
+    """Load a decision record UNDER a row lock (``SELECT … FOR UPDATE``), scoped (7.2).
+
+    Serializes concurrent local persists on ONE decision across sessions via the
+    shared :func:`~db.atomic.lock_row` primitive: a second reconcile of the same
+    decision blocks on the ``FOR UPDATE`` until the first commits, then reads the
+    just-committed state — which is what makes ``record_reconciliation``'s in-writer
+    monotonic terminal guard (its guard lives in a JSON column, not a portable
+    ``WHERE``) effective across sessions, so a transiently-worse read can never
+    regress a persisted terminal money truth. A foreign/unknown id is invisible →
+    ``None`` (the API maps that to 404). Requires a USER scope (the reconcile seam
+    is never system-scoped); the explicit ``owner_id`` predicate enforces per-user
+    isolation on the raw locked select.
+    """
+    if scope.is_system:
+        raise ValueError(
+            "lock_decision requires a USER scope; the reconcile seam is never "
+            "system-scoped (fail-closed)."
+        )
+    return await lock_row(
+        session, DecisionRecord, entity_id=decision_id, owner_id=scope.user_id
+    )
 
 
 async def load_decision(
@@ -308,6 +397,134 @@ async def prune_stale_proposed_decisions(
     )
     await session.commit()
     return result.rowcount
+
+
+#: The indeterminate/non-terminal outcome status the reclaimer stamps onto a
+#: forward-recovered orphan (Story 7.2). ``pending`` is non-terminal (reconcilable),
+#: so the recovered record is re-reconcilable via the 6.7 reconcile and is NEVER
+#: presented as a confirmed fill. Carries the persisted ``broker_ref`` (may be NULL).
+_RECLAIM_OUTCOME_STATUS = OrderStatus.PENDING
+
+
+def _recovery_cosign_snapshot(record: DecisionRecord) -> dict:
+    """Build the recovery ``cosign_snapshot`` for a reclaimed orphan (Story 7.2).
+
+    The forward-recovery snapshot for a crash-orphaned ``cosigning`` row: the
+    EXECUTED ``order_intent`` is taken verbatim from the immutable proposed
+    ``recommendation_snapshot['order_intent']`` (already a fixed-point-money JSON
+    dict — never recomputed, AD-5), and the outcome is an INDETERMINATE
+    (non-terminal) :data:`_RECLAIM_OUTCOME_STATUS` carrying the persisted
+    ``broker_ref`` (which may be NULL), ``filled_qty`` ``"0"`` and ``avg_price``
+    ``None`` — all money as fixed-point strings, the SAME shape
+    :func:`cosign`/:func:`record_reconciliation` write. This makes the row a
+    re-reconcilable, needs-reconfirmation cosigned record: the reclaimer NEVER
+    re-places, searches, or guesses a fill — an ambiguous placement stays pending
+    for the 6.7 reconcile or an explicit human re-confirmation.
+    """
+    snapshot = record.recommendation_snapshot or {}
+    # Pass the proposed order_intent JSON through verbatim (already money-fixed).
+    # A ``None`` proposed intent (possible on the offline default plan) still
+    # yields a well-formed snapshot with a null executed intent.
+    return {
+        "order_intent": snapshot.get("order_intent"),
+        "outcome": {
+            "status": _RECLAIM_OUTCOME_STATUS.value,
+            "filled_qty": _money(Decimal("0")),
+            "avg_price": None,
+            "broker_ref": record.broker_ref,
+        },
+    }
+
+
+async def reclaim_orphaned_cosigning(
+    *,
+    session: AsyncSession,
+    older_than: datetime.timedelta,
+    now: datetime.datetime | None = None,
+) -> int:
+    """Forward-recover crash-orphaned ``cosigning`` rows older than a window (7.2).
+
+    The SYSTEM-scope reclaimer for the go-live "permanent zombie" gap: a
+    ``cosigning`` row orphaned by a mid-claim crash is invisible to both history
+    (which filters ``status == "cosigned"``) and the pruner (which only touches
+    ``proposed``), so without a reclamation path it strands forever — possibly with
+    a LIVE order. This forward-recovers each such orphan to a ``cosigned``,
+    indeterminate, needs-reconfirmation, re-reconcilable record so the ordinary 6.7
+    reconcile (by ``broker_ref``) or a human resolves it.
+
+    BOUNDED + SAFE:
+
+    - Only ``cosigning`` rows whose ``cosigning_at`` is STRICTLY older than
+      ``now - older_than`` are candidates — a legitimately in-flight approve
+      (within the window) is NEVER touched. A NULL ``cosigning_at`` (claim time
+      unknown) is treated conservatively and NEVER reclaimed (the ``<`` comparison
+      excludes NULL), to avoid acting on anything ambiguous.
+    - Each transition is a rowcount-gated conditional ``cosigning → cosigned``
+      UPDATE through the shared :func:`~db.atomic.conditional_claim` primitive that
+      stamps ``co_signed_at`` and a recovery ``cosign_snapshot`` (executed intent
+      from the proposed snapshot; INDETERMINATE outcome carrying the persisted
+      ``broker_ref``). Because a RACING live cosign also does ``cosigning →
+      cosigned``, the rowcount gate makes the reclaimer a no-op if it lost — the
+      live cosign wins and the reclaimer never double-completes.
+    - NEVER re-places an order, searches, or guesses a fill; NEVER releases a
+      possibly-placed row back to ``proposed`` (which would permit a double-place).
+
+    Idempotent: a re-run finds no ``cosigning`` rows matching (the prior run moved
+    them to ``cosigned``) → a full no-op. A negative ``older_than`` is refused
+    (it would pull the cutoff into the FUTURE and reclaim just-claimed in-flight
+    rows). ``now`` is injectable for tests. Commits once at the end; returns the
+    count this call actually transitioned (rowcount == 1 each). SYSTEM-scope: the
+    reclaimer spans all owners by construction (a background recovery has no single
+    user), so it queries + writes without a per-user cage — but stays the sole
+    writer of the model (AD-6), every ``update(DecisionRecord)`` living here.
+    """
+    if older_than < datetime.timedelta(0):
+        raise ValueError(
+            "older_than must be non-negative "
+            f"(got {older_than!r}); a negative window would reclaim recent, "
+            "legitimately in-flight cosigning rows."
+        )
+    effective_now = now or datetime.datetime.now(datetime.timezone.utc)
+    if effective_now.tzinfo is None:
+        # Defensive: an injected naive ``now`` would yield a naive cutoff compared
+        # against the tz-aware ``cosigning_at`` (TIMESTAMPTZ) and stamp a naive
+        # ``co_signed_at`` — normalize to UTC (tz-aware everywhere else).
+        effective_now = effective_now.replace(tzinfo=datetime.timezone.utc)
+    cutoff = effective_now - older_than
+
+    # Enumerate candidate orphans (SYSTEM scope spans all owners). A NULL
+    # ``cosigning_at`` is excluded by the ``<`` comparison — never reclaimed.
+    result = await session.execute(
+        select(DecisionRecord).where(
+            DecisionRecord.status == "cosigning",
+            DecisionRecord.cosigning_at.isnot(None),
+            DecisionRecord.cosigning_at < cutoff,
+        )
+    )
+    candidates = list(result.scalars().all())
+
+    reclaimed = 0
+    for record in candidates:
+        # Rowcount-gated cosigning→cosigned: a racing live cosign wins (this
+        # no-ops). Build the recovery snapshot BEFORE the UPDATE so it reflects the
+        # persisted ``broker_ref``/proposed intent.
+        won = await conditional_claim(
+            session,
+            update(DecisionRecord)
+            .where(
+                DecisionRecord.id == record.id,
+                DecisionRecord.status == "cosigning",
+            )
+            .values(
+                status="cosigned",
+                co_signed_at=effective_now,
+                cosign_snapshot=_recovery_cosign_snapshot(record),
+            ),
+        )
+        if won:
+            reclaimed += 1
+    await session.commit()
+    return reclaimed
 
 
 def cosign(

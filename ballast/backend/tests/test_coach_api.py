@@ -133,6 +133,15 @@ async def ensure_tables():
                 "ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ"
             )
         )
+        # Story 7.2 adds the reclaimer's bounded-age key ``cosigning_at``;
+        # reconcile a carried-over DB the same way (create_all won't ALTER an
+        # existing table). Harmless/no-op once the column exists.
+        await conn.execute(
+            text(
+                "ALTER TABLE decision_record "
+                "ADD COLUMN IF NOT EXISTS cosigning_at TIMESTAMPTZ"
+            )
+        )
     yield
 
 
@@ -758,6 +767,58 @@ def test_approve_null_idempotency_key_refuses_broker_untouched(client):
         # Claim released → the record is retryable (proposed), not stranded.
         rows = _decision_rows(uid)
         assert len(rows) == 1 and rows[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def _cosigning_at_for(owner: uuid.UUID):
+    """Read this owner's decision_record.cosigning_at column (Story 7.2)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cosigning_at FROM decision_record WHERE owner_id = %s",
+                (str(owner),),
+            )
+            (at,) = cur.fetchone()
+    return at
+
+
+def test_approve_null_idempotency_key_pre_placement_422_release_clears_cosigning_at(
+    client,
+):
+    # (7.2 regression) Pins the NULL-idempotency_key PRE-PLACEMENT refusal: a
+    # decision whose persisted key is NULL is refused with 422 BEFORE any
+    # placement, the claim is released back to ``proposed``, the broker is NEVER
+    # touched, AND the release CLEARS ``cosigning_at`` (no stale age key the
+    # reclaimer could later act on). Story 7.2 must not weaken this pre-fill guard.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+        _null_idempotency_key(uid)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert spy.calls == []  # broker NEVER touched (pre-placement refusal)
+        assert spy.status_calls == []
+        rows = _decision_rows(uid)
+        assert len(rows) == 1 and rows[0]["status"] == "proposed"  # released
+        # The release cleared cosigning_at (no stale reclaimer age key stranded).
+        assert _cosigning_at_for(uid) is None
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)

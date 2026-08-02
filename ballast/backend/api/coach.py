@@ -67,6 +67,8 @@ from coach.decision_record import (
     effective_outcome_status,
     list_cosigned_decisions,
     load_decision,
+    lock_decision,
+    persist_broker_ref,
     record_proposal,
     record_reconciliation,
     release_claim,
@@ -553,8 +555,34 @@ async def approve(
         await release_claim(body.decision_id, scope=scope, session=session)
         raise
 
+    # Recoverable placement (Story 7.2): persist ``broker_ref`` DURABLY in its own
+    # commit the instant placement returns and BEFORE the cosign, so the queryable
+    # reference is durable independent of the cosign/commit below. If that later
+    # cosign/commit fails, the row stays ``cosigning`` but carries ``broker_ref``
+    # (recoverable by the 6.7 reconcile or the reclaimer) instead of a NULL-ref
+    # zombie. We do NOT release the claim on a post-placement failure — a live
+    # order may exist, so releasing (which permits a re-place) would risk a
+    # double-place; recoverability comes from the durable ref, not from releasing.
+    if outcome.broker_ref is not None:
+        await persist_broker_ref(
+            body.decision_id, outcome.broker_ref, scope=scope, session=session
+        )
+
     # Order was actually placed and reconciled: co-sign the referenced record
     # exactly once (cosigning→cosigned, delegated to the sole writer — AD-6).
+    # ``cosign`` re-writes ``broker_ref`` idempotently (same value already
+    # persisted above).
+    #
+    # Re-load so the cosign acts on the CURRENT DB state, not the pre-network
+    # in-memory instance (``expire_on_commit`` is off + the ``persist_broker_ref``
+    # Core UPDATE bypassed this instance, so ``record.status`` would otherwise be a
+    # stale ``cosigning``). If a concurrent forward-recovery (the reclaimer) already
+    # moved the row out of ``cosigning``, do NOT re-complete a stale instance — the
+    # order was placed, so surface the honest outcome without a spurious second
+    # cosign (and never release: a live order may exist).
+    record = await load_decision(body.decision_id, scope=scope, session=session)
+    if record is None or record.status != "cosigning":
+        return _to_approve_response(outcome)
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
     return _to_approve_response(outcome)
@@ -687,10 +715,19 @@ async def reconcile_decision(
         raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
 
     if result.reconciled:
-        # The broker was actually read — persist the reconciled outcome
-        # ADDITIVELY (immutable snapshots untouched) via the sole writer (AD-6).
-        record_reconciliation(record, outcome=result.outcome)
-        await session.commit()
+        # The broker was actually read (UNLOCKED, above — never hold a row lock
+        # across the network round-trip). Now serialize the LOCAL persist: re-load
+        # the row UNDER A LOCK (Story 7.2) so two concurrent reconciles of this
+        # decision serialize — the second blocks on the ``FOR UPDATE`` until the
+        # first commits, then ``record_reconciliation``'s in-writer monotonic
+        # terminal guard sees the just-committed state and no-ops rather than
+        # regressing a terminal money truth. Persist the reconciled outcome
+        # ADDITIVELY on the LOCKED instance (immutable snapshots untouched) via the
+        # sole writer (AD-6), then commit (releasing the lock).
+        locked = await lock_decision(decision_id, scope=scope, session=session)
+        if locked is not None:
+            record_reconciliation(locked, outcome=result.outcome)
+            await session.commit()
 
     outcome = result.outcome
     return ReconcileResponse(

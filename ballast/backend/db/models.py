@@ -353,6 +353,19 @@ class DecisionRecord(OwnedEntityMixin, Base):
     co_signed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # When the CURRENT claim entered ``cosigning`` (stamped by ``claim_for_cosign``,
+    # cleared by ``release_claim``) — the RECLAIMER's bounded-age key (Story 7.2):
+    # ``reclaim_orphaned_cosigning`` forward-recovers only ``cosigning`` rows whose
+    # ``cosigning_at`` is older than a window, so a legitimately in-flight approve
+    # is never stolen. NOT part of the immutable snapshot (it is claim-lifecycle
+    # bookkeeping, not decided/executed truth); NULL means the claim time is
+    # unknown, which the reclaimer treats conservatively (never reclaimed).
+    # (Built via ``create_all``; adding this to the model will NOT ALTER an
+    # already-created table — provisioned additively by the 7.1 startup migration,
+    # exactly as ``idempotency_key``/``broker_ref`` were.)
+    cosigning_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The stable per-decision idempotency key, minted+persisted at propose (Story
     # 6.1) and reused verbatim across every placement so a re-place after a
     # released claim dedupes rather than double-fills. Column stays nullable for

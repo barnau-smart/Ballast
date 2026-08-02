@@ -108,7 +108,7 @@ development_status:
   # 7.1–7.5 are code-only/offline-testable (loop-runnable); 7.6 is credential+real-money gated (human pause point).
   epic-7: in-progress
   7-1-production-db-migration-path: done
-  7-2-generalized-atomic-claim-recoverable-placement: backlog
+  7-2-generalized-atomic-claim-recoverable-placement: done
   7-3-calm-envelopes-provider-match-live-broker: backlog
   7-4-llm-live-path-latency-robustness: backlog
   7-5-live-read-robustness-multi-account-safety: backlog

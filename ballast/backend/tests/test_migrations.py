@@ -31,12 +31,13 @@ from db.migrations import run_startup_migrations
 from db.models import Base
 from db.session import async_session_maker, engine
 
-# Every Epic 6 column the migration must guarantee on ``decision_record``.
+# Every Epic 6/7 column the migration must guarantee on ``decision_record``.
 _EPIC6_COLUMNS = (
     "idempotency_key",
     "broker_ref",
     "reconciliation_snapshot",
     "reconciled_at",
+    "cosigning_at",  # Story 7.2 reclaimer age key
 )
 
 # Every Epic 6 index the migration must guarantee (exact ORM identifier names).
@@ -124,6 +125,11 @@ async def test_migration_provisions_missing_schema():
         )
         await conn.execute(
             text(
+                "ALTER TABLE decision_record DROP COLUMN IF EXISTS cosigning_at"
+            )
+        )
+        await conn.execute(
+            text(
                 "ALTER TABLE decision_record "
                 "DROP CONSTRAINT IF EXISTS uq_decision_record_idempotency_key"
             )
@@ -143,6 +149,7 @@ async def test_migration_provisions_missing_schema():
 
     # Confirm the drops took effect before re-provisioning.
     assert not await _column_exists("decision_record", "broker_ref")
+    assert not await _column_exists("decision_record", "cosigning_at")
     assert not await _index_exists("ix_decision_record_broker_ref")
     assert not await _index_exists("ix_decision_record_owner_co_signed_at")
     assert not await _index_exists("uq_decision_record_idempotency_key")
@@ -245,6 +252,88 @@ async def test_migration_backfills_null_idempotency_key():
         assert after == f"migrated:{decision_id}"
     finally:
         # Cascades to the decision_record row via the ON DELETE CASCADE FK.
+        async with async_session_maker() as session:
+            await session.execute(
+                text('DELETE FROM "user" WHERE id = :id'), {"id": user_id}
+            )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_migration_backfills_cosigning_at_for_carried_over_orphans():
+    """A carried-over ``cosigning`` row (NULL ``cosigning_at``) is backfilled (7.2).
+
+    A row already stuck in ``cosigning`` at deploy time is, by definition, an
+    orphan (its claiming process has restarted). The migration backfills its
+    ``cosigning_at`` from the immutable ``created_at`` so the reclaimer — which
+    excludes NULL ``cosigning_at`` — can recover it instead of leaving it a
+    permanent zombie. A ``proposed`` row keeps a NULL ``cosigning_at`` (only
+    ``cosigning`` rows are backfilled).
+    """
+    user_id = uuid.uuid4()
+    orphan_id = uuid.uuid4()
+    proposed_id = uuid.uuid4()
+    email = f"migration-test-{uuid.uuid4().hex}@example.com"
+    created = datetime.datetime(2026, 7, 1, 9, 0, tzinfo=datetime.timezone.utc)
+
+    async with async_session_maker() as session:
+        await session.execute(
+            text(
+                'INSERT INTO "user" '
+                "(id, email, hashed_password, is_active, is_superuser, is_verified) "
+                "VALUES (:id, :email, :pw, true, false, false)"
+            ),
+            {"id": user_id, "email": email, "pw": "x"},
+        )
+        # A carried-over cosigning orphan with a NULL cosigning_at, plus a proposed
+        # control row (must stay NULL). Raw SQL models the pre-7.2 carried-over state.
+        for did, status, key in (
+            (orphan_id, "cosigning", f"k-{orphan_id}"),
+            (proposed_id, "proposed", f"k-{proposed_id}"),
+        ):
+            await session.execute(
+                text(
+                    "INSERT INTO decision_record "
+                    "(id, owner_id, schema_version, recommendation_snapshot, status, "
+                    " created_at, idempotency_key, cosigning_at) "
+                    "VALUES (:id, :owner, 1, '{}', :status, :created, :key, NULL)"
+                ),
+                {
+                    "id": did,
+                    "owner": user_id,
+                    "status": status,
+                    "created": created,
+                    "key": key,
+                },
+            )
+        await session.commit()
+
+    try:
+        await run_startup_migrations(engine)
+
+        async with engine.connect() as conn:
+            (orphan_after,) = (
+                await conn.execute(
+                    text(
+                        "SELECT cosigning_at FROM decision_record WHERE id = :id"
+                    ),
+                    {"id": orphan_id},
+                )
+            ).one()
+            (proposed_after,) = (
+                await conn.execute(
+                    text(
+                        "SELECT cosigning_at FROM decision_record WHERE id = :id"
+                    ),
+                    {"id": proposed_id},
+                )
+            ).one()
+        # The cosigning orphan is backfilled from created_at (now reclaimable).
+        assert orphan_after is not None
+        assert orphan_after == created
+        # The proposed control row is untouched (still NULL).
+        assert proposed_after is None
+    finally:
         async with async_session_maker() as session:
             await session.execute(
                 text('DELETE FROM "user" WHERE id = :id'), {"id": user_id}
