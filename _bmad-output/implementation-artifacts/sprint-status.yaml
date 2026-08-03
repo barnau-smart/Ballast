@@ -75,7 +75,7 @@ development_status:
   3-3-recovery-precedent-view: done
   3-4-missed-growth-meter: done
   3-5-headline-contextualizer: done
-  3-6-hypothetical-drawdown-precedent: ready-for-dev
+  3-6-hypothetical-drawdown-precedent: done
   epic-3-retrospective: optional
 
   # Epic 4: The Coach — Propose, Approve, Execute, Co-sign & Replay

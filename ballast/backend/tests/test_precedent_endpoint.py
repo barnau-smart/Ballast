@@ -29,7 +29,8 @@ PASSWORD = "supersecret123"
 # TEST-prefixed symbols — safe against the shared global market_daily table.
 SYM_QUALIFY = "TEST_PREC_EP_QUALIFY"
 SYM_NOMATCH = "TEST_PREC_EP_NOMATCH"
-ALL_TEST_SYMBOLS = [SYM_QUALIFY, SYM_NOMATCH]
+SYM_HYPO = "TEST_PREC_EP_HYPO"
+ALL_TEST_SYMBOLS = [SYM_QUALIFY, SYM_NOMATCH, SYM_HYPO]
 
 BASE_DAY = date(2015, 1, 1)
 
@@ -78,6 +79,24 @@ def _qualify_closes() -> list[Decimal]:
         closes.append(Decimal("100") + Decimal(i))  # 101 .. 360, monotonic
     closes.append(Decimal("355"))
     closes.append(Decimal("331.20"))  # current: 8% below 360
+    return closes
+
+
+def _hypo_closes() -> list[Decimal]:
+    """A DEEP ~35% historical episode + a shallow current position near ATH.
+
+    The live path finds only a ~1% current drop (no deep precedent); only a
+    hypothetical query centred on 35% surfaces the deep episode. Mirrors
+    ``test_precedent._hypo_closes``.
+    """
+    closes = [
+        Decimal("100"),  # peak, idx0
+        Decimal("65"),   # trough, idx1 (35% drawdown)
+        Decimal("100"),  # recovery, idx2
+    ]
+    for v in range(101, 361):  # 101..360 monotonic — full forward window
+        closes.append(Decimal(v))
+    closes.append(Decimal("356.40"))  # current: ~1% below 360 (shallow)
     return closes
 
 
@@ -232,3 +251,167 @@ def test_recovery_requires_authentication(client):
     # No record body leaks to an unauthenticated caller.
     assert "statement" not in r.text
     assert "event-precedent" not in r.text
+
+
+# --- Hypothetical drawdown (Story 3.6, FR20) ---------------------------------
+
+
+def test_contextualize_hypothetical_surfaces_deep_episode(client):
+    """POST {headline, drawdown:0.35} → an explicitly-hypothetical deep precedent."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = client.post(
+            "/api/precedent/contextualize",
+            json={
+                "headline": "Markets in freefall!",
+                "symbol": SYM_HYPO,
+                "drawdown": "0.35",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Top-level shape is unchanged (AD-12 six fields).
+        assert set(body.keys()) == {
+            "id",
+            "kind",
+            "statement",
+            "stats",
+            "source",
+            "as_of",
+        }
+        assert body["kind"] == "event-precedent"
+        stats = body["stats"]
+        assert stats["hypothetical"] is True
+        assert stats["hypothetical_drawdown_pct"] == "0.3500"
+        assert stats["instance_count"] == 1
+        # Honest hypothetical framing, never a prediction.
+        assert body["statement"].startswith(f"If {SYM_HYPO} fell about 35%")
+        assert "isn't a prediction" in body["statement"]
+        # A single-episode match must read grammatically ("1 comparable drop",
+        # never "1 comparable drops").
+        assert "1 comparable drop " in body["statement"]
+        assert "comparable drops" not in body["statement"]
+    finally:
+        _clean([SYM_HYPO])
+        _delete_user(email)
+
+
+def test_recovery_hypothetical_drawdown_param(client):
+    """GET /recovery?drawdown=0.35 drives the same hypothetical match as POST."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = client.get(
+            "/api/precedent/recovery",
+            params={"symbol": SYM_HYPO, "drawdown": "0.35"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Same AD-12 six-field shape and same hypothetical framing as POST.
+        assert set(body.keys()) == {
+            "id",
+            "kind",
+            "statement",
+            "stats",
+            "source",
+            "as_of",
+        }
+        assert body["kind"] == "event-precedent"
+        assert body["stats"]["hypothetical"] is True
+        assert body["stats"]["hypothetical_drawdown_pct"] == "0.3500"
+        assert body["statement"].startswith(f"If {SYM_HYPO} fell about 35%")
+
+        # Out-of-range on the GET param is a calm 422, never a record body.
+        bad = client.get(
+            "/api/precedent/recovery",
+            params={"symbol": SYM_HYPO, "drawdown": "1.5"},
+            headers=headers,
+        )
+        assert bad.status_code == 422, bad.text
+        assert "event-precedent" not in bad.text
+    finally:
+        _clean([SYM_HYPO])
+        _delete_user(email)
+
+
+def test_contextualize_hypothetical_out_of_range_is_422(client):
+    """A drawdown outside 0 < d <= 0.90 is a calm 422 (never a crash/record body)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        for bad in ("0", "-0.1", "0.91", "1.5"):
+            r = client.post(
+                "/api/precedent/contextualize",
+                json={"headline": "x", "drawdown": bad},
+                headers=headers,
+            )
+            assert r.status_code == 422, (bad, r.text)
+            assert "event-precedent" not in r.text
+    finally:
+        _delete_user(email)
+
+
+def test_contextualize_hypothetical_no_match_is_strategy(client):
+    """A hypothetical target with no comparable episode → 200 strategy default."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = client.post(
+            "/api/precedent/contextualize",
+            json={"headline": "x", "symbol": SYM_HYPO, "drawdown": "0.70"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["kind"] == "strategy"
+        assert body["stats"]["reason"] == "no_band_match"
+        assert body["stats"]["windows"] == []
+        assert body["statement"]  # never a dead end
+    finally:
+        _clean([SYM_HYPO])
+        _delete_user(email)
+
+
+def test_contextualize_absent_drawdown_is_current_conditions(client):
+    """Omitting drawdown keeps the current-conditions behavior (no hypothetical keys)."""
+    _clean([SYM_NOMATCH])
+    _insert_series(SYM_NOMATCH, _nomatch_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = client.post(
+            "/api/precedent/contextualize",
+            json={"headline": "x", "symbol": SYM_NOMATCH},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Current-conditions path — never carries the hypothetical additive keys.
+        assert "hypothetical" not in body["stats"]
+    finally:
+        _clean([SYM_NOMATCH])
+        _delete_user(email)

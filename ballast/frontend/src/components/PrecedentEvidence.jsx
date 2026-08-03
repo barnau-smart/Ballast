@@ -68,6 +68,15 @@ function EventPrecedent({ record, expanded, onToggle, reduced, windowsId }) {
   const drawdownPct = formatPct(stats.initial_drawdown_pct)
   const forward = directionAndMagnitude(stats.forward_return_1yr_median)
   const windows = Array.isArray(stats.windows) ? stats.windows : []
+  // For a HYPOTHETICAL record (Story 3.6) `initial_drawdown_pct` is the QUERIED
+  // target, not the symbol's real position — so we must NOT label it "Where it
+  // stands now / below its recent peak" (that would present a fiction as fact,
+  // breaking the honesty invariant NFR8/FR20). Frame it as the scenario instead.
+  const hypothetical = stats.hypothetical === true
+  const drawdownTerm = hypothetical ? 'In this scenario' : 'Where it stands now'
+  const drawdownLabel = hypothetical
+    ? `a ${drawdownPct} drop from a recent high`
+    : `${drawdownPct} below its recent peak`
 
   return (
     <div className="ballast-precedent" data-testid="precedent-event">
@@ -78,12 +87,9 @@ function EventPrecedent({ record, expanded, onToggle, reduced, windowsId }) {
       <dl className="ballast-precedent__stats">
         {drawdownPct ? (
           <div className="ballast-precedent__stat" data-testid="precedent-drawdown">
-            <dt className="ballast-precedent__stat-term">Where it stands now</dt>
+            <dt className="ballast-precedent__stat-term">{drawdownTerm}</dt>
             <dd className="ballast-precedent__stat-value">
-              <MarketIndicator
-                direction="down"
-                label={`${drawdownPct} below its recent peak`}
-              />
+              <MarketIndicator direction="down" label={drawdownLabel} />
             </dd>
           </div>
         ) : null}

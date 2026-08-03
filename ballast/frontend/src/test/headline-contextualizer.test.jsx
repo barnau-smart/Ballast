@@ -44,6 +44,39 @@ const EVENT_RECORD = {
   as_of: '2026-07-27',
 }
 
+// A HYPOTHETICAL precedent record (Story 3.6) — additive `stats.hypothetical*`
+// keys, honest "if it fell about X%" statement, still the 6-field AD-12 shape.
+const HYPOTHETICAL_RECORD = {
+  id: 'ep-aa11bb22cc33',
+  kind: 'event-precedent',
+  statement:
+    "If VTI fell about 35% from a recent high, here's what the record shows: in 2 comparable drops on record, it recovered to breakeven in a median of 240 trading days, and it was higher a year later in 2 of 2. This isn't a prediction; it's the base rate.",
+  stats: {
+    initial_drawdown_pct: '0.3500',
+    current_velocity: '0.0000',
+    instance_count: 2,
+    recovery_days_median: 240,
+    recovery_days_range: { min: 210, max: 270 },
+    forward_return_1yr_median: '0.4500',
+    hypothetical: true,
+    hypothetical_drawdown_pct: '0.3500',
+    windows: [
+      {
+        peak_date: '2007-10-09',
+        trough_date: '2009-03-09',
+        recovery_date: '2012-03-15',
+        drawdown_pct: '0.3510',
+        velocity: '0.0010',
+        recovery_days: 240,
+        recovered: true,
+        forward_return_1yr: '0.4500',
+      },
+    ],
+  },
+  source: 'VTI daily close (market_daily)',
+  as_of: '2026-07-27',
+}
+
 const STRATEGY_RECORD = {
   id: 'strat-abc123456789',
   kind: 'strategy',
@@ -202,5 +235,84 @@ describe('HeadlineContextualizer — pull-only, calm, non-interpretive', () => {
       expect(screen.getByTestId('headline-fallback')).toBeInTheDocument(),
     )
     expect(screen.queryByTestId('precedent-event')).not.toBeInTheDocument()
+  })
+
+  // --- Story 3.6: hypothetical scenarios -------------------------------------
+
+  it('scenario chips are disabled until a headline is typed (no fetch on mount)', () => {
+    const fetchFn = stubRecord(HYPOTHETICAL_RECORD)
+    renderWidget()
+
+    expect(screen.getByTestId('headline-scenarios')).toBeInTheDocument()
+    expect(screen.getByTestId('headline-scenario-crash')).toBeDisabled()
+    expect(fetchFn).not.toHaveBeenCalled()
+
+    typeHeadline('Markets tumble')
+    expect(screen.getByTestId('headline-scenario-crash')).toBeEnabled()
+  })
+
+  it('choosing a scenario POSTs { headline, drawdown } and renders the hypothetical record', async () => {
+    const fetchFn = stubRecord(HYPOTHETICAL_RECORD)
+    const { container } = renderWidget()
+
+    typeHeadline('Markets tumble on recession fears')
+    fireEvent.click(screen.getByTestId('headline-scenario-crash'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('precedent-event')).toBeInTheDocument(),
+    )
+
+    // POSTs the drawdown fraction — the NUMBER drives the match, not the headline.
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    const [url, options] = fetchFn.mock.calls[0]
+    expect(url).toMatch(/\/api\/precedent\/contextualize$/)
+    expect(JSON.parse(options.body)).toEqual({
+      headline: 'Markets tumble on recession fears',
+      drawdown: 0.35,
+    })
+
+    // Hypothetical framing — never a prediction/forecast.
+    const framing = screen.getByTestId('headline-framing')
+    expect(framing).toHaveTextContent(/isn'?t a forecast/i)
+    expect(screen.getByTestId('precedent-statement')).toHaveTextContent(
+      /If VTI fell about 35%/i,
+    )
+
+    // Drops still sky-blue ▼, forward-returns green ▲, never red.
+    const drawdown = screen.getByTestId('precedent-drawdown')
+    expect(
+      drawdown.querySelector('.ballast-market-indicator--down'),
+    ).not.toBeNull()
+
+    // HONESTY (NFR8/FR20): the queried target must read as a SCENARIO, never as
+    // the symbol's real current position — so it must NOT say "below its recent
+    // peak" (which would present the hypothetical as fact).
+    expect(drawdown).toHaveTextContent(/in this scenario/i)
+    expect(drawdown).toHaveTextContent(/35\.0% drop from a recent high/i)
+    expect(drawdown).not.toHaveTextContent(/below its recent peak/i)
+    const forward = screen.getByTestId('precedent-forward')
+    expect(forward.querySelector('.ballast-market-indicator--up')).not.toBeNull()
+
+    expect(container.innerHTML).not.toMatch(/brand-red|accent-pink|line-red/)
+    expect(container.textContent).not.toMatch(NUDGE_OR_CLASSIFY)
+  })
+
+  it('the default submit path (no scenario) still POSTs exactly { headline }', async () => {
+    const fetchFn = stubRecord(EVENT_RECORD)
+    renderWidget()
+
+    typeHeadline('Stocks slide')
+    submit()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('precedent-event')).toBeInTheDocument(),
+    )
+    const [, options] = fetchFn.mock.calls[0]
+    // Current-conditions default: no drawdown key on the wire.
+    expect(JSON.parse(options.body)).toEqual({ headline: 'Stocks slide' })
+    // And the default (non-hypothetical) framing is shown.
+    expect(screen.getByTestId('headline-framing')).toHaveTextContent(
+      /doesn'?t weigh in on the news itself/i,
+    )
   })
 })

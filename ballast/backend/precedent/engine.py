@@ -271,8 +271,32 @@ def _source_str(symbol: str) -> str:
     return f"{symbol} daily close (market_daily)"
 
 
+def _higher_year_later(forward_returns: list[Decimal]) -> int:
+    """Count how many matched episodes had a POSITIVE one-year forward return.
+
+    Used only in the hypothetical statement's "higher a year later in Y of N"
+    base-rate phrasing; deterministic, no float."""
+    return sum(1 for r in forward_returns if r > 0)
+
+
+def _target_pct_display(hypothetical_drawdown: Decimal) -> Decimal:
+    """Friendly percent for the hypothetical target ("about 20%").
+
+    Whole-percent for a normal target, but for a sub-1% target (a valid but tiny
+    ``drawdown`` a direct API caller could pass — the validator only requires
+    ``> 0``) fall back to one decimal so the honesty copy never reads the
+    nonsensical "about 0%". Deterministic, no float."""
+    pct = hypothetical_drawdown * Decimal("100")
+    whole = pct.quantize(Decimal("1"))
+    return whole if whole >= 1 else pct.quantize(_PCT_DISPLAY_Q)
+
+
 def _build_strategy_record(
-    symbol: str, as_of: date, statement: str, reason: str
+    symbol: str,
+    as_of: date,
+    statement: str,
+    reason: str,
+    hypothetical_drawdown: Decimal | None = None,
 ) -> EvidenceRecord:
     """Build the always-available ``strategy`` fallback record (empty windows).
 
@@ -280,8 +304,16 @@ def _build_strategy_record(
     makes the fallback situation machine-distinguishable — and gives each reason a
     distinct deterministic ``id`` — without a downstream consumer having to parse the
     English ``statement``.
+
+    When ``hypothetical_drawdown`` is set (the no-band-match degrade of a hypothetical
+    query), the target is carried as ADDITIVE ``stats`` keys so the ``id`` encodes the
+    queried magnitude — two different hypothetical targets that both miss the band get
+    byte-distinct, byte-stable ids, and are distinct from the live no-band-match record.
     """
     stats: dict = {"reason": reason, "windows": []}
+    if hypothetical_drawdown is not None:
+        stats["hypothetical"] = True
+        stats["hypothetical_drawdown_pct"] = _q(hypothetical_drawdown)
     return EvidenceRecord(
         id=make_id(EvidenceKind.STRATEGY, symbol, as_of, stats),
         kind=EvidenceKind.STRATEGY,
@@ -297,6 +329,7 @@ def _build_event_precedent_record(
     as_of: date,
     current: dict,
     matches: list[dict],
+    hypothetical_drawdown: Decimal | None = None,
 ) -> EvidenceRecord:
     """Build the ONE aggregate ``event-precedent`` record from the matched windows.
 
@@ -305,6 +338,14 @@ def _build_event_precedent_record(
     fixed 6-field shape). ``recovery_days_*`` use only recovered episodes;
     ``forward_return_1yr_median`` uses only episodes with a full forward window.
     Integer-day medians use :func:`statistics.median_low` to stay ``int``.
+
+    When ``hypothetical_drawdown`` is set (a positive ``Decimal``), the record is an
+    explicitly HYPOTHETICAL precedent ("if it fell about X%…"): the match is centred
+    on that target magnitude rather than the live drawdown, the ``statement`` is
+    reworded to read as a base rate and never a prediction (NFR8/FR20), and two
+    ADDITIVE ``stats`` keys are set — ``hypothetical: True`` and
+    ``hypothetical_drawdown_pct`` (the target, as a 4-dp ``Decimal``). The six
+    TOP-LEVEL ``EvidenceRecord`` fields are unchanged (AD-12).
     """
     windows = []
     recovery_days_list: list[int] = []
@@ -357,19 +398,58 @@ def _build_event_precedent_record(
         "windows": windows,
     }
 
-    pct_display = (current["magnitude"] * Decimal("100")).quantize(_PCT_DISPLAY_Q)
-    if recovery_days_median is not None:
-        statement = (
-            f"{symbol} is ~{pct_display}% below its recent peak. In {instance_count} "
-            f"similar drops, it recovered to breakeven in a median of "
-            f"{recovery_days_median} trading days."
-        )
+    if hypothetical_drawdown is not None:
+        # Additive keys ONLY (AD-12: no new top-level field). Their presence lets a
+        # consumer distinguish a hypothetical precedent from a live-drawdown one and
+        # gives the two byte-distinct ``id``s for the same symbol/as_of, so a
+        # hypothetical query is deterministically reproducible on its own hash.
+        stats["hypothetical"] = True
+        stats["hypothetical_drawdown_pct"] = _q(hypothetical_drawdown)
+
+    if hypothetical_drawdown is not None:
+        # Explicitly hypothetical framing — a base rate, never a forecast. Round the
+        # target to a friendly whole-percent band ("about 20%").
+        target_display = _target_pct_display(hypothetical_drawdown)
+        forward_count = len(forward_returns)
+        # Grammar: a hypothetical band can match exactly one episode (e.g. a ~35%
+        # target that only the single COVID-2020 drop lands in), so pluralize.
+        drop_word = "drop" if instance_count == 1 else "drops"
+        if recovery_days_median is not None:
+            statement = (
+                f"If {symbol} fell about {target_display}% from a recent high, "
+                f"here's what the record shows: in {instance_count} comparable "
+                f"{drop_word} on record, it recovered to breakeven in a median of "
+                f"{recovery_days_median} trading days"
+            )
+        else:
+            statement = (
+                f"If {symbol} fell about {target_display}% from a recent high, "
+                f"here's what the record shows: {instance_count} comparable "
+                f"{drop_word} occurred, and none has fully recovered within the "
+                f"available data"
+            )
+        if forward_count:
+            statement += (
+                f", and it was higher a year later in {_higher_year_later(forward_returns)} "
+                f"of {forward_count}."
+            )
+        else:
+            statement += "."
+        statement += " This isn't a prediction; it's the base rate."
     else:
-        statement = (
-            f"{symbol} is ~{pct_display}% below its recent peak. {instance_count} "
-            f"similar drops occurred historically; none has fully recovered within "
-            f"the available data."
-        )
+        pct_display = (current["magnitude"] * Decimal("100")).quantize(_PCT_DISPLAY_Q)
+        if recovery_days_median is not None:
+            statement = (
+                f"{symbol} is ~{pct_display}% below its recent peak. In {instance_count} "
+                f"similar drops, it recovered to breakeven in a median of "
+                f"{recovery_days_median} trading days."
+            )
+        else:
+            statement = (
+                f"{symbol} is ~{pct_display}% below its recent peak. {instance_count} "
+                f"similar drops occurred historically; none has fully recovered within "
+                f"the available data."
+            )
 
     return EvidenceRecord(
         id=make_id(EvidenceKind.EVENT_PRECEDENT, symbol, as_of, stats),
@@ -388,14 +468,27 @@ async def find_precedent(
     session: AsyncSession,
     symbol: str = DEFAULT_BENCHMARK,
     as_of: date | None = None,
+    *,
+    hypothetical_drawdown: Decimal | None = None,
 ) -> list[EvidenceRecord]:
     """Find drawdown precedents for ``symbol`` as of ``as_of`` (default: latest bar).
 
     Returns a length-1 ``list[EvidenceRecord]`` in v1 — ONE aggregate
-    ``event-precedent`` record when ≥ 1 historical episode matches the current
-    drawdown's magnitude band, otherwise the ``strategy`` fallback. NEVER an empty
-    list. Fully deterministic: ``as_of`` defaults to the latest ``day`` in the
-    loaded series (never today), and identical inputs yield an identical ``id``.
+    ``event-precedent`` record when ≥ 1 historical episode matches, otherwise the
+    ``strategy`` fallback. NEVER an empty list. Fully deterministic: ``as_of``
+    defaults to the latest ``day`` in the loaded series (never today), and identical
+    inputs yield an identical ``id``.
+
+    ``hypothetical_drawdown`` (keyword-only) generalizes the match to an EXPLICIT
+    target magnitude ("what if it fell about X%?", FR20). When it is a positive
+    ``Decimal`` the engine centres the ``MAGNITUDE_BAND`` match on that target —
+    reusing the SAME ``historical_episodes`` + ±band filter + recovery/forward-return
+    stat computation as the live path — and BYPASSES the live current-drawdown /
+    velocity path (velocity is not a hypothetical input, so it is ranked as 0). The
+    record is framed as an honest base rate, never a prediction, with the additive
+    ``stats.hypothetical*`` keys. No band match → the ``strategy`` fallback with
+    ``reason='no_band_match'`` (never empty, never an error). When
+    ``hypothetical_drawdown is None`` the behavior is byte-identical to before.
 
     Insufficient data (symbol absent, or < 2 bars) logs a structured warning and
     degrades to the ``strategy`` record — it never crashes.
@@ -428,6 +521,14 @@ async def find_precedent(
         ]
 
     resolved_as_of = as_of if as_of is not None else series[-1][0]
+
+    if hypothetical_drawdown is not None:
+        return [
+            _find_hypothetical_precedent(
+                symbol, resolved_as_of, series, hypothetical_drawdown
+            )
+        ]
+
     current = current_drawdown(series, resolved_as_of)
 
     # Not in a drawdown (at its all-time high) → strategy fallback.
@@ -466,3 +567,60 @@ async def find_precedent(
         ]
 
     return [_build_event_precedent_record(symbol, resolved_as_of, current, matches)]
+
+
+def _find_hypothetical_precedent(
+    symbol: str,
+    as_of: date,
+    series: list[tuple[date, Decimal]],
+    hypothetical_drawdown: Decimal,
+) -> EvidenceRecord:
+    """Build the precedent for a HYPOTHETICAL target drawdown (FR20).
+
+    Matches every PAST historical episode whose magnitude is within ``MAGNITUDE_BAND``
+    of the target (the SAME band filter, current-episode exclusion, and stat
+    computation as the live path, so matched-window stats stay identical in shape),
+    ranked by ``|Δmagnitude|`` then episode order — velocity is not a hypothetical
+    input, so it is ranked as 0. No band match → the ``strategy`` default with
+    ``reason='no_band_match'`` (never a dead end).
+
+    Like the live path, the symbol's CURRENT, in-progress drawdown is excluded from
+    the match: it is the present, not a completed drop "on record", and (being
+    unrecovered) would otherwise inflate ``instance_count`` and pollute the base rate
+    whenever its magnitude happens to fall in the queried band. Only the target
+    magnitude — never the live drawdown or its velocity — drives the match, so the
+    same ``(symbol, as_of, hypothetical_drawdown)`` yields a byte-stable record (the
+    target is encoded into ``stats`` → the ``id``).
+    """
+    episodes = historical_episodes(series)
+    # Exclude the current, in-progress drawdown itself — everything strictly before
+    # its peak is genuine history (mirrors the live-path exclusion above).
+    current_peak_date = current_drawdown(series, as_of)["peak_date"]
+    past_episodes = [e for e in episodes if e["peak_date"] < current_peak_date]
+    matches = _match_and_rank(past_episodes, hypothetical_drawdown, Decimal("0"))
+
+    if not matches:
+        target_display = _target_pct_display(hypothetical_drawdown)
+        return _build_strategy_record(
+            symbol,
+            as_of,
+            f"The record shows no comparable {target_display}% drop for {symbol} to "
+            "point to. That doesn't change the plan — broad, steady index investing "
+            "has recovered from past drops given time.",
+            reason="no_band_match",
+            hypothetical_drawdown=hypothetical_drawdown,
+        )
+
+    # A hypothetical query has no live drawdown; carry the target as the context
+    # magnitude so ``initial_drawdown_pct`` reflects the queried size, and 0 velocity.
+    current = {
+        "magnitude": hypothetical_drawdown,
+        "velocity": Decimal("0"),
+    }
+    return _build_event_precedent_record(
+        symbol,
+        as_of,
+        current,
+        matches,
+        hypothetical_drawdown=hypothetical_drawdown,
+    )

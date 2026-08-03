@@ -19,6 +19,8 @@ is Epic 4. This is one endpoint over the existing engine.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,6 +55,7 @@ class RecoveryPrecedentOut(BaseModel):
 @router.get("/recovery", response_model=RecoveryPrecedentOut)
 async def recovery_precedent(
     symbol: str = Query(default=DEFAULT_BENCHMARK, min_length=1, max_length=32),
+    drawdown: Decimal | None = Query(default=None, gt=0, le=Decimal("0.90")),
     scope: Scope = Depends(get_scope),
     session: AsyncSession = Depends(get_async_session),
 ) -> RecoveryPrecedentOut:
@@ -64,8 +67,16 @@ async def recovery_precedent(
     (AD-4). Never a dead end, never an empty body. The ``scope`` dependency is
     the auth gate (401 for an unauthenticated request); precedent itself is not
     per-user data, so ``scope`` is not used to filter the query.
+
+    ``drawdown`` (optional, Story 3.6) mirrors the contextualizer's hypothetical
+    param: when present (``0 < drawdown <= 0.90``, else a calm 422) the record is
+    an explicitly-hypothetical precedent centred on that target magnitude rather
+    than the live drawdown; when absent the current-conditions behavior is
+    unchanged. The top-level ``RecoveryPrecedentOut`` shape is identical either way.
     """
-    records = await find_precedent(session, symbol=symbol)
+    records = await find_precedent(
+        session, symbol=symbol, hypothetical_drawdown=drawdown
+    )
     return RecoveryPrecedentOut(**records[0].to_dict())
 
 
@@ -78,10 +89,18 @@ class ContextualizeIn(BaseModel):
     a clean seam for a future event-taxonomy enrichment. ``symbol`` mirrors the
     ``/recovery`` bounded global-reference lookup so tests can seed a throwaway
     symbol; the frontend omits ``symbol`` and relies on this server default.
+
+    ``drawdown`` (optional, Story 3.6, FR20) is a HYPOTHETICAL target magnitude —
+    "what if it fell about X%?". When present (``0 < drawdown <= 0.90``) it drives
+    a hypothetical, explicitly-framed precedent match at that magnitude (never a
+    prediction); when absent the current-conditions behavior is unchanged. Unlike
+    the inert ``headline``, ``drawdown`` is a NUMBER that legitimately drives the
+    match — the headline text still classifies nothing. Out-of-range → calm 422.
     """
 
     headline: str = Field(min_length=1, max_length=500)
     symbol: str = Field(default=DEFAULT_BENCHMARK, min_length=1, max_length=32)
+    drawdown: Decimal | None = Field(default=None, gt=0, le=Decimal("0.90"))
 
 
 @router.post("/contextualize", response_model=RecoveryPrecedentOut)
@@ -104,8 +123,16 @@ async def contextualize(
     is a later enrichment. The ``scope`` dependency is the auth gate (401 for an
     unauthenticated request); precedent is global reference data, so ``scope``
     does not filter the query.
+
+    When ``body.drawdown`` is present the response is an explicitly HYPOTHETICAL
+    precedent centred on that target magnitude ("if it fell about X%"), still
+    computed entirely by the engine (AD-1/AD-3); it is bounded ``0 < drawdown <=
+    0.90`` at the model, so an out-of-range value is a calm 422 (never reaches
+    here). The ``drawdown`` number — not the inert headline — drives the match.
     """
-    records = await find_precedent(session, symbol=body.symbol)
+    records = await find_precedent(
+        session, symbol=body.symbol, hypothetical_drawdown=body.drawdown
+    )
     return RecoveryPrecedentOut(**records[0].to_dict())
 
 

@@ -33,6 +33,23 @@ const FRAMING =
   "Ballast doesn't weigh in on the news itself — here's what the market has " +
   'actually done in drops like today’s.'
 
+// Framing for a HYPOTHETICAL scenario (Story 3.6, FR20). Still non-judging and
+// never a prediction — it names the queried size and points to the base rate.
+const HYPOTHETICAL_FRAMING =
+  "This isn't a forecast — here's what the record shows for drops of that size."
+
+// The calm scenario options (Story 3.6). Each carries a `drawdown` fraction the
+// backend uses to centre a HYPOTHETICAL magnitude match. Framed as a neutral
+// "want to see a bigger drop?" choice — never a fear nudge, never urgency.
+// `null` is the default: current conditions, no hypothetical.
+const SCENARIOS = [
+  { key: 'current', label: 'Right now', drawdown: null },
+  { key: 'dip', label: 'A dip ~5%', drawdown: 0.05 },
+  { key: 'correction', label: 'A correction ~10%', drawdown: 0.1 },
+  { key: 'bear', label: 'A bear market ~20%', drawdown: 0.2 },
+  { key: 'crash', label: 'A crash ~35%', drawdown: 0.35 },
+]
+
 // Calm static fallback on transport failure (non-2xx / network error). Reads
 // like the strategy default — reassuring, plan-focused, never an error dump.
 const FETCH_FALLBACK = {
@@ -47,6 +64,9 @@ export function HeadlineContextualizer() {
   const [headline, setHeadline] = useState('')
   const [status, setStatus] = useState('idle') // idle | submitting | ready | failed
   const [record, setRecord] = useState(null)
+  // Which scenario the result reflects — kept so the framing can name the
+  // hypothetical size. `null` (default) = current conditions.
+  const [scenario, setScenario] = useState(null)
 
   // Guard against a response resolving after the component unmounts (a submit
   // in flight when the user navigates away), which would setState on an
@@ -63,15 +83,19 @@ export function HeadlineContextualizer() {
   const inFlight = status === 'submitting'
   const submitDisabled = trimmedEmpty || inFlight
 
-  async function onSubmit(event) {
-    event.preventDefault()
-    if (submitDisabled) return
+  // The single fetch path, shared by the headline submit and the scenario
+  // chips. `drawdown` (a number) drives a HYPOTHETICAL match when set; when
+  // null the body is exactly `{ headline }` (current-conditions default).
+  async function fetchPrecedent(drawdown) {
+    if (trimmedEmpty) return
     setStatus('submitting')
+    setScenario(drawdown)
+    const body = drawdown == null ? { headline } : { headline, drawdown }
     try {
       const res = await apiFetch('/api/precedent/contextualize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ headline }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
@@ -83,6 +107,12 @@ export function HeadlineContextualizer() {
       if (!mounted.current) return
       setStatus('failed')
     }
+  }
+
+  async function onSubmit(event) {
+    event.preventDefault()
+    if (submitDisabled) return
+    await fetchPrecedent(null)
   }
 
   return (
@@ -110,6 +140,30 @@ export function HeadlineContextualizer() {
         >
           {inFlight ? 'Looking back…' : 'Show me the precedent'}
         </button>
+
+        <div
+          className="ballast-headline__scenarios"
+          role="group"
+          aria-label="Want to see what history shows for a bigger drop?"
+          data-testid="headline-scenarios"
+        >
+          <span className="ballast-headline__scenarios-label">
+            Or see what the record shows for a bigger drop:
+          </span>
+          {SCENARIOS.map((s) => (
+            <button
+              key={s.key}
+              type="button"
+              className="ballast-headline__chip"
+              data-testid={`headline-scenario-${s.key}`}
+              disabled={trimmedEmpty || inFlight}
+              aria-pressed={status === 'ready' && scenario === s.drawdown}
+              onClick={() => fetchPrecedent(s.drawdown)}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
       </form>
 
       {status === 'submitting' ? (
@@ -121,7 +175,7 @@ export function HeadlineContextualizer() {
       {status === 'ready' ? (
         <div className="ballast-headline__result" data-testid="headline-result">
           <p className="ballast-headline__framing" data-testid="headline-framing">
-            {FRAMING}
+            {scenario == null ? FRAMING : HYPOTHETICAL_FRAMING}
           </p>
           <PrecedentEvidence record={record} idPrefix="headline-precedent" />
         </div>

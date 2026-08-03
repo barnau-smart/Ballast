@@ -35,6 +35,7 @@ SYM_ONEBAR = "TEST_PREC_ONEBAR"
 SYM_DETERM = "TEST_PREC_DETERM"
 SYM_MULTI = "TEST_PREC_MULTI"
 SYM_DEFAULT = "TEST_PREC_DEFAULT"
+SYM_HYPO = "TEST_PREC_HYPO"
 
 ALL_TEST_SYMBOLS = [
     SYM_QUALIFY,
@@ -45,6 +46,7 @@ ALL_TEST_SYMBOLS = [
     SYM_DETERM,
     SYM_MULTI,
     SYM_DEFAULT,
+    SYM_HYPO,
 ]
 
 BASE_DAY = date(2015, 1, 1)
@@ -518,3 +520,211 @@ async def test_forward_return_median_over_multiple_windows_is_decimal():
         assert median == min(fwds)
     finally:
         _clean([SYM_MULTI])
+
+
+# --- Hypothetical-drawdown precedent (Story 3.6, FR20) -----------------------
+
+
+def _hypo_closes() -> list[Decimal]:
+    """A crafted series with a DEEP ~35% historical episode + shallow current drop.
+
+    Episode: peak 100 (idx0) → trough 65 (idx1, 35% drawdown) → recover 100 (idx2),
+    followed by a long monotonic climb so the trough has a full 252-bar forward
+    window (a positive forward return). The tail sits only ~1% below its running
+    peak, so the LIVE current-drawdown path would find NO deep precedent — only a
+    hypothetical query centred on 35% surfaces the deep episode.
+    """
+    closes = [
+        Decimal("100"),  # peak, idx0
+        Decimal("65"),   # trough, idx1 (35% drawdown)
+        Decimal("100"),  # recovery, idx2
+    ]
+    for v in range(101, 361):  # 101..360 monotonic — full forward window
+        closes.append(Decimal(v))
+    closes.append(Decimal("356.40"))  # current: ~1% below 360 (shallow)
+    return closes
+
+
+@pytest.mark.asyncio
+async def test_hypothetical_surfaces_deep_episode_bypassing_current():
+    """A 35% hypothetical target surfaces the deep episode even near an all-time high."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    try:
+        async with async_session_maker() as session:
+            rec = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.35")
+                )
+            )[0]
+        assert rec.kind is EvidenceKind.EVENT_PRECEDENT
+        stats = rec.stats
+        # Additive hypothetical keys — the six TOP-LEVEL fields are unchanged.
+        assert stats["hypothetical"] is True
+        assert stats["hypothetical_drawdown_pct"] == Decimal("0.3500")
+        # Context magnitude reflects the QUERIED target, not the live ~1% drop.
+        assert stats["initial_drawdown_pct"] == Decimal("0.3500")
+        assert stats["instance_count"] == 1
+        assert len(stats["windows"]) == 1
+        w = stats["windows"][0]
+        assert w["drawdown_pct"] == Decimal("0.3500")
+        assert w["recovered"] is True
+        # Honestly framed as hypothetical, never a prediction.
+        assert rec.statement.startswith(f"If {SYM_HYPO} fell about 35%")
+        assert "the record shows" in rec.statement
+        assert "isn't a prediction" in rec.statement
+        # Six-field AD-12 shape preserved.
+        assert set(rec.to_dict().keys()) == {
+            "id",
+            "kind",
+            "statement",
+            "stats",
+            "source",
+            "as_of",
+        }
+    finally:
+        _clean([SYM_HYPO])
+
+
+@pytest.mark.asyncio
+async def test_hypothetical_no_band_match_degrades_to_strategy():
+    """A hypothetical target with no comparable episode → strategy default (never empty)."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    try:
+        async with async_session_maker() as session:
+            # 70% has no comparable historical drop for this symbol.
+            rec = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.70")
+                )
+            )[0]
+        assert rec.kind is EvidenceKind.STRATEGY
+        assert rec.stats["reason"] == "no_band_match"
+        assert rec.stats["windows"] == []
+        # The target is encoded so the id is stable + distinct from a live no-match.
+        assert rec.stats["hypothetical"] is True
+        assert rec.stats["hypothetical_drawdown_pct"] == Decimal("0.7000")
+        assert rec.statement  # never empty
+    finally:
+        _clean([SYM_HYPO])
+
+
+@pytest.mark.asyncio
+async def test_hypothetical_sub_one_percent_target_never_reads_zero():
+    """A valid but tiny target (validator only requires >0) must not read "about 0%".
+
+    The whole-percent friendly band would round a 0.5% target to 0; the display
+    falls back to one decimal so the honesty copy stays sensible ("about 0.5%").
+    """
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    try:
+        async with async_session_maker() as session:
+            rec = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.005")
+                )
+            )[0]
+        # Whichever path (matched or strategy no-band-match), the copy names the
+        # real sub-1% target — never the nonsensical rounded-to-zero "0%".
+        assert "0.5%" in rec.statement
+        assert "about 0%" not in rec.statement
+        assert " 0% " not in rec.statement
+    finally:
+        _clean([SYM_HYPO])
+
+
+@pytest.mark.asyncio
+async def test_hypothetical_is_byte_stable_across_runs():
+    """Identical hypothetical queries yield an identical id (deterministic)."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    try:
+        async with async_session_maker() as session:
+            a = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.35")
+                )
+            )[0]
+        async with async_session_maker() as session:
+            b = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.35")
+                )
+            )[0]
+        assert a.id == b.id
+        assert a.to_dict() == b.to_dict()
+        # A DIFFERENT target gives a distinct id (the magnitude is in the hash).
+        async with async_session_maker() as session:
+            other = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.36")
+                )
+            )[0]
+        assert other.id != a.id
+    finally:
+        _clean([SYM_HYPO])
+
+
+@pytest.mark.asyncio
+async def test_absent_hypothetical_is_unchanged_from_live_path():
+    """`hypothetical_drawdown=None` is byte-identical to the default call."""
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _hypo_closes())
+    try:
+        async with async_session_maker() as session:
+            default = (await find_precedent(session, SYM_HYPO))[0]
+        async with async_session_maker() as session:
+            explicit_none = (
+                await find_precedent(session, SYM_HYPO, hypothetical_drawdown=None)
+            )[0]
+        assert default.to_dict() == explicit_none.to_dict()
+        # And the live path never carries the hypothetical keys.
+        assert "hypothetical" not in default.stats
+    finally:
+        _clean([SYM_HYPO])
+
+
+def _current_drop_closes() -> list[Decimal]:
+    """A completed ~20% historical episode + a CURRENT, in-progress ~20% drop.
+
+    Episode 1: peak 100 → trough 80 (20%) → recover 100. Then a monotonic climb to
+    150, followed by a fall to 120 that never recovers — the symbol is presently
+    ~20% below its running peak (150). A 20% hypothetical query lands both episodes
+    in the band, so it pins that the live, unrecovered present drop is EXCLUDED
+    (only genuine history counts "on record").
+    """
+    closes = [Decimal("100"), Decimal("80"), Decimal("100")]
+    for v in range(101, 151):  # 101..150 monotonic climb to a new peak
+        closes.append(Decimal(v))
+    closes.append(Decimal("120"))  # current: 20% below the 150 peak, unrecovered
+    return closes
+
+
+@pytest.mark.asyncio
+async def test_hypothetical_excludes_current_in_progress_drop():
+    """The symbol's live drawdown is not counted as a comparable drop "on record".
+
+    Mirrors the live path's current-episode exclusion: a 20% hypothetical query on a
+    symbol presently ~20% down must surface ONLY the completed historical 20%
+    episode, never the in-progress (unrecovered) present drop.
+    """
+    _clean([SYM_HYPO])
+    _insert_series(SYM_HYPO, _current_drop_closes())
+    try:
+        async with async_session_maker() as session:
+            rec = (
+                await find_precedent(
+                    session, SYM_HYPO, hypothetical_drawdown=Decimal("0.20")
+                )
+            )[0]
+        assert rec.kind is EvidenceKind.EVENT_PRECEDENT
+        # Only the completed historical episode — the current in-progress drop of the
+        # same magnitude is excluded, so instance_count stays 1 and every matched
+        # window is a recovered, genuinely-past episode.
+        assert rec.stats["instance_count"] == 1
+        assert len(rec.stats["windows"]) == 1
+        assert rec.stats["windows"][0]["recovered"] is True
+    finally:
+        _clean([SYM_HYPO])
