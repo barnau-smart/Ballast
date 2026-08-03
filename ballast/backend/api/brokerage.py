@@ -143,6 +143,12 @@ class AuthorizeResponse(BaseModel):
     # Echoes back the validated in-app path to resume at after re-auth (or None
     # if none/invalid was supplied). NEVER an external URL (see sanitize).
     return_to: str | None = None
+    # Which broker adapter minted the URL. The real (schwab) flow hands the
+    # browser off to an external authorize page; the fake/dev adapter has NO
+    # such page (its authorization_url is a non-navigable stub), so the client
+    # completes the link in-app against /callback instead. Additive; older
+    # clients ignore it.
+    provider: str | None = None
 
 
 class CallbackRequest(BaseModel):
@@ -198,7 +204,10 @@ async def authorize(
     safe_return_to = sanitize_return_to(return_to)
     logger.info("brokerage_authorize_issued user_id=%s", scope.user_id)
     return AuthorizeResponse(
-        authorization_url=url, state=state, return_to=safe_return_to
+        authorization_url=url,
+        state=state,
+        return_to=safe_return_to,
+        provider=getattr(broker, "provider", None),
     )
 
 

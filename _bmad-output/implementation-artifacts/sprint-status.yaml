@@ -63,6 +63,7 @@ development_status:
   2-3-import-cache-portfolio-single-writer-projection: done
   2-4-plain-english-portfolio-dashboard: done
   2-5-index-core-mapping: done
+  2-6-fake-broker-browser-link: done  # dev/demo: Connect Schwab completes in-app in fake mode (added 2026-08-03); real flow unchanged
   epic-2-retrospective: optional
 
   # Epic 3: See the Record (Precedent Engine + Calming Views)

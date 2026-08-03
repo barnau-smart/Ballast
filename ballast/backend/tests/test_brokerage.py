@@ -321,6 +321,9 @@ def test_full_fake_link_flow(client):
         state = body["state"]
         assert state
         assert state in body["authorization_url"]
+        # The broker that minted the URL (fake) — lets the SPA complete the link
+        # in-app instead of navigating to the fake adapter's stub authorize page.
+        assert body["provider"] == "fake"
 
         # 3. callback: exchange code + store tokens.
         cb = client.post(

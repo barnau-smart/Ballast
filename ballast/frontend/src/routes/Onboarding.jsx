@@ -35,8 +35,20 @@ export function Onboarding() {
       const res = await apiFetch('/api/brokerage/authorize')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      // Hand off to the brokerage's authorization page (fake or real).
-      if (data.authorization_url) {
+      if (data.provider === 'fake') {
+        // The fake/dev broker has no external authorize page — its
+        // authorization_url is a non-navigable stub. Complete the link in-app
+        // by posting the signed state straight to the callback (the fake
+        // adapter auto-approves any code), then refresh status → connected.
+        const cb = await apiFetch('/api/brokerage/callback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: 'fake-auth-code', state: data.state }),
+        })
+        if (!cb.ok) throw new Error(`HTTP ${cb.status}`)
+        await loadStatus()
+      } else if (data.authorization_url) {
+        // Real broker: hand off to the external authorization page.
         window.location.assign(data.authorization_url)
       }
     } catch {

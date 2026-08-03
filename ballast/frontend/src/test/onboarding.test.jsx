@@ -133,4 +133,58 @@ describe('Onboarding — Schwab link (Story 2.1)', () => {
       ).toBeInTheDocument(),
     )
   })
+
+  it('fake provider: completes the link in-app (no external redirect)', async () => {
+    let linked = false
+    const fetchMock = vi.fn((path, opts) => {
+      const p = String(path)
+      if (p.includes('/api/brokerage/status')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ linked, provider: linked ? 'fake' : null }),
+        })
+      }
+      if (p.includes('/api/brokerage/authorize')) {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              authorization_url: 'https://fake-broker.ballast.local/oauth/authorize?state=abc',
+              state: 'abc',
+              provider: 'fake',
+            }),
+        })
+      }
+      if (p.includes('/api/brokerage/callback')) {
+        linked = true // the fake adapter auto-approves; next status is linked
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ linked: true }) })
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${p}`))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const assign = vi.fn()
+    vi.stubGlobal('location', { ...window.location, assign })
+
+    renderOnboarding()
+    await waitFor(() =>
+      expect(screen.getByText(/isn.t connected yet/i)).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByRole('button', { name: /connect schwab/i }))
+
+    // Ends connected, WITHOUT any external navigation.
+    await waitFor(() =>
+      expect(
+        screen.getByText(/your schwab account is connected/i),
+      ).toBeInTheDocument(),
+    )
+    expect(assign).not.toHaveBeenCalled()
+
+    // The callback was posted with the signed state from /authorize.
+    const cbCall = fetchMock.mock.calls.find((c) =>
+      String(c[0]).includes('/api/brokerage/callback'),
+    )
+    expect(cbCall).toBeTruthy()
+    expect(cbCall[1].method).toBe('POST')
+    expect(JSON.parse(cbCall[1].body).state).toBe('abc')
+  })
 })
