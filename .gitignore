@@ -24,3 +24,7 @@ _bmad/
 .env
 **/.env
 !**/.env.example
+# Pre-flight harness redacted shape captures (Story 7.6) — kept local-only even
+# though they carry no leaf values (type names + array lengths only).
+preflight-captures/
+**/preflight-captures/

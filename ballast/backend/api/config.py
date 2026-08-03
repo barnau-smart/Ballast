@@ -141,6 +141,17 @@ class Settings(BaseSettings):
     # than this. Cosigned (on-the-record) rows are immutable and never pruned.
     DECISION_PROPOSED_RETENTION_DAYS: int = 30
 
+    # --- Live pre-flight harness / Story 7.6 ---------------------------------
+
+    # Directory the read-only pre-flight payload-shape harness writes redacted
+    # SHAPE SKELETONS to. Empty (the default) = OFF: every capture tap in the
+    # adapters is a passive no-op — nothing is reduced, nothing is written, and
+    # adapter parse/mapping behavior is byte-for-byte unchanged. Set to a local
+    # directory ONLY for a credential-gated manual pre-flight run; the captures
+    # are redacted (type names + array lengths, never leaf values) but are still
+    # kept local-only via .gitignore. Mirrors the ``*_ADAPTER`` opt-in pattern.
+    PREFLIGHT_CAPTURE_DIR: str = ""
+
     @property
     def cors_origins(self) -> list[str]:
         """Parse CORS_ALLOWED_ORIGINS into a clean list."""

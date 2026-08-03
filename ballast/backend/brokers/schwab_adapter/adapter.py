@@ -192,6 +192,26 @@ class SchwabAdapter(BrokerPort):
             )
         return self._to_broker_tokens(token)
 
+    @staticmethod
+    def _preflight_capture(seam: str, payload) -> None:
+        """Passive pre-flight shape capture (Story 7.6) — a NO-OP unless enabled.
+
+        Guarded so that when ``PREFLIGHT_CAPTURE_DIR`` is empty (the default) this
+        does NOTHING and constructs NOTHING: it checks the env flag FIRST (a cheap
+        ``os.environ`` read — the app's ``get_settings()`` is intentionally
+        uncached, so building a ``Settings`` on every parse would be real
+        hot-path overhead), and only then imports the helper, builds settings, and
+        reduces/serializes. So the OFF path leaves adapter behavior byte-for-byte
+        unchanged with zero added work.
+        """
+        import os
+
+        if not os.environ.get("PREFLIGHT_CAPTURE_DIR", ""):
+            return
+        from preflight.capture import capture
+
+        capture(get_settings(), seam, payload)
+
     def fetch_portfolio(self) -> PortfolioSnapshot:
         """Fetch the account's holdings + cash from Schwab (network call, Story 6.5).
 
@@ -232,6 +252,9 @@ class SchwabAdapter(BrokerPort):
                     f"Schwab account read failed (status {resp.status_code})."
                 )
             body = resp.json()
+            # Passive pre-flight tap (Story 7.6): capture the RAW account body's
+            # shape (redacted) only when capture is enabled; no-op when OFF.
+            self._preflight_capture("portfolio", body)
             if not isinstance(body, dict):
                 raise SchwabReadError("Schwab account body is not an object.")
             acct = body.get("securitiesAccount")
@@ -642,6 +665,9 @@ class SchwabAdapter(BrokerPort):
         if self._account_hash_cache is None:
             resp = client.get_account_numbers()
             accounts = resp.json()
+            # Passive pre-flight tap (Story 7.6): capture the RAW account-numbers
+            # list's shape (redacted) only when capture is enabled; no-op when OFF.
+            self._preflight_capture("account_numbers", accounts)
             if not accounts:
                 raise SchwabNotConfiguredError(
                     "Schwab returned no account for this login; cannot place an order."
@@ -724,6 +750,9 @@ class SchwabAdapter(BrokerPort):
         """
         resp = client.get_quote(symbol)
         data = resp.json() or {}
+        # Passive pre-flight tap (Story 7.6): capture the RAW quote body's shape
+        # (redacted) only when capture is enabled; no-op when OFF.
+        self._preflight_capture("quote", data)
         node = data.get(symbol) or {}
         quote = node.get("quote") or {}
         ask_raw = quote.get("askPrice")
@@ -850,6 +879,9 @@ class SchwabAdapter(BrokerPort):
     @staticmethod
     def _to_broker_tokens(token: dict) -> BrokerTokens:
         """Normalise schwab-py's token dict into :class:`BrokerTokens`."""
+        # Passive pre-flight tap (Story 7.6): capture the RAW token dict's shape
+        # (redacted) only when capture is enabled; a true no-op when OFF.
+        SchwabAdapter._preflight_capture("token", token)
         access = token.get("access_token", "")
         refresh = token.get("refresh_token", "")
         # OAuth tokens carry either an absolute ``expires_at`` (epoch seconds)

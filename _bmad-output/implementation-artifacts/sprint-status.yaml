@@ -112,7 +112,7 @@ development_status:
   7-3-calm-envelopes-provider-match-live-broker: done
   7-4-llm-live-path-latency-robustness: done
   7-5-live-read-robustness-multi-account-safety: done
-  7-6-live-preflight-payload-shape-harness: ready-for-dev
+  7-6-live-preflight-payload-shape-harness: done
   7-7-gated-live-exercise-real-money: backlog
   epic-7-retrospective: optional
 

@@ -196,6 +196,21 @@ class AnthropicGateway(LLMGateway):
         ``json.JSONDecodeError``), and requires a ``dict`` root — every failure a
         typed :class:`~llm.port.LLMError` subtype. No response body is logged.
         """
+        # Passive pre-flight tap (Story 7.6): capture the RAW message's shape
+        # (stop_reason + content block types/text) — redacted — only when capture
+        # is enabled. A cheap ``os.environ`` flag check gates it FIRST so the OFF
+        # path builds NOTHING (``get_settings()`` is intentionally uncached, so
+        # constructing a ``Settings`` on every completion would be real hot-path
+        # overhead) and parse behavior stays byte-for-byte unchanged. Imported
+        # lazily so the adapter carries no import-time dependency on preflight.
+        import os as _os
+
+        _pf_on = bool(_os.environ.get("PREFLIGHT_CAPTURE_DIR", ""))
+        if _pf_on:
+            from preflight.capture import capture as _pf_capture
+
+            _pf_capture(get_settings(), "llm_message", resp)
+
         if resp.stop_reason == "refusal":
             raise LLMRefusalError("The model refused the request.")
         # Truncated / incomplete terminal reasons: a partial (or absent) body must
@@ -228,4 +243,11 @@ class AnthropicGateway(LLMGateway):
             raise LLMMalformedResponseError(
                 "The structured output root is not an object."
             )
+        # Passive pre-flight tap (Story 7.6): capture the PARSED output's shape
+        # (redacted) where RECOMMENDATION_OUTPUT_SCHEMA drift shows up — reusing
+        # the same cheap OFF-path gate as the message tap above.
+        if _pf_on:
+            from preflight.capture import capture as _pf_capture
+
+            _pf_capture(get_settings(), "llm_output", output)
         return LLMResponse(output=output, model=model, provider=self.provider)
