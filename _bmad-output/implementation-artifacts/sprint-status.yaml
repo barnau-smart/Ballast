@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-03  # Story 4.11 (live coach card) built + code-reviewed + done; Epic 4 complete again
+last_updated: 2026-08-03  # Story 3.6 (hypothetical-drawdown precedent) spec'd + ready-for-dev; Epic 3 reopened
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -67,12 +67,15 @@ development_status:
   epic-2-retrospective: optional
 
   # Epic 3: See the Record (Precedent Engine + Calming Views)
-  epic-3: done
+  # Reopened 2026-08-03: Story 3.6 adds hypothetical-drawdown precedent (FR20 enrichment)
+  # so the "big drop historically recovered" story surfaces even when the market is near a high.
+  epic-3: in-progress
   3-1-market-data-ingestion-market-daily: done
   3-2-drawdown-matching-evidence-record-contract: done
   3-3-recovery-precedent-view: done
   3-4-missed-growth-meter: done
   3-5-headline-contextualizer: done
+  3-6-hypothetical-drawdown-precedent: ready-for-dev
   epic-3-retrospective: optional
 
   # Epic 4: The Coach — Propose, Approve, Execute, Co-sign & Replay
