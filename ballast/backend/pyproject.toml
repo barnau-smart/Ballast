@@ -15,6 +15,7 @@ dependencies = [
     "cryptography",
     "schwab-py==1.5.1",
     "anthropic>=0.120,<0.121",
+    "tiingo>=0.16,<0.17",
 ]
 
 [project.optional-dependencies]
