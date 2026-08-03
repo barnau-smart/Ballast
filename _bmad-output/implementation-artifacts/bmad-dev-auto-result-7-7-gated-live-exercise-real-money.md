@@ -7,15 +7,15 @@ status: blocked
 # BMad Dev Auto Result
 
 Status: blocked
-Blocking condition: Story 7.6 is the credential- and real-money human gate — it cannot be run by the autonomous loop. It requires real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a **funded** Schwab account, places a **real order with real money** against live Schwab, and contains a **reserved product decision** (partial-fill terminality) that is MasterB's to make. Every acceptance criterion needs live real-world I/O that cannot be executed or tested offline. The loop must not fabricate live payload results or place a real trade. Handing to MasterB to run manually.
+Blocking condition (re-confirmed 2026-08-03, Story 7.6 now `done`): Story 7.7 is the credential- and real-money human gate — it cannot be run by the autonomous loop. It requires real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a **funded** Schwab account, places a **real order with real money** against live Schwab, and contains a **reserved product decision** (partial-fill terminality) that is MasterB's to make. Every acceptance criterion needs live real-world I/O that cannot be executed or tested offline. The loop must not fabricate live payload results or place a real trade. Handing to MasterB to run manually.
 
 ## Why this halts (not a failure — the designed pause point)
 
 Story 7.6's own text: *"Human pause point — not a loop task. Requires real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a funded Schwab account."* This matches the standing build mandate: run the loop autonomously, **pause only at real blockers (creds / product decisions / live trades)**. Story 7.6 is all three at once. There is no offline code deliverable to complete first — the whole story *is* the live exercise plus confirming the guessed payload shapes against what actually comes back.
 
-## Readiness check — the gate is open (7.1–7.5 landed)
+## Readiness check — the gate is fully open (7.1–7.6 all landed)
 
-All prerequisites are `done` in `sprint-status.yaml` and the code seams they harden are in place:
+All prerequisites are `done` in `sprint-status.yaml` and the code seams they harden are in place. **7.7 is now the sole remaining story in Epic 7 before retrospective:**
 
 | Story | What it guarantees for the live run | Status |
 |------|--------------------------------------|--------|
@@ -24,6 +24,9 @@ All prerequisites are `done` in `sprint-status.yaml` and the code seams they har
 | 7.3 | Calm 409 reconnect envelopes + provider-match on the live broker seams (never a raw 500) | done |
 | 7.4 | LLM client built once, tight request timeout — a hung call degrades to the default plan in seconds | done |
 | 7.5 | Off-event-loop reads + explicit multi-account selection (a taxable buy can't land in an IRA) + re-link clears projection | done |
+| 7.6 | Read-only pre-flight harness — confirms 5 of 6 guessed payload shapes (token, account-numbers, balance/positions, quote, LLM structured-output) with **zero orders** before any money moves | done |
+
+The de-risking pre-flight harness offered in the prior recommendation has since been built, reviewed, and merged (commit `5d21829`). Run **7.6's read-only live pass first** to catch payload drift on the 5 read seams, then run 7.7's single real order (which is the only way to confirm the remaining order-status/fill `_map_order` seam).
 
 Working tree is clean, on `main`. No `.env` and no real creds are present locally — confirming the gate has not been crossed.
 
