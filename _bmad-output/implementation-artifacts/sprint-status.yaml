@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-03  # Story 3.6 (hypothetical-drawdown precedent) spec'd + ready-for-dev; Epic 3 reopened
+last_updated: 2026-08-03  # Epic 3 retrospective done (3.6 shipped); Epic 3 fully closed
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -76,7 +76,7 @@ development_status:
   3-4-missed-growth-meter: done
   3-5-headline-contextualizer: done
   3-6-hypothetical-drawdown-precedent: done
-  epic-3-retrospective: optional
+  epic-3-retrospective: done
 
   # Epic 4: The Coach — Propose, Approve, Execute, Co-sign & Replay
   # Reopened 2026-08-03: the backend propose/approve (4.6) + Decisions replay UI (4.10)
@@ -170,3 +170,15 @@ action_items:
     action: "Sweep the 40-item deferred-work ledger (21 new in Epic 6) — partition into pre-go-live-spike blockers vs. exercised-and-closed-by-the-spike."
     owner: "MasterB"
     status: open
+  - epic: 3
+    action: "Fold the two Story 3.6 deferred items (live-path count pluralization 'in 1 similar drops'; HeadlineContextualizer rapid-chip stale-response race needing a per-request sequence token) into the existing Epic 6 deferred-work sweep — no separate work stream."
+    owner: "MasterB"
+    status: open
+  - epic: 3
+    action: "On 'epic done', spot-check FR intent coverage, not just AC checkboxes — recurring gap where a done epic missed its full requirement intent (Epic 3 FR20 fear-before-the-drop -> 3.6 reopen; Epic 4 coach-card centerpiece -> 4.11 reopen)."
+    owner: "MasterB"
+    status: open
+  - epic: 3
+    action: "Loop-liveness check (ps grep bmad-dev-auto / bmad_loop.cli run) before any hand-commit or marker-finalize when a bmad-loop 'seems dead'; if a session is alive, do not edit markers, commit, or start a second loop (race risk)."
+    owner: "MasterB"
+    status: done  # memory guardrail saved 2026-08-03
