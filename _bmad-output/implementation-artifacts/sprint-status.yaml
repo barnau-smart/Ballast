@@ -90,7 +90,7 @@ development_status:
   4-8-approval-placement-integrity: done
   4-9-co-signed-immutable-decision-record: done
   4-10-decisions-history-replay: done
-  4-11-live-coach-card-propose-approve-ui: ready-for-dev
+  4-11-live-coach-card-propose-approve-ui: review
   epic-4-retrospective: done
 
   # Epic 5: Weekly Digest

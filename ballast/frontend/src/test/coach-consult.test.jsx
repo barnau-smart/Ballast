@@ -1,0 +1,321 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { CoachConsult } from '../components/CoachConsult.jsx'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+// --- Fixtures ---------------------------------------------------------------
+
+const STRATEGY_RECORD = {
+  id: 'strat-abc123456789',
+  kind: 'strategy',
+  statement:
+    'Broad, steady index investing has recovered from every past drop given time.',
+  stats: { reason: 'default_plan', windows: [] },
+  source: 'ballast-strategy',
+  as_of: '2026-07-28',
+}
+
+const REC_NO_INTENT = {
+  decision_id: 'dec-no-intent-1',
+  action_label: 'Stick to your plan: make your regular contribution',
+  reasoning:
+    'When nothing special is happening, the proven move is the steady one — time in the market tends to beat timing it.',
+  evidence: [STRATEGY_RECORD],
+  uncertainties: [
+    'Markets can stay volatile longer than anyone expects; past patterns never guarantee a future outcome.',
+  ],
+  order_intent: null,
+}
+
+const REC_WITH_INTENT = {
+  ...REC_NO_INTENT,
+  decision_id: 'dec-with-intent-1',
+  action_label: 'Invest your $450 into your index core today.',
+  order_intent: { symbol: 'VOO', side: 'buy', amount: '450.00' },
+}
+
+const OUTCOME = {
+  status: 'filled',
+  filled_qty: '5',
+  avg_price: '100.00',
+  broker_ref: 'fake-order-1',
+}
+
+// A calm/never-nudge copy guard.
+const NUDGE = /you should|don'?t wait|buy the dip|act now|hurry/i
+
+// --- fetch stub: route by URL to the right canned response -------------------
+
+function respond(h) {
+  if (!h) return Promise.reject(new Error('no handler for this url'))
+  if (h.reject) return Promise.reject(new Error('network down'))
+  return Promise.resolve({
+    ok: h.ok ?? true,
+    status: h.status ?? 200,
+    json: () => Promise.resolve(h.body ?? {}),
+  })
+}
+
+function stubFetch({ recommend, approve } = {}) {
+  const fn = vi.fn((url) => {
+    const u = String(url)
+    if (u.includes('/api/coach/recommend')) return respond(recommend)
+    if (u.includes('/api/coach/approve')) return respond(approve)
+    return Promise.reject(new Error(`unexpected url: ${u}`))
+  })
+  vi.stubGlobal('fetch', fn)
+  return fn
+}
+
+function renderConsult() {
+  return render(
+    <MemoryRouter>
+      <CoachConsult />
+    </MemoryRouter>,
+  )
+}
+
+function ask(question) {
+  fireEvent.change(screen.getByTestId('coach-ask-input'), {
+    target: { value: question },
+  })
+}
+
+function setOrder({ symbol, amount, side }) {
+  if (symbol !== undefined)
+    fireEvent.change(screen.getByTestId('coach-symbol-input'), {
+      target: { value: symbol },
+    })
+  if (amount !== undefined)
+    fireEvent.change(screen.getByTestId('coach-amount-input'), {
+      target: { value: amount },
+    })
+  if (side !== undefined)
+    fireEvent.change(screen.getByTestId('coach-side-select'), {
+      target: { value: side },
+    })
+}
+
+function submitAsk() {
+  fireEvent.click(screen.getByTestId('coach-ask-submit'))
+}
+
+// --- Tests ------------------------------------------------------------------
+
+describe('CoachConsult — live propose → approve/decline', () => {
+  it('idle: renders the form, ask disabled when empty, no fetch on mount', () => {
+    const fn = stubFetch({ recommend: { body: REC_NO_INTENT } })
+    renderConsult()
+
+    expect(screen.getByTestId('coach-ask-input')).toBeInTheDocument()
+    expect(screen.getByTestId('coach-ask-submit')).toBeDisabled()
+    expect(fn).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
+  })
+
+  it('question-only + default plan → recommendation renders, NO approve control', async () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT } })
+    const { container } = renderConsult()
+
+    ask('Should I be worried about the market right now?')
+    expect(screen.getByTestId('coach-ask-submit')).toBeEnabled()
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-card')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-card-action')).toHaveTextContent(
+      /stick to your plan/i,
+    )
+    // No concrete order + null intent ⇒ no co-sign zone, honest no-trade note.
+    expect(screen.queryByTestId('coach-approve')).not.toBeInTheDocument()
+    expect(screen.getByTestId('coach-no-order')).toBeInTheDocument()
+    expect(container.textContent).not.toMatch(NUDGE)
+  })
+
+  it('concrete order + null intent → approve sends the FORM order + decision_id; outcome renders', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Should I invest my $500 paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-outcome')).toHaveTextContent(
+      /filled 5 @ 100\.00/i,
+    )
+    expect(screen.getByTestId('coach-replay-chip')).toBeInTheDocument()
+
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.decision_id).toBe('dec-no-intent-1')
+    expect(body.order_intent).toEqual({
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+    })
+  })
+
+  it("prefers the coach's blessed order_intent over the raw form", async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_WITH_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    // Question-only (no form order) — the recommendation carries the intent.
+    ask('Is now an ok time to add to my index core?')
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent).toEqual({
+      symbol: 'VOO',
+      side: 'buy',
+      amount: '450.00',
+    })
+  })
+
+  it('approve on a non-live session (409) → calm reconnect + Onboarding link, retryable', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: {
+        ok: false,
+        status: 409,
+        body: { detail: 'Reconnect your Schwab account to continue.' },
+      },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-reconnect')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-reconnect')).toHaveTextContent(
+      /reconnect your schwab account/i,
+    )
+    expect(screen.getByRole('link', { name: /reconnect schwab/i })).toHaveAttribute(
+      'href',
+      '/onboarding',
+    )
+    // Still retryable: the co-sign action stays.
+    expect(screen.getByTestId('coach-approve')).toBeInTheDocument()
+  })
+
+  it('approve refused (422) → shows the backend calm reason verbatim, nothing placed', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: {
+        ok: false,
+        status: 422,
+        body: { detail: 'That buys less than one whole share.' },
+      },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '1', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-refused')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-refused')).toHaveTextContent(
+      /less than one whole share/i,
+    )
+    expect(screen.queryByTestId('coach-outcome')).not.toBeInTheDocument()
+  })
+
+  it('"not now" declines with NO network call and dismisses the card', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-decline')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-decline'))
+
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('coach-cosign')).not.toBeInTheDocument()
+    // Only /recommend was ever called — decline never hits the broker.
+    expect(
+      fn.mock.calls.some((c) => String(c[0]).includes('/api/coach/approve')),
+    ).toBe(false)
+  })
+
+  it('recommend transport failure → calm fallback (no error dump)', async () => {
+    stubFetch({ recommend: { reject: true } })
+    const { container } = renderConsult()
+
+    ask('Anything at all')
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-recommend-failed')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-recommend-failed')).toHaveTextContent(
+      /your plan hasn.t changed/i,
+    )
+    expect(container.innerHTML).not.toMatch(/traceback|internal server error/i)
+  })
+
+  it('recommend 401 → calm sign-in prompt', async () => {
+    stubFetch({ recommend: { ok: false, status: 401, body: {} } })
+    renderConsult()
+
+    ask('Should I invest?')
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-signed-out')).toBeInTheDocument(),
+    )
+    expect(screen.getByRole('link', { name: /sign in/i })).toHaveAttribute(
+      'href',
+      '/auth',
+    )
+  })
+})

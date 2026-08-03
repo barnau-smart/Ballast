@@ -1,3 +1,4 @@
+import { CoachConsult } from '../components/CoachConsult.jsx'
 import { RecoveryPrecedent } from '../components/RecoveryPrecedent.jsx'
 import { HeadlineContextualizer } from '../components/HeadlineContextualizer.jsx'
 import './screen.css'
@@ -11,6 +12,7 @@ export function Coach() {
         A calm, plain-spoken guide. Ask a question and think out loud — no
         jargon, no pressure.
       </p>
+      <CoachConsult />
       <RecoveryPrecedent />
       <HeadlineContextualizer />
     </section>

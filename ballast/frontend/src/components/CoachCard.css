@@ -1,0 +1,75 @@
+/*
+ * Live coach card (Story 4.11). The calm decision surface — green terminal
+ * chrome, soft-white prose for the "why". A LOSS/market value is NEVER rendered
+ * red/pink here (direction color comes only from the shared PrecedentEvidence
+ * block via MarketIndicator: up = phosphor green, down = sky-blue). Brand-red is
+ * reserved for the co-sign ACTION, which lives in CoachConsult, not this card.
+ * All values reference --ballast-* design tokens (no raw hex/px — stylelint).
+ */
+
+.ballast-coach-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-24);
+}
+
+.ballast-coach-card__termbar {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-phosphor-dim);
+  margin: 0;
+}
+
+.ballast-coach-card__ask {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  font-style: italic;
+  color: var(--ballast-color-muted);
+  border-left-style: solid;
+  border-left-width: var(--ballast-space-4);
+  border-left-color: var(--ballast-color-line);
+  padding-left: var(--ballast-space-12);
+  margin: 0;
+}
+
+.ballast-coach-card__rec {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-lg);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-coach-card__prompt {
+  font-family: var(--ballast-font-terminal);
+  color: var(--ballast-color-phosphor);
+}
+
+.ballast-coach-card__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-coach-card__key {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  letter-spacing: var(--ballast-space-4);
+  color: var(--ballast-color-phosphor);
+  margin: 0;
+}
+
+.ballast-coach-card__reasoning {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}

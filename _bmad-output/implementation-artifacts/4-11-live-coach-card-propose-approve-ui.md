@@ -1,6 +1,6 @@
 # Story 4.11: Live coach card — propose → approve/decline in the SPA
 
-Status: ready-for-dev
+Status: review
 
 <!-- Completes Epic 4's unbuilt centerpiece. Frontend-only; backend propose/approve shipped in 4.6. -->
 
@@ -78,8 +78,26 @@ The order approved is the **user's stated order** (`recommendation.order_intent 
 
 ### Agent Model Used
 
+claude-opus-4-8[1m]
+
 ### Debug Log References
+
+- Initial `npm test`: parse error in `CoachCard.jsx` — a JSDoc line contained `**//`, whose embedded `*/` closed the block comment early. Fixed by rewriting the comment as plain prose.
+- Second `npm test`: one self-inflicted test-guard failure — a `/…|500/` regex matched the `$500` in a placeholder, not a real error dump. Tightened to `/traceback|internal server error/i`.
 
 ### Completion Notes List
 
+- Built the live coach card to `mockups/coach-card.html`: termbar → echoed question → `>` action_label → why → precedent (shared `PrecedentEvidence`) → uncertainty (shared `UncertaintyCallout`) → dashed co-sign zone (Approve & Co-sign + "not now") → replay chip.
+- Approve sends the user's stated order (`recommendation.order_intent ?? form values`) + `decision_id`; amount as a decimal string. 409 → calm reconnect + Onboarding link (retryable); 422 → backend `detail` verbatim; 401 → sign-in prompt; recommend transport failure → calm fallback. Question-only (no concrete order) → guidance only, no approve control. "not now" makes no network call and dismisses the card.
+- Brand-red used ONLY on the co-sign action + the dashed `--ballast-color-line-red` divider; outcome/loss values are calm terminal text (never red). All CSS via `--ballast-*` tokens (stylelint clean).
+- Verification: `npm test` → 76 passed (13 files, incl. new `coach-consult.test.jsx` covering every I/O row); `npm run lint:css` → clean. Frontend-only; no backend/`sprint-status`/`_bmad-output` code touched by the implementation.
+- NOT yet done: independent code review + live manual run against the fake-adapter stack (servers up). Status set to `review`.
+
 ### File List
+
+- `ballast/frontend/src/components/CoachConsult.jsx` (new) — form + recommend/approve orchestration + co-sign zone + outcome + degraded states.
+- `ballast/frontend/src/components/CoachConsult.css` (new)
+- `ballast/frontend/src/components/CoachCard.jsx` (new) — presentation of a live recommendation via the shared components.
+- `ballast/frontend/src/components/CoachCard.css` (new)
+- `ballast/frontend/src/routes/Coach.jsx` (edit) — mount `<CoachConsult />` above the reference views.
+- `ballast/frontend/src/test/coach-consult.test.jsx` (new) — I/O-matrix coverage.

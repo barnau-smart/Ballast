@@ -1,0 +1,162 @@
+/*
+ * Live coach consult (Story 4.11). The ask form + co-sign zone + outcome.
+ * Brand-red is used ONLY for the primary co-sign ACTION (the one rare place red
+ * is allowed — brand punctuation); the dashed co-sign divider uses the tinted
+ * --ballast-color-line-red, matching the replay's signature. A LOSS/outcome
+ * value is NEVER red/pink — the outcome line is calm terminal text. All values
+ * reference --ballast-* design tokens (no raw hex/px — stylelint enforced).
+ */
+
+.ballast-consult {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-consult__form {
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-consult__order {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-consult__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+  flex: 1 1 auto;
+}
+
+.ballast-consult__note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-consult__link {
+  color: var(--ballast-color-phosphor);
+}
+
+.ballast-consult__result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-consult__cosign {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  border-style: dashed;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line-red);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-consult__cosign-note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-accent-pink);
+  margin: 0;
+}
+
+.ballast-consult__cosign-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: var(--ballast-space-12);
+  align-items: center;
+}
+
+.ballast-consult__approve {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  letter-spacing: var(--ballast-space-4);
+  color: var(--ballast-color-text);
+  background-color: var(--ballast-color-brand-red-deep);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-brand-red);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-20);
+  cursor: pointer;
+}
+
+.ballast-consult__approve:disabled {
+  background-color: var(--ballast-color-surface-2);
+  border-color: var(--ballast-color-line);
+  color: var(--ballast-color-muted);
+  cursor: default;
+}
+
+.ballast-consult__decline {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  letter-spacing: var(--ballast-space-4);
+  color: var(--ballast-color-phosphor);
+  background-color: transparent;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-20);
+  cursor: pointer;
+}
+
+.ballast-consult__approve:focus-visible,
+.ballast-consult__decline:focus-visible {
+  outline-style: solid;
+  outline-width: var(--ballast-space-4);
+  outline-color: var(--ballast-color-phosphor);
+}
+
+.ballast-consult__cosign-msg {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-consult__outcome {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-consult__outcome-line {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-consult__chip {
+  align-self: flex-start;
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-accent-pink);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-accent-pink);
+  border-radius: var(--ballast-radius-pill);
+  padding: var(--ballast-space-4) var(--ballast-space-12);
+  margin: 0;
+}
