@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-03  # Epic 4 reopened; Story 4.11 (live coach card propose/approve UI) created ready-for-dev to complete the unbuilt centerpiece surface
+last_updated: 2026-08-03  # Story 4.11 (live coach card) built + code-reviewed + done; Epic 4 complete again
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -78,8 +78,8 @@ development_status:
   # Reopened 2026-08-03: the backend propose/approve (4.6) + Decisions replay UI (4.10)
   # shipped, but the live Coach card (ask -> recommendation -> Approve & Co-sign / decline)
   # -- the UX "emotional centerpiece" (EXPERIENCE.md / mockups/coach-card.html) -- was never
-  # built in the SPA. Story 4.11 completes it. See action_items (epic 4).
-  epic-4: in-progress
+  # built in the SPA. Story 4.11 completed it (2026-08-03, reviewed). See action_items (epic 4).
+  epic-4: done
   4-1-llm-gateway: done
   4-2-recommendation-object-validation-gate: done
   4-3-coach-pipeline-default-plan-fallback: done
@@ -90,7 +90,7 @@ development_status:
   4-8-approval-placement-integrity: done
   4-9-co-signed-immutable-decision-record: done
   4-10-decisions-history-replay: done
-  4-11-live-coach-card-propose-approve-ui: review
+  4-11-live-coach-card-propose-approve-ui: done
   epic-4-retrospective: done
 
   # Epic 5: Weekly Digest
@@ -125,7 +125,7 @@ action_items:
   - epic: 4
     action: "Epic 4 shipped 'done' without its UX centerpiece: the live Coach card (ask -> recommendation -> Approve & Co-sign / 'not now' decline) was never built in the SPA — only the backend propose/approve (4.6) and the Decisions replay UI (4.10). The planned surface exists in the UX (EXPERIENCE.md 'emotional centerpiece', DESIGN.md, mockups/coach-card.html) but has no frontend. Reopened Epic 4 + created Story 4.11 to complete it. Consider a brief course-correction/retro note on how a 'done' epic missed its centerpiece screen."
     owner: "MasterB"
-    status: in-progress  # Story 4.11 created ready-for-dev 2026-08-03
+    status: done  # Story 4.11 built + reviewed 2026-08-03; the centerpiece coach card now ships
   - epic: 4
     action: "Atomicity hardening pass: atomic proposed->cosigning->cosigned decision claim + stable persisted per-decision idempotency key + DB unique index on idempotency_key; fold the 5.1 digest double-send guard into the same pass (one root cause). Blocks real-broker wiring."
     owner: "MasterB"

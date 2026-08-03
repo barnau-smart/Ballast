@@ -318,4 +318,201 @@ describe('CoachConsult — live propose → approve/decline', () => {
       '/auth',
     )
   })
+
+  it('editing the form after a recommendation invalidates the card (no stale co-sign)', async () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT }, approve: { body: OUTCOME } })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    // Change the amount — the shown recommendation no longer matches.
+    setOrder({ amount: '600' })
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('coach-cosign')).not.toBeInTheDocument()
+  })
+
+  it('a malformed amount (1e3) is not a concrete order → no approve control', async () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT } })
+    renderConsult()
+
+    ask('Should I buy?')
+    setOrder({ symbol: 'VTI', amount: '1e3', side: 'buy' })
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-card')).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('coach-approve')).not.toBeInTheDocument()
+    expect(screen.getByTestId('coach-no-order')).toBeInTheDocument()
+  })
+
+  it('a recommendation missing decision_id shows no co-sign control', async () => {
+    stubFetch({
+      recommend: { body: { ...REC_WITH_INTENT, decision_id: undefined } },
+    })
+    renderConsult()
+
+    ask('Add to my core?')
+    submitAsk()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-card')).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('coach-approve')).not.toBeInTheDocument()
+  })
+
+  it('approve 401 (session ended) → sign-in prompt, not a generic retry', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { ok: false, status: 401, body: {} },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve-signed-out')).toBeInTheDocument(),
+    )
+  })
+
+  it('approve 500 → honest "could not confirm", never claims nothing was placed', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { ok: false, status: 500, body: {} },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-indeterminate')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-indeterminate')).toHaveTextContent(
+      /couldn.t confirm/i,
+    )
+    expect(screen.getByTestId('coach-indeterminate')).not.toHaveTextContent(
+      /nothing was placed/i,
+    )
+  })
+
+  it('409 in-progress → "give it a moment", NOT a reconnect link', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: {
+        ok: false,
+        status: 409,
+        body: {
+          detail:
+            'This decision is being approved right now — give it a moment and check your Decisions.',
+        },
+      },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-in-progress')).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('coach-reconnect')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('link', { name: /reconnect schwab/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('a rejected outcome is shown honestly — no replay promise', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: { status: 'rejected', filled_qty: '0' } },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-outcome')).toHaveTextContent(/rejected/i)
+    expect(screen.queryByTestId('coach-replay-chip')).not.toBeInTheDocument()
+  })
+
+  it('a pending outcome asks the user to check Decisions — no phantom fill', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: { status: 'pending', filled_qty: '0' } },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-outcome')).toHaveTextContent(
+      /couldn.t confirm this yet/i,
+    )
+    expect(screen.queryByTestId('coach-replay-chip')).not.toBeInTheDocument()
+  })
+
+  it('double-clicking Approve fires only ONE /approve request', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    const btn = screen.getByTestId('coach-approve')
+    fireEvent.click(btn)
+    fireEvent.click(btn) // synchronous second click, before the first resolves
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCalls = fn.mock.calls.filter((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    expect(approveCalls).toHaveLength(1)
+  })
 })

@@ -1,6 +1,6 @@
 # Story 4.11: Live coach card — propose → approve/decline in the SPA
 
-Status: review
+Status: done
 
 <!-- Completes Epic 4's unbuilt centerpiece. Frontend-only; backend propose/approve shipped in 4.6. -->
 
@@ -35,6 +35,23 @@ Epic 4 delivered the backend propose/approve endpoints (Story 4.6) and the Decis
   - [ ] `ballast/frontend/src/routes/Coach.jsx` — render `<CoachConsult />` ABOVE the existing reference views; leave them intact.
 - [ ] **Task 4 — tests** (AC: 1–6, 8)
   - [ ] `ballast/frontend/src/test/coach-consult.test.jsx` — unit-test every I/O-matrix row (mock `apiFetch`): question-only hides approve; concrete order shows it; approve success renders outcome; approve sends `order_intent = recommendation.order_intent ?? form values`; 409 reconnect + Onboarding link; 422 verbatim refusal; recommend-failure fallback; decline makes no call.
+
+### Review Findings
+
+_Code review 2026-08-03 (Blind Hunter + Edge Case Hunter + Acceptance Auditor on commit 086b3ac). 10 patch, 0 defer, 9 dismissed as noise._
+
+- [x] [Review][Patch] Editable order after blessing → co-sign a different order than shown, under a stale `decision_id` (HIGH) [CoachConsult.jsx: `orderIntent`/`question` derived from live form] — snapshot the order + question at ask time; invalidate the recommendation when the form is edited.
+- [x] [Review][Patch] Non-fill outcomes (rejected/timeout/pending) dressed as success with the "I'll replay this" chip — phantom-success (HIGH) [CoachConsult.jsx outcome block] — only filled/partial get the on-the-record/replay framing; others render honestly.
+- [x] [Review][Patch] `/approve` 401 unhandled → generic "try again" forever instead of sign-in (MED) [CoachConsult.jsx onApprove] — route 401 to the sign-in prompt like recommend does.
+- [x] [Review][Patch] Indeterminate approve failure (500/parse/network) asserts "Nothing was placed" → invites a duplicate live order (MED) [CoachConsult.jsx onApprove catch] — honest "couldn't confirm — check Decisions before retrying"; keep the pre-placement 422 as "nothing placed".
+- [x] [Review][Patch] 409 conflates reconnect (no live session) vs in-progress (concurrent approve) → wrong "Reconnect Schwab" link for in-progress (MED) [CoachConsult.jsx 409 branch] — show detail verbatim; link only for the session case.
+- [x] [Review][Patch] `amount` accepts `1e3`/`0x10`/`5.` via `Number()` and sends the raw string (MED) [CoachConsult.jsx `hasConcreteOrder`] — validate as a clean decimal string so validated == sent.
+- [x] [Review][Patch] Double-click Approve can fire two POSTs (state guard is async) (MED) [CoachConsult.jsx onApprove] — add an in-flight ref guard.
+- [x] [Review][Patch] Approve allowed with a missing `decision_id` (MED) [CoachConsult.jsx] — require `decision_id` for the co-sign control.
+- [x] [Review][Patch] Outcome/error region not announced to assistive tech (MED) [CoachConsult.jsx] — `role="status"`/`aria-live` on the result region; `aria-hidden` on decorative glyphs.
+- [x] [Review][Patch] Test gaps: non-filled outcome honesty, approve-500 indeterminate, snapshot-invalidation-on-edit, double-click guard (MED) [coach-consult.test.jsx] — add coverage.
+
+_Dismissed (9): CoachCard non-string field guard (backend contract + validation gate guarantee strings); unbounded `detail` length (backend-owned calm copy); React `key={id ?? i}` (matches DecisionReplay convention, needs malformed data); unmount-mid-request live placement (inherent; backend reconciles); decline-then-re-ask "already declined" state (not a defect); partial-order no-hint (fields labeled optional); reduced-motion/glow fidelity (theme intentionally dropped glow); whitespace-only question sent raw (harmless free text); replay-chip-pre-approval mockup nuance (post-fill placement is more honest)._
 
 ## Dev Notes
 
@@ -91,7 +108,8 @@ claude-opus-4-8[1m]
 - Approve sends the user's stated order (`recommendation.order_intent ?? form values`) + `decision_id`; amount as a decimal string. 409 → calm reconnect + Onboarding link (retryable); 422 → backend `detail` verbatim; 401 → sign-in prompt; recommend transport failure → calm fallback. Question-only (no concrete order) → guidance only, no approve control. "not now" makes no network call and dismisses the card.
 - Brand-red used ONLY on the co-sign action + the dashed `--ballast-color-line-red` divider; outcome/loss values are calm terminal text (never red). All CSS via `--ballast-*` tokens (stylelint clean).
 - Verification: `npm test` → 76 passed (13 files, incl. new `coach-consult.test.jsx` covering every I/O row); `npm run lint:css` → clean. Frontend-only; no backend/`sprint-status`/`_bmad-output` code touched by the implementation.
-- NOT yet done: independent code review + live manual run against the fake-adapter stack (servers up). Status set to `review`.
+- Code review (2026-08-03, 3 adversarial layers): all 10 patch findings fixed, 9 dismissed as noise, 0 deferred. Key fixes: snapshot the order+question at ask time and invalidate the card on edit (no co-signing a different order than shown / no stale `decision_id`); honest outcomes (only filled/partial get the replay framing; rejected/timeout/pending shown truthfully); 401→sign-in and 5xx/network→"couldn't confirm, check Decisions" (never falsely "nothing was placed"); 409 reconnect-vs-in-progress split; strict decimal-string amount validation; in-flight ref guard against double-approve; `decision_id` guard on the co-sign control; `role="status"` on result/outcome regions + `aria-hidden` on decorative glyphs. Tests grew 76→85 (`npm test` 85 passed; `npm run lint:css` clean).
+- Still pending: live manual run against the fake-adapter stack (servers up) — recommended before merge/demo.
 
 ### File List
 

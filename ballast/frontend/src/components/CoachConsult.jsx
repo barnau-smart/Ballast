@@ -13,19 +13,44 @@ import './CoachConsult.css'
  *
  * Presentation-only (AD-1): computes no money/market number; renders what the
  * backend blessed. Product contract (ratified): the order approved is the
- * USER'S stated order — `recommendation.order_intent ?? {symbol, side, amount}`
- * from the form — so a null recommendation intent (the default plan) does not
+ * USER'S stated order — `recommendation.order_intent ?? the order snapshotted
+ * at ask time` — so a null recommendation intent (the default plan) does not
  * erase the order the user came in with (warn-not-block, Epic 4.5; explicit
  * approval is the gate, FR8/FR9). A consult with no concrete order shows
  * guidance only — NO approve control.
  *
+ * INTEGRITY (review 2026-08-03): the co-signed order is a SNAPSHOT taken when
+ * the recommendation was requested — never live form state — and editing any
+ * field after a recommendation renders invalidates it (you must re-ask), so the
+ * order placed always matches the card the user saw and its `decision_id`.
+ *
  * Calm + honest + never-red: `/approve` needs a live session, so a 409 degrades
- * to a calm reconnect prompt (link to Onboarding), retryable; a 422 shows the
- * backend's calm reason verbatim; any of the five order statuses
- * (filled/partial/rejected/timeout/pending) is shown truthfully, never as an
- * error and never a phantom success. Brand-red appears ONLY on the co-sign
- * action; a loss/outcome value is never red. Guards setState-after-unmount.
+ * to a calm reconnect prompt (session) or a "give it a moment" note (a
+ * concurrent approve in flight); a 422 shows the backend's calm reason; a 401
+ * routes to sign-in. Only a `filled`/`partial` outcome is framed as a placed
+ * position — `rejected`/`timeout`/`pending` are shown honestly and NEVER get
+ * the replay promise. An indeterminate failure (network/5xx/unparseable) never
+ * claims "nothing was placed"; it asks the user to check Decisions before
+ * retrying (no duplicate-order nudge). Brand-red appears ONLY on the co-sign
+ * action; a loss/outcome value is never red. Guards setState-after-unmount and
+ * double-submit.
  */
+
+// A clean positive decimal string (no exponent/hex/trailing-dot) — what the
+// money wire contract accepts. `Number()` alone would pass "1e3"/"0x10"/"5.".
+const DECIMAL_RE = /^\d+(\.\d+)?$/
+
+// A concrete, placeable order from raw form fields, or null. The returned
+// `amount` is the exact validated string that goes on the wire (validated ==
+// sent — never a decimal float).
+function parseOrder(symbol, amount, side) {
+  const s = symbol.trim()
+  const a = amount.trim()
+  if (s === '' || !DECIMAL_RE.test(a) || Number(a) <= 0) return null
+  if (side !== 'buy' && side !== 'sell') return null
+  return { symbol: s, side, amount: a }
+}
+
 export function CoachConsult() {
   const [question, setQuestion] = useState('')
   const [symbol, setSymbol] = useState('')
@@ -35,13 +60,17 @@ export function CoachConsult() {
   // idle | thinking | ready | recommend-failed | signed-out
   const [phase, setPhase] = useState('idle')
   const [recommendation, setRecommendation] = useState(null)
+  // Snapshot the recommendation was made for: { question, order: {…}|null }.
+  const [submitted, setSubmitted] = useState(null)
 
-  // idle | placing | placed | reconnect | refused | approve-failed
+  // idle | placing | placed | reconnect | in-progress | refused | signed-out
+  // | indeterminate
   const [approve, setApprove] = useState('idle')
   const [approveMessage, setApproveMessage] = useState('')
   const [outcome, setOutcome] = useState(null)
 
   const mounted = useRef(true)
+  const placingRef = useRef(false) // synchronous double-submit guard
   useEffect(() => {
     mounted.current = true
     return () => {
@@ -49,28 +78,36 @@ export function CoachConsult() {
     }
   }, [])
 
-  const trimmedSymbol = symbol.trim()
-  const trimmedAmount = amount.trim()
-  const trimmedQuestion = question.trim()
-  const amountValue = Number(trimmedAmount)
-  const hasConcreteOrder =
-    trimmedSymbol !== '' &&
-    trimmedAmount !== '' &&
-    Number.isFinite(amountValue) &&
-    amountValue > 0 &&
-    (side === 'buy' || side === 'sell')
-
+  const liveOrder = parseOrder(symbol, amount, side)
   // Something must be on the table to ask: a question OR a concrete order.
   const askDisabled =
-    phase === 'thinking' || (trimmedQuestion === '' && !hasConcreteOrder)
+    phase === 'thinking' || (question.trim() === '' && liveOrder === null)
 
-  // The order to co-sign: prefer the coach's blessed intent, else the user's
-  // stated one. Null when there's nothing concrete to approve.
-  const orderIntent =
-    recommendation?.order_intent ??
-    (hasConcreteOrder
-      ? { symbol: trimmedSymbol, side, amount: trimmedAmount }
-      : null)
+  // The order to co-sign: the coach's blessed intent, else the SNAPSHOT taken
+  // at ask time — never live form state. Null when there's nothing to approve.
+  const orderIntent = recommendation
+    ? recommendation.order_intent ?? submitted?.order ?? null
+    : null
+
+  function resetResult() {
+    setRecommendation(null)
+    setSubmitted(null)
+    setApprove('idle')
+    setApproveMessage('')
+    setOutcome(null)
+  }
+
+  // Editing any field invalidates a shown recommendation — it no longer matches
+  // the order/question on the card, so the user must re-ask before co-signing.
+  function edit(setter) {
+    return (value) => {
+      if (recommendation !== null) {
+        resetResult()
+        setPhase('idle')
+      }
+      setter(value)
+    }
+  }
 
   async function readDetail(res) {
     try {
@@ -84,19 +121,18 @@ export function CoachConsult() {
   async function onAsk(event) {
     event.preventDefault()
     if (askDisabled) return
+    const snapshot = { question, order: liveOrder }
+    const validAmount = DECIMAL_RE.test(amount.trim()) ? amount.trim() : null
     setPhase('thinking')
-    setRecommendation(null)
-    setApprove('idle')
-    setApproveMessage('')
-    setOutcome(null)
+    resetResult()
     try {
       const res = await apiFetch('/api/coach/recommend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          symbol: trimmedSymbol || null,
+          symbol: symbol.trim() || null,
           question,
-          amount: trimmedAmount || null,
+          amount: validAmount,
           side: side || null,
         }),
       })
@@ -112,6 +148,7 @@ export function CoachConsult() {
       const data = await res.json()
       if (!mounted.current) return
       setRecommendation(data)
+      setSubmitted(snapshot)
       setPhase('ready')
     } catch {
       if (!mounted.current) return
@@ -120,7 +157,9 @@ export function CoachConsult() {
   }
 
   async function onApprove() {
-    if (!recommendation || !orderIntent || approve === 'placing') return
+    if (!recommendation?.decision_id || !orderIntent) return
+    if (placingRef.current) return // synchronous double-click guard
+    placingRef.current = true
     setApprove('placing')
     setApproveMessage('')
     try {
@@ -134,7 +173,14 @@ export function CoachConsult() {
       })
       if (!mounted.current) return
       if (res.ok) {
-        const data = await res.json()
+        let data
+        try {
+          data = await res.json()
+        } catch {
+          // 200 but unreadable body — the order may well have been placed.
+          setApprove('indeterminate')
+          return
+        }
         if (!mounted.current) return
         setOutcome(data)
         setApprove('placed')
@@ -142,33 +188,47 @@ export function CoachConsult() {
       }
       const detail = await readDetail(res)
       if (!mounted.current) return
-      if (res.status === 409) {
+      if (res.status === 401) {
+        setApprove('signed-out')
+      } else if (res.status === 409) {
+        // 409 has two causes: no live session (reconnect) vs a concurrent
+        // approve of this decision already in flight (give it a moment).
         setApproveMessage(detail)
-        setApprove('reconnect')
+        setApprove(
+          /moment|in progress|being approved|already/i.test(detail)
+            ? 'in-progress'
+            : 'reconnect',
+        )
       } else if (res.status === 422) {
+        // A deliberate pre-placement refusal — nothing was placed, retryable.
         setApproveMessage(detail)
         setApprove('refused')
       } else {
-        setApprove('approve-failed')
+        // 5xx/404/other — the order MAY have been placed; never claim it wasn't.
+        setApprove('indeterminate')
       }
     } catch {
       if (!mounted.current) return
-      setApprove('approve-failed')
+      setApprove('indeterminate')
+    } finally {
+      placingRef.current = false
     }
   }
 
   // "not now" — always equally easy, never penalized (EXPERIENCE.md). No network
   // call; dismiss the card back to a calm ready-to-ask state, keeping the form.
   function onDecline() {
-    setRecommendation(null)
+    resetResult()
     setPhase('idle')
-    setApprove('idle')
-    setApproveMessage('')
-    setOutcome(null)
   }
 
   const showCosign =
-    phase === 'ready' && orderIntent !== null && approve !== 'placed'
+    phase === 'ready' &&
+    orderIntent !== null &&
+    Boolean(recommendation?.decision_id) &&
+    approve !== 'placed'
+  const placedPosition =
+    outcome && (outcome.status === 'filled' || outcome.status === 'partial')
 
   return (
     <div className="ballast-consult" data-testid="coach-consult">
@@ -184,7 +244,7 @@ export function CoachConsult() {
           rows={2}
           maxLength={500}
           placeholder="e.g. “Should I invest my $500 paycheck? The market feels scary right now.”"
-          onChange={(e) => setQuestion(e.target.value)}
+          onChange={(e) => edit(setQuestion)(e.target.value)}
         />
 
         <div className="ballast-consult__order">
@@ -200,7 +260,7 @@ export function CoachConsult() {
               autoComplete="off"
               value={symbol}
               placeholder="VTI"
-              onChange={(e) => setSymbol(e.target.value)}
+              onChange={(e) => edit(setSymbol)(e.target.value)}
             />
           </div>
           <div className="ballast-consult__field">
@@ -215,7 +275,7 @@ export function CoachConsult() {
               inputMode="decimal"
               value={amount}
               placeholder="500"
-              onChange={(e) => setAmount(e.target.value)}
+              onChange={(e) => edit(setAmount)(e.target.value)}
             />
           </div>
           <div className="ballast-consult__field">
@@ -227,7 +287,7 @@ export function CoachConsult() {
               className="ballast-form__input"
               data-testid="coach-side-select"
               value={side}
-              onChange={(e) => setSide(e.target.value)}
+              onChange={(e) => edit(setSide)(e.target.value)}
             >
               <option value="">—</option>
               <option value="buy">buy</option>
@@ -247,13 +307,21 @@ export function CoachConsult() {
       </form>
 
       {phase === 'thinking' ? (
-        <p className="ballast-consult__note" data-testid="coach-thinking">
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-thinking"
+          role="status"
+        >
           Looking at the record…
         </p>
       ) : null}
 
       {phase === 'signed-out' ? (
-        <p className="ballast-consult__note" data-testid="coach-signed-out">
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-signed-out"
+          role="status"
+        >
           Sign in to ask the coach.{' '}
           <Link className="ballast-consult__link" to="/auth">
             Sign in
@@ -262,7 +330,11 @@ export function CoachConsult() {
       ) : null}
 
       {phase === 'recommend-failed' ? (
-        <p className="ballast-consult__note" data-testid="coach-recommend-failed">
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-recommend-failed"
+          role="status"
+        >
           We couldn’t reach the coach just now. Your plan hasn’t changed — try
           again in a moment.
         </p>
@@ -270,7 +342,10 @@ export function CoachConsult() {
 
       {phase === 'ready' && recommendation ? (
         <div className="ballast-consult__result">
-          <CoachCard recommendation={recommendation} question={question} />
+          <CoachCard
+            recommendation={recommendation}
+            question={submitted?.question}
+          />
 
           {orderIntent === null ? (
             <p className="ballast-consult__note" data-testid="coach-no-order">
@@ -281,7 +356,8 @@ export function CoachConsult() {
           {showCosign ? (
             <div className="ballast-consult__cosign" data-testid="coach-cosign">
               <p className="ballast-consult__cosign-note">
-                ✎ I’ll put my name on this with you.
+                <span aria-hidden="true">✎</span> I’ll put my name on this with
+                you.
               </p>
               <div className="ballast-consult__cosign-actions">
                 <button
@@ -307,6 +383,7 @@ export function CoachConsult() {
                 <p
                   className="ballast-consult__cosign-msg"
                   data-testid="coach-reconnect"
+                  role="status"
                 >
                   {approveMessage ||
                     'Reconnect your Schwab account to place this.'}{' '}
@@ -316,43 +393,91 @@ export function CoachConsult() {
                 </p>
               ) : null}
 
+              {approve === 'in-progress' ? (
+                <p
+                  className="ballast-consult__cosign-msg"
+                  data-testid="coach-in-progress"
+                  role="status"
+                >
+                  {approveMessage ||
+                    'This is being approved right now — give it a moment and check your Decisions.'}
+                </p>
+              ) : null}
+
               {approve === 'refused' ? (
                 <p
                   className="ballast-consult__cosign-msg"
                   data-testid="coach-refused"
+                  role="status"
                 >
                   {approveMessage ||
                     'That order can’t be placed as-is. Nothing was placed.'}
                 </p>
               ) : null}
 
-              {approve === 'approve-failed' ? (
+              {approve === 'signed-out' ? (
                 <p
                   className="ballast-consult__cosign-msg"
-                  data-testid="coach-approve-failed"
+                  data-testid="coach-approve-signed-out"
+                  role="status"
                 >
-                  We couldn’t place that just now. Nothing was placed — try
-                  again in a moment.
+                  Your session ended. Sign in and try again.{' '}
+                  <Link className="ballast-consult__link" to="/auth">
+                    Sign in
+                  </Link>
+                </p>
+              ) : null}
+
+              {approve === 'indeterminate' ? (
+                <p
+                  className="ballast-consult__cosign-msg"
+                  data-testid="coach-indeterminate"
+                  role="status"
+                >
+                  We couldn’t confirm whether that went through. Check your
+                  Decisions before trying again.{' '}
+                  <Link className="ballast-consult__link" to="/decisions">
+                    Open Decisions
+                  </Link>
                 </p>
               ) : null}
             </div>
           ) : null}
 
           {approve === 'placed' && outcome ? (
-            <div className="ballast-consult__outcome" data-testid="coach-outcome">
-              <p className="ballast-consult__outcome-line">
-                Outcome: {outcome.status}
-                {outcome.filled_qty != null
-                  ? ` · filled ${outcome.filled_qty}`
-                  : ''}
-                {outcome.avg_price != null ? ` @ ${outcome.avg_price}` : ''}
-              </p>
-              <p
-                className="ballast-consult__chip"
-                data-testid="coach-replay-chip"
-              >
-                ↻ if it dips, I’ll replay this back to you
-              </p>
+            <div
+              className="ballast-consult__outcome"
+              data-testid="coach-outcome"
+              role="status"
+            >
+              {placedPosition ? (
+                <>
+                  <p className="ballast-consult__outcome-line">
+                    Outcome: {outcome.status}
+                    {outcome.filled_qty != null
+                      ? ` · filled ${outcome.filled_qty}`
+                      : ''}
+                    {outcome.avg_price != null ? ` @ ${outcome.avg_price}` : ''}
+                  </p>
+                  <p
+                    className="ballast-consult__chip"
+                    data-testid="coach-replay-chip"
+                  >
+                    <span aria-hidden="true">↻</span> if it dips, I’ll replay
+                    this back to you
+                  </p>
+                </>
+              ) : outcome.status === 'rejected' ? (
+                <p className="ballast-consult__outcome-line">
+                  Outcome: rejected — nothing was placed. Nothing to worry
+                  about; you can try again when you’re ready.
+                </p>
+              ) : (
+                <p className="ballast-consult__outcome-line">
+                  Outcome: {outcome.status} — we couldn’t confirm this yet.
+                  Check your Decisions before trying again.
+                </p>
+              )}
             </div>
           ) : null}
         </div>
