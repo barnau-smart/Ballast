@@ -35,6 +35,7 @@ from brokers.port import (
     OrderOutcome,
     OrderStatus,
     PortfolioSnapshot,
+    Quote,
 )
 from coach.recommendation import Duration, OrderIntent, OrderSide, OrderType
 from money import format_money
@@ -935,6 +936,31 @@ class SchwabAdapter(BrokerPort):
         return self._usable_price(
             self._read_quote(client, symbol), "askPrice", symbol
         )
+
+    async def get_quote(self, symbol: str) -> Quote:
+        """Read the live top-of-book :class:`Quote` for ``symbol`` (Story 8.4).
+
+        The clean READ seam the coach's suggest-order engine depends on — it
+        places NOTHING (no ``place_order``). Builds the trading client (a missing
+        token/config raises :class:`SchwabNotConfiguredError` plainly, which the
+        endpoint maps to a calm 409 reconnect), then reads ONE quote node via
+        :meth:`_read_quote` (sharing the Story 7.6 pre-flight tap). Only the
+        ``askPrice`` is load-bearing for suggest-order's "buy near the low" clamp,
+        so a missing / non-positive / non-finite ``askPrice`` refuses via
+        :class:`~brokers.port.OrderNotPlaceableError` (mapped to the calm 422),
+        never a guessed price. The ``bidPrice`` is read best-effort — a thin or
+        absent bid leg must NOT refuse an otherwise-valid quote — and falls back to
+        the ask when unusable. Never logs token/secret material.
+        """
+        self._require_configured()
+        client = self._trading_client()
+        quote = self._read_quote(client, symbol)
+        ask = self._usable_price(quote, "askPrice", symbol)
+        try:
+            bid = self._usable_price(quote, "bidPrice", symbol)
+        except OrderNotPlaceableError:
+            bid = ask
+        return Quote(bid=bid, ask=ask)
 
     def _map_order(
         self,

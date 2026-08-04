@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, replace
+from decimal import ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
 
 from brokers.port import BrokerPort, OrderOutcome, OrderStatus
@@ -144,6 +145,23 @@ def _assert_session_integrity(
             "Your brokerage connection needs a quick reconnect before this order "
             "can go through."
         )
+
+
+def whole_share_quantity(amount: Decimal, price: Decimal) -> int:
+    """Return ``floor(amount / price)`` as a whole-share count (Story 8.4).
+
+    The shared, reusable sub-share sizing helper mirroring the adapters' inline
+    ``int((amount / price).to_integral_value(rounding=ROUND_FLOOR))`` flooring —
+    factored here so the suggest-order engine (:mod:`coach.suggest`) sizes shares
+    the SAME deterministic way the fake/schwab adapters do at placement, without
+    reinventing it (the adapters keep their own inline flooring to stay 8.1/8.2
+    byte-identical). ``amount``/``price`` are positive ``Decimal``; a
+    non-positive/non-finite ``price`` (which would make the division meaningless)
+    yields ``0`` rather than raising, so the caller refuses ``< 1`` share calmly.
+    """
+    if not price.is_finite() or price <= 0:
+        return 0
+    return int((amount / price).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def mint_idempotency_key() -> str:

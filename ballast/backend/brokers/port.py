@@ -116,6 +116,23 @@ class OrderOutcome:
     account_ref: str | None = None
 
 
+@dataclass(frozen=True)
+class Quote:
+    """A live top-of-book quote for a symbol — ``bid``/``ask`` as ``Decimal`` (8.4).
+
+    The clean read seam the coach's suggest-order engine depends on so it never
+    reaches into a concrete adapter for a price. ``bid``/``ask`` are ``Decimal``
+    (NEVER binary float, money discipline) and represent the best current
+    bid/ask. Frozen so a quote is an immutable value. Producing it is a READ — it
+    places nothing. An adapter that cannot read a usable ask/bid refuses via
+    :class:`OrderNotPlaceableError` (mapped to the same calm 422 as an
+    out-of-scope order) rather than returning a guessed price.
+    """
+
+    bid: Decimal
+    ask: Decimal
+
+
 class OrderNotPlaceableError(ValueError):
     """Raised when a whole-share market order cannot be constructed (Story 6.3).
 
@@ -257,6 +274,23 @@ class BrokerPort(ABC):
 
         Money in the returned outcome is ``Decimal`` (never binary float). This
         method never logs token/secret material.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_quote(self, symbol: str) -> Quote:
+        """Read the current top-of-book :class:`Quote` for ``symbol`` (Story 8.4).
+
+        The clean READ seam the coach's suggest-order engine
+        (:func:`coach.suggest.suggest_resting_order`) depends on so it never
+        reaches into a concrete adapter to learn the live ask. It places NOTHING —
+        it is a pure read, the sibling of 8.2's ``cancel_order`` port addition.
+
+        The concrete adapter returns ``bid``/``ask`` as ``Decimal`` (never binary
+        float). A missing / non-positive / non-finite ask or bid is not a usable
+        price, so the adapter refuses via :class:`OrderNotPlaceableError` (the API
+        maps it to the same calm 422 as an out-of-scope order) rather than
+        returning a guessed number. Never logs token/secret material.
         """
         raise NotImplementedError
 

@@ -60,9 +60,12 @@ function respond(h) {
   })
 }
 
-function stubFetch({ recommend, approve } = {}) {
+function stubFetch({ recommend, approve, suggest } = {}) {
   const fn = vi.fn((url) => {
     const u = String(url)
+    // Order matters: the suggest route is a more specific path, but neither
+    // string is a prefix of the other, so plain includes() is unambiguous.
+    if (u.includes('/api/coach/suggest-order')) return respond(suggest)
     if (u.includes('/api/coach/recommend')) return respond(recommend)
     if (u.includes('/api/coach/approve')) return respond(approve)
     return Promise.reject(new Error(`unexpected url: ${u}`))
@@ -792,5 +795,161 @@ describe('CoachConsult — live propose → approve/decline', () => {
       String(c[0]).includes('/api/coach/approve'),
     )
     expect(approveCalls).toHaveLength(1)
+  })
+
+  // --- Story 8.4: "Suggest this order" button ------------------------------
+
+  const SUGGESTION = {
+    symbol: 'VTI',
+    side: 'buy',
+    order_type: 'limit',
+    limit_price: '89.10',
+    duration: 'gtc',
+    amount: '980.10',
+    shares: 11,
+    reasoning:
+      'This rests a buy for VTI at $89.10 — a touch below its recent low. No rush.',
+  }
+
+  it('suggest-order 200 → populates side/amount/LIMIT/limit_price/GTC + shows reasoning, submits nothing', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+      suggest: { body: SUGGESTION },
+    })
+    renderConsult()
+
+    // The button needs a symbol; enter one, then click Suggest.
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+
+    // The reasoning renders inline.
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-reasoning')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-suggest-reasoning')).toHaveTextContent(
+      /rests a buy for VTI at \$89\.10/i,
+    )
+
+    // The form controls are populated: side=buy + the exact amount string.
+    expect(screen.getByTestId('coach-side-select')).toHaveValue('buy')
+    expect(screen.getByTestId('coach-amount-input')).toHaveValue('980.10')
+
+    // Only the suggest endpoint was hit — nothing was ever approved/placed.
+    expect(
+      fn.mock.calls.some((c) => String(c[0]).includes('/api/coach/approve')),
+    ).toBe(false)
+    // The exact strings crossed the wire on the request, no float coercion.
+    const suggestCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/suggest-order'),
+    )
+    const reqBody = JSON.parse(suggestCall[1].body)
+    expect(reqBody.symbol).toBe('VTI')
+  })
+
+  it('suggest → ask → approve: the AI resting LIMIT + GTC survive the ask reset into the co-signed order (AC-4)', async () => {
+    // The recommendation the ask returns must carry a blessed intent + decision
+    // for the co-sign step to appear; its symbol matches the suggested symbol.
+    const REC_VTI = {
+      ...REC_WITH_INTENT,
+      decision_id: 'dec-vti-1',
+      order_intent: { symbol: 'VTI', side: 'buy', amount: '450.00' },
+    }
+    const fn = stubFetch({
+      recommend: { body: REC_VTI },
+      approve: { body: OUTCOME },
+      suggest: { body: SUGGESTION },
+    })
+    renderConsult()
+
+    // 1. Suggest for VTI — populates the form and holds the resting LIMIT.
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-reasoning')).toBeInTheDocument(),
+    )
+
+    // 2. Ask the coach — resetResult() blanks `options` back to MARKET, but the
+    //    held suggestion is re-seeded so the LIMIT/GTC reach the co-sign step.
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    // 3. Approve — the composed order_intent must carry the AI's resting LIMIT +
+    //    GTC, NOT the blanked MARKET default (the pre-fix regression).
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent).toMatchObject({
+      order_type: 'limit',
+      limit_price: '89.10',
+      duration: 'gtc',
+    })
+  })
+
+  it('suggest-order sends amount:null when the amount field is empty', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      suggest: { body: SUGGESTION },
+    })
+    renderConsult()
+
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-reasoning')).toBeInTheDocument(),
+    )
+
+    const suggestCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/suggest-order'),
+    )
+    const reqBody = JSON.parse(suggestCall[1].body)
+    expect(reqBody.amount).toBeNull()
+  })
+
+  it('suggest-order 422 → surfaces the envelope message verbatim, populates nothing', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      suggest: {
+        ok: false,
+        status: 422,
+        body: {
+          error: {
+            type: 'http_error',
+            message:
+              'There isn’t enough idle cash for a whole share at that resting price right now — nothing was suggested.',
+          },
+        },
+      },
+    })
+    renderConsult()
+
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-failed')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-suggest-failed')).toHaveTextContent(
+      /not enough idle cash|isn.t enough idle cash/i,
+    )
+    // Populated NOTHING: the reasoning panel never shows, the side stays unset.
+    expect(
+      screen.queryByTestId('coach-suggest-reasoning'),
+    ).not.toBeInTheDocument()
+    expect(screen.getByTestId('coach-side-select')).toHaveValue('')
+    expect(screen.getByTestId('coach-amount-input')).toHaveValue('')
+  })
+
+  it('the Suggest button is disabled with no symbol', () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT } })
+    renderConsult()
+    expect(screen.getByTestId('coach-suggest-order')).toBeDisabled()
   })
 })

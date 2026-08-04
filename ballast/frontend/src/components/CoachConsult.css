@@ -48,6 +48,35 @@
   color: var(--ballast-color-phosphor);
 }
 
+/* Story 8.4 — the optional "Suggest this order" button + its calm narration
+   panel. A quiet secondary action, never the loud brand-red co-sign. */
+.ballast-consult__suggest {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-phosphor);
+  background: transparent;
+  border: 1px solid var(--ballast-color-phosphor);
+  border-radius: var(--ballast-radius-sm, 4px);
+  padding: var(--ballast-space-8) var(--ballast-space-16);
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.ballast-consult__suggest:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ballast-consult__suggest-panel {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  border-left: 2px solid var(--ballast-color-phosphor);
+  padding-left: var(--ballast-space-16);
+  margin: 0;
+}
+
 .ballast-consult__result {
   display: flex;
   flex-direction: column;

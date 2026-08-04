@@ -83,6 +83,21 @@ export function CoachConsult() {
   const [options, setOptions] = useState(DEFAULT_OPTIONS)
   const [dismissed, setDismissed] = useState([])
 
+  // Story 8.4 — MasterB's "Suggest this order" button. The backend computes a
+  // resting BUY LIMIT (GTC) deterministically and the LLM narrates it; on 200 we
+  // populate the frozen 8.3 controls via the existing setters (side/amount/
+  // options) and show the reasoning inline. On 422/409 we surface the calm
+  // envelope message verbatim and populate NOTHING. `suggest` phases:
+  // idle | suggesting | suggested | suggest-failed.
+  const [suggest, setSuggest] = useState('idle')
+  const [suggestMessage, setSuggestMessage] = useState('')
+  const [suggestReasoning, setSuggestReasoning] = useState('')
+  // Story 8.4 — a computed AI suggestion held OUTSIDE `options` so it survives
+  // the ask reset (`resetResult` blanks `options` back to MARKET). Re-seeded into
+  // the co-sign `options` by `onAsk` so the resting LIMIT reaches /approve (AC-4).
+  const [pendingSuggestion, setPendingSuggestion] = useState(null)
+  const suggestingRef = useRef(false) // synchronous double-click guard
+
   const mounted = useRef(true)
   const placingRef = useRef(false) // synchronous double-submit guard
   useEffect(() => {
@@ -113,6 +128,10 @@ export function CoachConsult() {
     // MARKET default and clears any dismissed footgun warnings.
     setOptions(DEFAULT_OPTIONS)
     setDismissed([])
+    // Clear any prior suggest-order narration/message (a fresh ask starts clean).
+    setSuggest('idle')
+    setSuggestMessage('')
+    setSuggestReasoning('')
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -141,6 +160,9 @@ export function CoachConsult() {
     if (askDisabled) return
     const snapshot = { question, order: liveOrder }
     const validAmount = DECIMAL_RE.test(amount.trim()) ? amount.trim() : null
+    // Capture any prior AI suggestion BEFORE resetResult() blanks `options`, so we
+    // can re-seed the resting LIMIT into the co-sign step once the decision lands.
+    const pending = pendingSuggestion
     setPhase('thinking')
     resetResult()
     try {
@@ -168,6 +190,31 @@ export function CoachConsult() {
       setRecommendation(data)
       setSubmitted(snapshot)
       setPhase('ready')
+      // Story 8.4 — carry a prior AI suggestion through the ask so its computed
+      // resting LIMIT (GTC) survives to the co-sign step (AC-4). resetResult()
+      // above blanked `options`; re-seed from the suggestion when it still matches
+      // the asked symbol AND the recommendation is actually co-signable (a blessed
+      // decision_id), then spend it (one-shot — further edits are the user's).
+      if (pending && pending.symbol === symbol.trim().toUpperCase()) {
+        if (data?.decision_id) {
+          setOptions({
+            ...DEFAULT_OPTIONS,
+            order_type: 'limit',
+            limit_price: pending.limit_price,
+            duration: pending.duration,
+          })
+          setSuggestReasoning(pending.reasoning)
+          setSuggest('suggested')
+          setPendingSuggestion(null)
+        }
+        // else: the coach answered without an executable order — KEEP the held
+        // suggestion so the next co-signable ask of this symbol still carries the
+        // resting LIMIT (spending it here would resurrect the P1 MARKET downgrade).
+      } else {
+        // A different symbol (or none) — the held suggestion no longer applies to
+        // what's on the table; discard it.
+        setPendingSuggestion(null)
+      }
     } catch {
       if (!mounted.current) return
       setPhase('recommend-failed')
@@ -237,10 +284,115 @@ export function CoachConsult() {
     }
   }
 
+  // Story 8.4 — "Suggest this order": ask the backend to COMPUTE a resting BUY
+  // LIMIT (GTC) and NARRATE it, then populate the frozen 8.3 controls via the
+  // existing setters. On 200 we set side=buy + the exact amount/limit_price
+  // strings + LIMIT + GTC and show the reasoning inline. On 422/409 we surface
+  // the calm envelope reason verbatim and populate NOTHING. Nothing executes —
+  // the human still runs the /approve co-sign path.
+  async function onSuggest() {
+    if (suggestingRef.current) return // synchronous double-click guard
+    if (phase === 'thinking') return // don't race an in-flight ask
+    const s = symbol.trim()
+    if (s === '') {
+      setSuggestMessage('Enter a symbol to suggest an order.')
+      setSuggest('suggest-failed')
+      return
+    }
+    suggestingRef.current = true
+    setSuggest('suggesting')
+    setSuggestMessage('')
+    setSuggestReasoning('')
+    setPendingSuggestion(null) // a fresh suggest supersedes any prior one
+    // A shown recommendation no longer matches once we repopulate the form.
+    if (recommendation !== null) {
+      resetResult()
+      setPhase('idle')
+    }
+    try {
+      const validAmount = DECIMAL_RE.test(amount.trim()) ? amount.trim() : null
+      const res = await apiFetch('/api/coach/suggest-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: s, amount: validAmount }),
+      })
+      if (!mounted.current) return
+      if (res.ok) {
+        let data
+        try {
+          data = await res.json()
+        } catch {
+          setSuggestMessage('We couldn’t read that suggestion — try again.')
+          setSuggest('suggest-failed')
+          return
+        }
+        if (!mounted.current) return
+        // Defense in depth: the endpoint's response_model guarantees string
+        // money fields, but never write literal "undefined" into a money input.
+        if (
+          typeof data.amount !== 'string' ||
+          typeof data.limit_price !== 'string'
+        ) {
+          setSuggestMessage('We couldn’t read that suggestion — try again.')
+          setSuggest('suggest-failed')
+          return
+        }
+        // Populate the 8.3 controls via the existing setters (no fork of
+        // orderOptions.js). limit_price/amount travel as the EXACT strings.
+        setSide('buy')
+        setAmount(data.amount)
+        // Seed from a clean DEFAULT_OPTIONS base (mirrors onAsk) so no stale
+        // option key (a leftover session/stop from a prior card) can ride along
+        // into the suggested resting LIMIT.
+        setOptions({
+          ...DEFAULT_OPTIONS,
+          order_type: 'limit',
+          limit_price: data.limit_price,
+          duration: 'gtc',
+        })
+        // Hold the suggestion outside `options` so the resting LIMIT survives the
+        // ask reset and reaches co-sign (AC-4). Keyed by the backend's normalized
+        // (upper-cased) symbol so a later ask for a DIFFERENT symbol won't seed it.
+        setPendingSuggestion({
+          symbol: String(data.symbol),
+          limit_price: data.limit_price,
+          duration: 'gtc',
+          reasoning: data.reasoning ?? '',
+        })
+        setSuggestReasoning(data.reasoning ?? '')
+        setSuggest('suggested')
+        return
+      }
+      // Calm refusal — surface the backend envelope message verbatim (the
+      // 8.3-hardened shape), populate NOTHING.
+      let message = ''
+      try {
+        const data = await res.json()
+        message = data?.error?.message ?? data?.detail ?? data?.message ?? ''
+      } catch {
+        message = ''
+      }
+      if (!mounted.current) return
+      if (res.status === 401) {
+        setSuggestMessage('Sign in to suggest an order.')
+      } else {
+        setSuggestMessage(message)
+      }
+      setSuggest('suggest-failed')
+    } catch {
+      if (!mounted.current) return
+      setSuggestMessage('We couldn’t reach the coach just now — try again.')
+      setSuggest('suggest-failed')
+    } finally {
+      suggestingRef.current = false
+    }
+  }
+
   // "not now" — always equally easy, never penalized (EXPERIENCE.md). No network
   // call; dismiss the card back to a calm ready-to-ask state, keeping the form.
   function onDecline() {
     resetResult()
+    setPendingSuggestion(null)
     setPhase('idle')
   }
 
@@ -344,7 +496,44 @@ export function CoachConsult() {
         >
           {phase === 'thinking' ? 'Looking at the record…' : 'Ask the coach'}
         </button>
+
+        {/* Story 8.4 — MasterB's optional "Suggest this order" button. Computes a
+            calm resting BUY LIMIT (GTC) and populates the form; never executes. */}
+        <button
+          type="button"
+          className="ballast-consult__suggest"
+          data-testid="coach-suggest-order"
+          onClick={onSuggest}
+          disabled={
+            suggest === 'suggesting' ||
+            phase === 'thinking' ||
+            symbol.trim() === ''
+          }
+        >
+          {suggest === 'suggesting' ? 'Suggesting…' : 'Suggest this order'}
+        </button>
       </form>
+
+      {suggest === 'suggested' ? (
+        <div
+          className="ballast-consult__suggest-panel"
+          data-testid="coach-suggest-reasoning"
+          role="status"
+        >
+          {suggestReasoning}
+        </div>
+      ) : null}
+
+      {suggest === 'suggest-failed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-suggest-failed"
+          role="status"
+        >
+          {suggestMessage ||
+            'We couldn’t suggest an order just now — try again in a moment.'}
+        </p>
+      ) : null}
 
       {phase === 'thinking' ? (
         <p

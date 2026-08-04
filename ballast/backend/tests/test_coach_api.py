@@ -46,6 +46,7 @@ from brokers.port import (
     OrderOutcome,
     OrderStatus,
     PortfolioSnapshot,
+    Quote,
 )
 from brokers.schwab_adapter import SchwabNotConfiguredError
 from brokers.session import BrokerageSession
@@ -351,6 +352,9 @@ class _SpyAdapter(BrokerPort):
         self.cancel_calls.append(broker_ref)
         return await self._delegate.cancel_order(broker_ref)
 
+    async def get_quote(self, symbol: str) -> Quote:
+        return await self._delegate.get_quote(symbol)
+
 
 class _ScriptedAdapter(BrokerPort):
     """A broker double that returns a SCRIPTED placement/reconciliation outcome.
@@ -425,6 +429,9 @@ class _ScriptedAdapter(BrokerPort):
                 "the cancel should not have touched the broker."
             )
         return self._cancelled
+
+    async def get_quote(self, symbol: str) -> Quote:
+        return await self._delegate.get_quote(symbol)
 
 
 # =============================================================================
@@ -719,6 +726,9 @@ class _NotPlaceableAdapter(BrokerPort):
     async def cancel_order(self, broker_ref: str) -> OrderOutcome:
         raise AssertionError("cancel_order must not be reached on a refusal")
 
+    async def get_quote(self, symbol: str) -> Quote:
+        return await self._delegate.get_quote(symbol)
+
 
 def _broker_ref_for(owner: uuid.UUID) -> str | None:
     """Read this owner's decision_record.broker_ref column (Story 6.3)."""
@@ -961,6 +971,9 @@ class _AccountSelectionAdapter(BrokerPort):
 
     async def cancel_order(self, broker_ref: str) -> OrderOutcome:
         raise AssertionError("cancel_order must not be reached on a refusal")
+
+    async def get_quote(self, symbol: str) -> Quote:
+        return await self._delegate.get_quote(symbol)
 
 
 def test_approve_account_selection_refusal_is_calm_422_releases_claim(client):
@@ -2342,6 +2355,9 @@ class _BlockingSpyAdapter(BrokerPort):
 
     async def cancel_order(self, broker_ref: str) -> OrderOutcome:
         return await self._delegate.cancel_order(broker_ref)
+
+    async def get_quote(self, symbol: str) -> Quote:
+        return await self._delegate.get_quote(symbol)
 
 
 def _proposed_decision_row(owner: uuid.UUID) -> dict:

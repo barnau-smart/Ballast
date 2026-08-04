@@ -24,6 +24,7 @@ from brokers.port import (
     OrderOutcome,
     OrderStatus,
     PortfolioSnapshot,
+    Quote,
 )
 
 # A recognisable, obviously-fake authorization host so it can never be mistaken
@@ -314,6 +315,17 @@ class FakeBrokerAdapter(BrokerPort):
             avg_price=None,
             broker_ref=None,
         )
+
+    async def get_quote(self, symbol: str) -> Quote:
+        """Return a deterministic top-of-book :class:`Quote` (Story 8.4, no network).
+
+        Both the ``bid`` and the ``ask`` are the fixed :data:`FAKE_FILL_PRICE`
+        (``Decimal("100.00")``) — the SAME reference the fake fill uses — so the
+        suggest-order engine's price computation is fully deterministic and
+        zero-network in every test (seed-stable). No wall-clock, no randomness.
+        Never logs token/secret material.
+        """
+        return Quote(bid=FAKE_FILL_PRICE, ask=FAKE_FILL_PRICE)
 
     async def cancel_order(self, broker_ref: str) -> OrderOutcome:
         """Cancel a placed order by its ``broker_ref`` (Story 8.2, no network).

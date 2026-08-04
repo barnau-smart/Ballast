@@ -540,6 +540,9 @@ class _FetchFailsAdapter(BrokerPort):
     async def cancel_order(self, broker_ref):
         return await FakeBrokerAdapter().cancel_order(broker_ref)
 
+    async def get_quote(self, symbol):
+        return await FakeBrokerAdapter().get_quote(symbol)
+
 
 def test_relink_import_failure_leaves_empty_projection(client):
     """When the post-clear import fails on re-link, the projection is EMPTY (the

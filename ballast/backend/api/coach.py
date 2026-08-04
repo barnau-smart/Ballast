@@ -86,6 +86,7 @@ from coach.execution import (
     reconcile_pending_decision,
 )
 from coach.pipeline import CoachDecision, run_coach_pipeline
+from coach.suggest import suggest_resting_order
 from coach.recommendation import (
     Duration,
     OrderIntent,
@@ -96,6 +97,7 @@ from coach.recommendation import (
 from coach.validation import BlessedRecommendation
 from db.scope import Scope
 from db.session import get_async_session
+from llm.factory import get_llm_gateway
 from money import format_money
 
 logger = logging.getLogger("ballast.api.coach")
@@ -381,6 +383,42 @@ class CancelResponse(BaseModel):
     avg_price: str | None = None
     broker_ref: str | None = None
     needs_reconfirmation: bool = False
+
+
+class SuggestOrderRequest(BaseModel):
+    """The user-initiated "suggest & populate the order" request (Story 8.4).
+
+    ``symbol`` is the instrument to size a resting BUY LIMIT for; ``amount`` is an
+    OPTIONAL target dollar budget (``Decimal``, never float) — when present and
+    ``> 0`` the engine sizes off ``min(amount, available_cash)``, otherwise off the
+    user's available idle cash. The endpoint COMPUTES the price/amount/shares
+    deterministically; the LLM only narrates them.
+    """
+
+    symbol: str
+    amount: Decimal | None = None
+
+
+class SuggestOrderResponse(BaseModel):
+    """A computed resting BUY LIMIT (GTC) suggestion, money as strings (Story 8.4).
+
+    ``limit_price``/``amount`` are fixed-point decimal STRINGS on the wire (never
+    binary float), via the same ``_money_str`` path as ``/approve``. ``side`` is
+    always ``"buy"``, ``order_type`` always ``"limit"``, ``duration`` always
+    ``"gtc"`` — a genuine resting buy the frontend populates into the frozen 8.3
+    controls. ``shares`` is the whole-share count. ``reasoning`` is the LLM's plain
+    prose (or a resilient templated fallback). Nothing executes: the human runs the
+    unchanged ``/approve`` co-sign path.
+    """
+
+    symbol: str
+    side: OrderSide
+    order_type: OrderType
+    limit_price: str
+    duration: Duration
+    amount: str
+    shares: int
+    reasoning: str
 
 
 # --- Serialization helpers ---------------------------------------------------
@@ -732,6 +770,75 @@ async def approve(
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
     return _to_approve_response(outcome)
+
+
+@router.post("/suggest-order", response_model=SuggestOrderResponse)
+async def suggest_order(
+    body: SuggestOrderRequest,
+    scope: Scope = Depends(get_scope),
+    broker_session: BrokerageSession = Depends(require_live_broker_session),
+    broker: BrokerPort = Depends(get_execution_broker),
+    session: AsyncSession = Depends(get_async_session),
+) -> SuggestOrderResponse:
+    """SUGGEST & POPULATE a resting BUY LIMIT (GTC) order (Story 8.4, MasterB core).
+
+    The backend DETERMINISTICALLY computes a resting buy-limit price (a touch below
+    the recent 20-day low, always strictly below the live ask), sizes a whole-share
+    dollar amount from the user's real idle cash, and asks the LLM gateway to
+    NARRATE that already-computed number in plain English — the model never does
+    money-math and never sets the price. Mirrors the ``/approve`` DI (``get_scope``
+    + ``require_live_broker_session`` + ``get_execution_broker`` +
+    ``get_async_session``): only reached on an authenticated user AND a live
+    brokerage session (:func:`require_live_broker_session` → calm 409 reconnect
+    otherwise, no suggestion attempted).
+
+    PLACES NOTHING — it touches no ``place_order``/``decision_record`` path. The
+    human still executes via the unchanged ``/approve`` co-sign flow. Every calm
+    decline (non-core symbol, no price history, insufficient idle cash) is an
+    :class:`~coach.execution.OrderScopeError` → calm 422; an unreadable live quote
+    is the adapter's :class:`~brokers.port.OrderNotPlaceableError` → calm 422; a
+    lapsed session is the existing 409. Money crosses the wire as fixed-point
+    strings. The LLM gateway is resolved from config (fake unless configured);
+    narration failure degrades to a deterministic templated reasoning, never a 500.
+    """
+    gateway = get_llm_gateway()
+    try:
+        suggestion = await suggest_resting_order(
+            scope,
+            session,
+            broker=broker,
+            broker_session=broker_session,
+            gateway=gateway,
+            symbol=body.symbol,
+            target_amount=body.amount,
+        )
+    except OrderNotSupportedError as exc:
+        # Symmetric with /approve: a deferred order feature refusal → calm 422.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OrderScopeError as exc:
+        # A calm decline (non-core symbol, no history, insufficient idle cash) →
+        # 422 through the app error envelope, never a 500, never a phantom order.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OrderNotPlaceableError as exc:
+        # An unreadable live quote (missing/non-positive ask) surfaced by
+        # ``broker.get_quote`` → the same calm 422 as an out-of-scope order.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SchwabNotConfiguredError as exc:
+        # A config/auth fault surfaced by the quote read at client build — map it
+        # to the SAME calm 409 reconnect envelope as a lapsed session (distinct
+        # from a calm decline), symmetric with /reconcile and /cancel.
+        raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
+
+    return SuggestOrderResponse(
+        symbol=suggestion.symbol,
+        side=suggestion.side,
+        order_type=suggestion.order_type,
+        limit_price=_money_str(suggestion.limit_price),
+        duration=suggestion.duration,
+        amount=_money_str(suggestion.amount),
+        shares=suggestion.shares,
+        reasoning=suggestion.reasoning,
+    )
 
 
 @router.get("/decisions", response_model=DecisionListResponse)

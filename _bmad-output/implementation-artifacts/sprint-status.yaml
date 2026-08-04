@@ -134,7 +134,7 @@ development_status:
   8-3-order-entry-ui-beginner-warnings: done
   # 8.4 added 2026-08-04: MasterB's "AI suggest & populate the order" button.
   # Compute-owner LOCKED: backend computes the resting-limit price deterministically, LLM only narrates.
-  8-4-ai-suggest-populate-order: backlog
+  8-4-ai-suggest-populate-order: done
   epic-8-retrospective: optional
 
 action_items:
