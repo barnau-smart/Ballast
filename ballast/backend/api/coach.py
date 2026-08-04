@@ -52,7 +52,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import get_settings
@@ -78,13 +78,20 @@ from coach.decision_record import (
     release_claim,
 )
 from coach.execution import (
+    OrderNotSupportedError,
     OrderScopeError,
     SessionIntegrityError,
     execute_approved_order,
     reconcile_pending_decision,
 )
 from coach.pipeline import CoachDecision, run_coach_pipeline
-from coach.recommendation import OrderIntent, OrderSide
+from coach.recommendation import (
+    Duration,
+    OrderIntent,
+    OrderSide,
+    OrderType,
+    Session,
+)
 from coach.validation import BlessedRecommendation
 from db.scope import Scope
 from db.session import get_async_session
@@ -118,21 +125,86 @@ IN_PROGRESS_MESSAGE = (
 class OrderIntentIn(BaseModel):
     """The typed executable payload the user approves.
 
-    ``amount`` is accepted as a Decimal (Pydantic parses a JSON string/number to
-    ``Decimal``) and stays ``Decimal`` end to end — never binary float.
+    ``amount``/``limit_price``/``stop_price`` are accepted as Decimals (Pydantic
+    parses a JSON string/number to ``Decimal``) and stay ``Decimal`` end to end —
+    never binary float. The order-model fields (Story 8.1) are optional and
+    defaulted so a plain ``{symbol, side, amount}`` body is still a valid MARKET
+    order; ``order_type``/``session``/``duration`` are the human-entered overrides
+    on the ``/approve`` path (the LLM coach never proposes them).
     """
 
     symbol: str
     side: OrderSide
     amount: Decimal
+    order_type: OrderType = OrderType.MARKET
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    session: Session = Session.REGULAR
+    duration: Duration = Duration.DAY
+
+    @model_validator(mode="after")
+    def _validate_order_matrix(self) -> "OrderIntentIn":
+        """Enforce the field-requirement matrix at the schema boundary (Story 8.1).
+
+        A bad shape is a 422 HERE, BEFORE the engine — two layers by design (the
+        engine's :func:`coach.execution.validate_order_intent` stays the
+        authoritative gate). Deferred features (``stop``/``stop_limit`` type,
+        ``am``/``pm`` session, ``gtc`` duration) are refused as "not supported in
+        this version"; a MARKET carrying a limit/stop price or a LIMIT missing a
+        positive limit price / carrying a stop price is a field-shape violation.
+        Messages are kept consistent with the engine's.
+        """
+        if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+            raise ValueError(
+                "Stop and stop-limit orders aren't supported in this version yet."
+            )
+        if self.session in (Session.AM, Session.PM):
+            raise ValueError(
+                "Extended-hours (pre-market / after-hours) sessions aren't "
+                "supported in this version yet."
+            )
+        if self.duration == Duration.GTC:
+            raise ValueError(
+                "Good-till-canceled (GTC) orders aren't supported in this "
+                "version yet."
+            )
+        if self.order_type == OrderType.MARKET:
+            if self.limit_price is not None or self.stop_price is not None:
+                raise ValueError(
+                    "A market order can't carry a limit or stop price."
+                )
+        else:  # LIMIT
+            if self.stop_price is not None:
+                raise ValueError("A limit order can't carry a stop price.")
+            if (
+                self.limit_price is None
+                or not self.limit_price.is_finite()
+                or self.limit_price <= 0
+            ):
+                raise ValueError(
+                    "A limit order needs a limit price greater than zero."
+                )
+        return self
 
 
 class OrderIntentOut(BaseModel):
-    """A serialized ``order_intent`` — amount as a decimal STRING on the wire."""
+    """A serialized ``order_intent`` — money fields as decimal STRINGS on the wire.
+
+    The order-model fields (Story 8.1) are omit-when-default / null-when-None,
+    mirroring the persisted snapshot: a MARKET intent serializes to just
+    ``{symbol, side, amount}``; a LIMIT intent additively carries ``order_type`` +
+    ``limit_price``. The Coach never proposes a limit, so ``/recommend`` output
+    stays market-only in practice — the schema is kept forward-compatible.
+    """
 
     symbol: str
     side: OrderSide
     amount: str
+    order_type: OrderType | None = None
+    limit_price: str | None = None
+    stop_price: str | None = None
+    session: Session | None = None
+    duration: Duration | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -284,10 +356,23 @@ class ReconcileResponse(BaseModel):
 def _order_intent_out(intent: OrderIntent | None) -> OrderIntentOut | None:
     if intent is None:
         return None
+    # Omit-when-default / null-when-None (Story 8.1), mirroring the persisted
+    # snapshot: a MARKET intent stays ``{symbol, side, amount}`` on the wire.
     return OrderIntentOut(
         symbol=intent.symbol,
         side=intent.side,
         amount=format_money(intent.amount),
+        order_type=(
+            None if intent.order_type == OrderType.MARKET else intent.order_type
+        ),
+        limit_price=(
+            None if intent.limit_price is None else format_money(intent.limit_price)
+        ),
+        stop_price=(
+            None if intent.stop_price is None else format_money(intent.stop_price)
+        ),
+        session=None if intent.session == Session.REGULAR else intent.session,
+        duration=None if intent.duration == Duration.DAY else intent.duration,
     )
 
 
@@ -516,10 +601,17 @@ async def approve(
                 "Please start a new recommendation."
             ),
         )
+    # Carry ALL the order-model fields (Story 8.1) so the limit price actually
+    # reaches the adapter and the cosign snapshot — not just symbol/side/amount.
     intent = OrderIntent(
         symbol=body.order_intent.symbol,
         side=body.order_intent.side,
         amount=body.order_intent.amount,
+        order_type=body.order_intent.order_type,
+        limit_price=body.order_intent.limit_price,
+        stop_price=body.order_intent.stop_price,
+        session=body.order_intent.session,
+        duration=body.order_intent.duration,
     )
     try:
         outcome = await execute_approved_order(
@@ -537,6 +629,15 @@ async def approve(
         raise HTTPException(
             status_code=409, detail=RECONNECT_MESSAGE
         ) from exc
+    except OrderNotSupportedError as exc:
+        # A deferred order feature (Story 8.1): stop/stop_limit type, am/pm
+        # session, or gtc duration — rejected BEFORE any broker call. Since
+        # ``OrderNotSupportedError(ValueError)`` is caught by no existing typed
+        # arm, this MUST sit above the trailing ``except Exception`` (which would
+        # release + re-raise → 500). Release the claim (retryable) and surface a
+        # calm 422 "not supported in this version", symmetric with the scope arm.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OrderScopeError as exc:
         # Rejected before any broker call; release the claim (retryable) and
         # surface through the app envelope.

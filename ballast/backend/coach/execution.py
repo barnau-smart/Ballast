@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING
 
 from brokers.port import BrokerPort, OrderOutcome, OrderStatus
 from brokers.session import BrokerageSession
-from coach.recommendation import OrderIntent
+from coach.recommendation import Duration, OrderIntent, OrderType, Session
 from strategy.index_core import is_index_core
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (decision_record imports us)
@@ -76,6 +76,19 @@ class OrderScopeError(ValueError):
     amount. This is raised BEFORE any broker call, so the Broker Port is never
     reached for an out-of-scope order. The API layer maps it to the app error
     envelope (422).
+    """
+
+
+class OrderNotSupportedError(ValueError):
+    """Raised for an order feature not yet supported in this version (Story 8.1).
+
+    A calm, explicit refusal of the forward-compat order-model members Story A
+    does NOT execute: ``order_type`` in {``stop``, ``stop_limit``}, ``session`` in
+    {``am``, ``pm``}, or ``duration == gtc`` (all Story B). It is raised BEFORE any
+    broker call — the Broker Port is never reached for an unsupported order. The
+    API layer maps it to a calm 422 ("not supported in this version") and releases
+    the atomic claim so the decision stays retryable, symmetric with
+    :class:`OrderScopeError`.
     """
 
 
@@ -142,6 +155,61 @@ def mint_idempotency_key() -> str:
     return uuid.uuid4().hex
 
 
+def validate_order_intent(intent: OrderIntent) -> None:
+    """Enforce the field-requirement matrix + deferred-feature rejection (Story 8.1).
+
+    A pure, synchronous, NO-I/O gate run inside :func:`execute_approved_order`
+    AFTER session integrity and the ``is_index_core`` + ``amount`` gate, BEFORE
+    ``place_order`` — so the broker is never touched on any rejection. Two refusal
+    classes, kept distinct:
+
+    - **Deferred features** (Story B) → :class:`OrderNotSupportedError`:
+      ``order_type`` in {``STOP``, ``STOP_LIMIT``}, ``session`` in {``AM``, ``PM``},
+      or ``duration == GTC``. Checked FIRST so an unsupported feature is refused
+      as "not supported in this version" rather than as a field-shape violation.
+    - **Field-shape violations** (a malformed but in-scope order) →
+      :class:`OrderScopeError`: a ``MARKET`` order carrying a ``limit_price`` or
+      ``stop_price``; a ``LIMIT`` order missing a positive, finite ``limit_price``
+      or carrying a ``stop_price``.
+
+    Messages stay calm and specific. This mirrors the boundary-layer
+    ``OrderIntentIn`` validator (``api/coach.py``) but is the AUTHORITATIVE gate.
+    """
+    # Deferred features first (Story B) — an explicit "not supported yet" refusal.
+    if intent.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+        raise OrderNotSupportedError(
+            "Stop and stop-limit orders aren't supported in this version yet."
+        )
+    if intent.session in (Session.AM, Session.PM):
+        raise OrderNotSupportedError(
+            "Extended-hours (pre-market / after-hours) sessions aren't supported "
+            "in this version yet."
+        )
+    if intent.duration == Duration.GTC:
+        raise OrderNotSupportedError(
+            "Good-till-canceled (GTC) orders aren't supported in this version yet."
+        )
+
+    # Field-requirement matrix for the two supported order types.
+    if intent.order_type == OrderType.MARKET:
+        if intent.limit_price is not None or intent.stop_price is not None:
+            raise OrderScopeError(
+                "A market order can't carry a limit or stop price."
+            )
+        return
+    # order_type == LIMIT (the only remaining supported type):
+    if intent.stop_price is not None:
+        raise OrderScopeError("A limit order can't carry a stop price.")
+    if (
+        intent.limit_price is None
+        or not intent.limit_price.is_finite()
+        or intent.limit_price <= 0
+    ):
+        raise OrderScopeError(
+            "A limit order needs a limit price greater than zero."
+        )
+
+
 async def execute_approved_order(
     order_intent: OrderIntent,
     *,
@@ -190,8 +258,13 @@ async def execute_approved_order(
             "An order amount must be a finite value greater than zero."
         )
 
-    # Place the CANONICAL symbol so the gate and the placed order agree.
+    # Place the CANONICAL symbol so the gate and the placed order agree
+    # (``replace`` preserves the Story 8.1 order-model fields).
     canonical_intent = replace(order_intent, symbol=normalized_symbol)
+    # Order-shape validation LAST before placement (Story 8.1): field-requirement
+    # matrix + deferred-feature rejection. Runs after integrity + index-core/amount
+    # so the broker is never touched on any rejection.
+    validate_order_intent(canonical_intent)
     key = idempotency_key or mint_idempotency_key()
     placement = await broker.place_order(canonical_intent, idempotency_key=key)
     return await _reconcile(placement, broker=broker, idempotency_key=key)

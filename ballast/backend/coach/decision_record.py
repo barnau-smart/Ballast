@@ -57,7 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from brokers.port import OrderOutcome, OrderStatus
 from coach.execution import mint_idempotency_key
-from coach.recommendation import OrderIntent
+from coach.recommendation import Duration, OrderIntent, OrderType, Session
 from coach.validation import BlessedRecommendation
 from db.atomic import conditional_claim, lock_row
 from db.models import DecisionRecord
@@ -83,12 +83,35 @@ def _money(value: Decimal) -> str:
 
 
 def _order_intent_json(order_intent: OrderIntent) -> dict:
-    """Serialize an :class:`OrderIntent` for a JSON snapshot (money fixed-point)."""
-    return {
+    """Serialize an :class:`OrderIntent` for a JSON snapshot (money fixed-point).
+
+    OMIT-WHEN-DEFAULT (Story 8.1, regression-critical): the base
+    ``{symbol, side, amount}`` shape is always emitted; the order-model fields are
+    added ONLY when non-default — ``order_type`` when ``!= MARKET``, ``session``
+    when ``!= REGULAR``, ``duration`` when ``!= DAY``, and ``limit_price`` /
+    ``stop_price`` only when not ``None``. So a MARKET intent serializes to exactly
+    ``{symbol, side, amount}`` (byte-identical to pre-8.1, AC 5 — the
+    ``schema_version == 1`` / ``_ORDER_INTENT_JSON`` regression guards stay green)
+    while a LIMIT intent additively carries ``order_type: "limit"`` + ``limit_price``
+    (AC 1). This keeps :data:`DECISION_RECORD_SCHEMA_VERSION` at 1 (a pure additive
+    superset needing no replay adaptation).
+    """
+    result = {
         "symbol": order_intent.symbol,
         "side": order_intent.side.value,
         "amount": _money(order_intent.amount),
     }
+    if order_intent.order_type != OrderType.MARKET:
+        result["order_type"] = order_intent.order_type.value
+    if order_intent.limit_price is not None:
+        result["limit_price"] = _money(order_intent.limit_price)
+    if order_intent.stop_price is not None:
+        result["stop_price"] = _money(order_intent.stop_price)
+    if order_intent.session != Session.REGULAR:
+        result["session"] = order_intent.session.value
+    if order_intent.duration != Duration.DAY:
+        result["duration"] = order_intent.duration.value
+    return result
 
 
 def _snapshot(blessed: BlessedRecommendation) -> dict:
@@ -425,6 +448,14 @@ def _recovery_cosign_snapshot(record: DecisionRecord) -> dict:
     # Pass the proposed order_intent JSON through verbatim (already money-fixed).
     # A ``None`` proposed intent (possible on the offline default plan) still
     # yields a well-formed snapshot with a null executed intent.
+    #
+    # KNOWN degraded-recovery behavior (Story 8.1, by design — NOT a regression):
+    # the executed intent is taken from the coach's PROPOSED (MARKET-only)
+    # snapshot, but a LIMIT's ``order_type``/``limit_price`` are human-entered at
+    # /approve and never enter the proposed snapshot. So a crash-orphaned LIMIT
+    # order forward-recovered here snapshots as MARKET. This is out of scope for
+    # Story A (limit fields are human-entered; resting-order lifecycle is Story B)
+    # — left intentionally so a future reviewer doesn't flag it as a regression.
     return {
         "order_intent": snapshot.get("order_intent"),
         "outcome": {

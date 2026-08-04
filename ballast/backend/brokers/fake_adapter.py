@@ -12,14 +12,15 @@ in the real adapter with no caller changes (AD-8).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from urllib.parse import quote, urlencode
 
-from coach.recommendation import OrderIntent
+from coach.recommendation import OrderIntent, OrderSide, OrderType
 from brokers.port import (
     BrokerPort,
     BrokerTokens,
     Holding,
+    OrderNotPlaceableError,
     OrderOutcome,
     OrderStatus,
     PortfolioSnapshot,
@@ -162,11 +163,21 @@ class FakeBrokerAdapter(BrokerPort):
         recorded = self._orders.get(idempotency_key)
         if recorded is not None:
             return recorded
-        filled_qty = order_intent.amount / FAKE_FILL_PRICE
+        if order_intent.order_type == OrderType.LIMIT:
+            # Marketable LIMIT branch (Story 8.1): floor sizing at the limit price,
+            # a fill at exactly the limit price, and a marketable guard vs the
+            # deterministic reference quote. A non-marketable / sub-share limit
+            # raises ``OrderNotPlaceableError`` BEFORE anything is recorded.
+            filled_qty, avg_price = self._limit_fill(order_intent)
+        else:
+            # MARKET path — byte-for-byte UNCHANGED (AC 5): fractional
+            # ``amount / FAKE_FILL_PRICE``, no flooring, no <1-share refusal.
+            filled_qty = order_intent.amount / FAKE_FILL_PRICE
+            avg_price = FAKE_FILL_PRICE
         outcome = OrderOutcome(
             status=OrderStatus.FILLED,
             filled_qty=filled_qty,
-            avg_price=FAKE_FILL_PRICE,
+            avg_price=avg_price,
             broker_ref=f"fake-order-{idempotency_key}",
         )
         self._orders[idempotency_key] = outcome
@@ -175,6 +186,48 @@ class FakeBrokerAdapter(BrokerPort):
         if outcome.broker_ref is not None:
             self._orders_by_ref[outcome.broker_ref] = outcome
         return outcome
+
+    def _limit_fill(self, order_intent: OrderIntent) -> tuple[Decimal, Decimal]:
+        """Compute a deterministic marketable-LIMIT fill (Story 8.1).
+
+        :data:`FAKE_FILL_PRICE` is the reference quote for BOTH the ask and the
+        bid. Marketable guard: a BUY is refused when ``limit_price`` is below the
+        (ask) reference; a SELL when it is above the (bid) reference — a
+        non-marketable limit isn't immediately fillable, so it is refused calmly
+        via :class:`~brokers.port.OrderNotPlaceableError` (resting limit orders are
+        Story B). Sizing floors ``amount / limit_price`` to whole shares and
+        refuses a sub-share order the same way. The fill is at exactly the limit
+        price. Fully deterministic (no wall-clock, no randomness). Returns
+        ``(filled_qty, avg_price)``.
+        """
+        limit_price = order_intent.limit_price
+        if order_intent.side == OrderSide.BUY:
+            if limit_price < FAKE_FILL_PRICE:
+                raise OrderNotPlaceableError(
+                    f"A buy limit at ${limit_price:.2f} is below the current "
+                    f"price (${FAKE_FILL_PRICE:.2f}), so this limit isn't "
+                    "immediately fillable; resting limit orders are coming later "
+                    "— no order was placed."
+                )
+        else:
+            if limit_price > FAKE_FILL_PRICE:
+                raise OrderNotPlaceableError(
+                    f"A sell limit at ${limit_price:.2f} is above the current "
+                    f"price (${FAKE_FILL_PRICE:.2f}), so this limit isn't "
+                    "immediately fillable; resting limit orders are coming later "
+                    "— no order was placed."
+                )
+        quantity = int(
+            (order_intent.amount / limit_price).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        if quantity < 1:
+            raise OrderNotPlaceableError(
+                f"${order_intent.amount:.2f} buys less than one whole share at a "
+                f"${limit_price:.2f} limit — no order was placed."
+            )
+        return Decimal(quantity), limit_price
 
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
         """Return the recorded :class:`OrderOutcome` for ``idempotency_key`` (no network).

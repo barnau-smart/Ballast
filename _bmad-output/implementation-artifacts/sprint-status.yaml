@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-03  # Epic 3 retrospective done (3.6 shipped); Epic 3 fully closed
+last_updated: 2026-08-04  # Story 8.1 (marketable limit orders) implemented -> review; Story B next
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -124,6 +124,15 @@ development_status:
   7-6-live-preflight-payload-shape-harness: done
   7-7-gated-live-exercise-real-money: backlog
   epic-7-retrospective: optional
+
+  # Epic 8: Expand the Ordering Interface (marketable limit -> resting lifecycle -> UI)
+  # New pre-go-live feature (decided 2026-08-04); sequenced BEFORE the 7.7 real-money gate.
+  # 3-story split A/B/C; 8.1 is backend+API+tests (no UI), fill-immediate marketable limits.
+  epic-8: in-progress
+  8-1-marketable-limit-orders-order-model: review
+  8-2-resting-order-lifecycle: backlog
+  8-3-order-entry-ui-beginner-warnings: backlog
+  epic-8-retrospective: optional
 
 action_items:
   - epic: 4

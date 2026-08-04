@@ -33,7 +33,7 @@ from brokers.schwab_adapter import (
     SchwabNotConfiguredError,
     SchwabReadError,
 )
-from coach.recommendation import OrderIntent, OrderSide
+from coach.recommendation import OrderIntent, OrderSide, OrderType
 
 _auth = importlib.import_module("schwab.auth")
 _equities = importlib.import_module("schwab.orders.equities")
@@ -328,6 +328,170 @@ async def test_place_order_no_order_id_is_timeout(monkeypatch):
     reconciled = await adapter.get_order_status("k8")
     assert reconciled.status == OrderStatus.PENDING
     assert reconciled.broker_ref is None
+
+
+# --- place_order: marketable LIMIT (Story 8.1) --------------------------------
+
+
+def _record_limit_builders(monkeypatch) -> list:
+    """Patch the LIMIT builders to record (side, symbol, quantity, price) calls.
+
+    The limit builders take THREE args ``(symbol, quantity, price)`` — distinct
+    from the 2-arg market recorders (``_record_builders``); price is the
+    fixed-point STRING the adapter passes.
+    """
+    calls: list = []
+
+    def _buy(symbol, quantity, price):
+        calls.append(("buy_limit", symbol, quantity, price))
+        return f"buy-limit-spec-{symbol}-{quantity}-{price}"
+
+    def _sell(symbol, quantity, price):
+        calls.append(("sell_limit", symbol, quantity, price))
+        return f"sell-limit-spec-{symbol}-{quantity}-{price}"
+
+    monkeypatch.setattr(_equities, "equity_buy_limit", _buy)
+    monkeypatch.setattr(_equities, "equity_sell_limit", _sell)
+    return calls
+
+
+def _limit_intent(
+    *, side=OrderSide.BUY, symbol="VOO", amount="250", limit_price="100.00"
+) -> OrderIntent:
+    return OrderIntent(
+        symbol=symbol,
+        side=side,
+        amount=Decimal(amount),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal(limit_price),
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_order_buy_limit_builds_fixed_point_string_price(monkeypatch):
+    client = _FakeClient(
+        quote={"VOO": {"quote": {"askPrice": 100, "bidPrice": 99}}},
+        order={"status": "FILLED", "filledQuantity": 2, "avgFillPrice": 100},
+    )
+    _install_client(monkeypatch, client)
+    calls = _record_limit_builders(monkeypatch)
+    _set_order_id(monkeypatch, 771)
+
+    outcome = await _adapter().place_order(
+        _limit_intent(side=OrderSide.BUY, amount="250", limit_price="100.00"),
+        idempotency_key="lk1",
+    )
+
+    # floor(250 / 100) = 2 shares; price passed as the fixed-point STRING.
+    assert calls == [("buy_limit", "VOO", 2, "100.00")]
+    assert outcome.status == OrderStatus.FILLED
+    assert len(client.placed) == 1
+
+
+@pytest.mark.asyncio
+async def test_place_order_sell_limit_uses_bid_and_sell_builder(monkeypatch):
+    # A SELL limit's marketable guard reads the BID (not the ask).
+    client = _FakeClient(
+        quote={"VTI": {"quote": {"askPrice": 101, "bidPrice": 100}}},
+        order={"status": "FILLED", "filledQuantity": 5, "avgFillPrice": 100},
+    )
+    _install_client(monkeypatch, client)
+    calls = _record_limit_builders(monkeypatch)
+    _set_order_id(monkeypatch, 772)
+
+    await _adapter().place_order(
+        _limit_intent(
+            side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="100.00"
+        ),
+        idempotency_key="lk2",
+    )
+
+    # floor(500 / 100) = 5 shares via the SELL-limit builder at "100.00".
+    assert calls == [("sell_limit", "VTI", 5, "100.00")]
+
+
+def test_equity_buy_limit_builds_day_normal_limit_payload():
+    # AC 4: call the REAL builder (no network) and assert the built payload shape
+    # — orderType LIMIT, the price as the fixed-point STRING, NORMAL/DAY.
+    spec = _equities.equity_buy_limit("VOO", 2, "100.00").build()
+    assert spec["orderType"] == "LIMIT"
+    assert spec["price"] == "100.00"  # the string, not Decimal("100.00")
+    assert spec["session"] == "NORMAL"
+    assert spec["duration"] == "DAY"
+
+
+def test_equity_sell_limit_builds_day_normal_limit_payload():
+    spec = _equities.equity_sell_limit("VTI", 5, "100.00").build()
+    assert spec["orderType"] == "LIMIT"
+    assert spec["price"] == "100.00"
+    assert spec["session"] == "NORMAL"
+    assert spec["duration"] == "DAY"
+
+
+@pytest.mark.asyncio
+async def test_place_order_non_marketable_buy_limit_refuses(monkeypatch):
+    # BUY limit BELOW the ask isn't immediately fillable → calm refusal, no place.
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100, "bidPrice": 99}}})
+    _install_client(monkeypatch, client)
+    calls = _record_limit_builders(monkeypatch)
+
+    with pytest.raises(OrderNotPlaceableError, match="coming later"):
+        await _adapter().place_order(
+            _limit_intent(side=OrderSide.BUY, amount="500", limit_price="90.00"),
+            idempotency_key="lk3",
+        )
+    assert client.placed == []
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_order_non_marketable_sell_limit_refuses(monkeypatch):
+    # SELL limit ABOVE the bid isn't immediately fillable → calm refusal, no place.
+    client = _FakeClient(quote={"VTI": {"quote": {"askPrice": 101, "bidPrice": 100}}})
+    _install_client(monkeypatch, client)
+    calls = _record_limit_builders(monkeypatch)
+
+    with pytest.raises(OrderNotPlaceableError, match="coming later"):
+        await _adapter().place_order(
+            _limit_intent(
+                side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="110.00"
+            ),
+            idempotency_key="lk4",
+        )
+    assert client.placed == []
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_order_sub_share_limit_refuses(monkeypatch):
+    # Marketable (limit >= ask) but floor(amount / limit) < 1 → sub-share refusal.
+    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100, "bidPrice": 99}}})
+    _install_client(monkeypatch, client)
+    _record_limit_builders(monkeypatch)
+
+    with pytest.raises(OrderNotPlaceableError):
+        await _adapter().place_order(
+            _limit_intent(side=OrderSide.BUY, amount="50", limit_price="100.00"),
+            idempotency_key="lk5",
+        )
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_place_order_limit_unusable_quote_refuses(monkeypatch):
+    # A missing side-relevant leg (bid for a sell) is an unusable quote → refuse.
+    client = _FakeClient(quote={"VTI": {"quote": {"askPrice": 101}}})  # no bidPrice
+    _install_client(monkeypatch, client)
+    _record_limit_builders(monkeypatch)
+
+    with pytest.raises(OrderNotPlaceableError):
+        await _adapter().place_order(
+            _limit_intent(
+                side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="100.00"
+            ),
+            idempotency_key="lk6",
+        )
+    assert client.placed == []
 
 
 # --- fetch_portfolio (Story 6.5) ----------------------------------------------

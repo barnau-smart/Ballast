@@ -60,7 +60,7 @@ from coach.execution import (
     SessionIntegrityError,
     execute_approved_order,
 )
-from coach.recommendation import OrderIntent, OrderSide
+from coach.recommendation import OrderIntent, OrderSide, OrderType
 from db.connection import get_connection
 from db.models import BrokerageToken, DecisionRecord, MarketDaily, PortfolioCache
 from db.scope import Scope
@@ -1934,6 +1934,160 @@ def test_cosigned_record_is_replay_ready(client):
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _clean_market([SYM])
+        _delete_user(email)
+
+
+def test_approve_marketable_limit_cosigns_truthfully(client):
+    # Story 8.1 (AC 1): a human LIMIT override, marketable (limit == fake fill
+    # price 100), fills end-to-end. The cosign snapshot TRUTHFULLY carries
+    # order_type="limit" + limit_price, and outcome.avg_price == limit_price.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {
+                    "symbol": "VTI",
+                    "side": "buy",
+                    "amount": "500",
+                    "order_type": "limit",
+                    "limit_price": "100.00",
+                },
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "filled"
+        # floor(500 / 100) = 5 whole shares, filled at the limit price.
+        assert body["filled_qty"] == "5"
+        assert body["avg_price"] == "100.00"
+        assert len(spy.calls) == 1
+        # The engine received the full limit intent (not just symbol/side/amount).
+        intent, _key = spy.calls[0]
+        assert intent.order_type is OrderType.LIMIT
+        assert intent.limit_price == Decimal("100.00")
+
+        cosign_snap = _decision_rows(uid)[0]["cosign_snapshot"]
+        # Truthful, ADDITIVE snapshot (omit-when-default: no session/duration keys).
+        assert cosign_snap["order_intent"] == {
+            "symbol": "VTI",
+            "side": "buy",
+            "amount": "500",
+            "order_type": "limit",
+            "limit_price": "100.00",
+        }
+        # outcome.avg_price == limit_price (AC 1).
+        assert cosign_snap["outcome"]["status"] == "filled"
+        assert cosign_snap["outcome"]["avg_price"] == "100.00"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_non_marketable_limit_422_releases_claim(client):
+    # Story 8.1 (AC 2): a non-marketable BUY limit (below the fill price) is a calm
+    # 422 (never a 500, never a phantom fill), the claim is released so the
+    # decision returns to 'proposed' and stays retryable.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {
+                    "symbol": "VTI",
+                    "side": "buy",
+                    "amount": "500",
+                    "order_type": "limit",
+                    "limit_price": "90.00",  # below the fake fill price → not marketable
+                },
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert "coming later" in resp.json()["error"]["message"]
+        # Claim released → the decision is back to 'proposed' (retryable).
+        assert _decision_rows(uid)[0]["status"] == "proposed"
+
+        # Retry with a marketable limit now succeeds (the record was never stuck).
+        retry = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {
+                    "symbol": "VTI",
+                    "side": "buy",
+                    "amount": "500",
+                    "order_type": "limit",
+                    "limit_price": "100.00",
+                },
+            },
+            headers=headers,
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == "filled"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"order_type": "stop", "stop_price": "90.00"},
+        {"order_type": "stop_limit", "limit_price": "100.00", "stop_price": "90.00"},
+        {"session": "am"},
+        {"session": "pm"},
+        {"duration": "gtc"},
+    ],
+)
+def test_approve_deferred_features_rejected_422_no_broker(client, override):
+    # Story 8.1 (AC 3): a deferred order feature is rejected with a calm 422 at the
+    # schema boundary, BEFORE any broker call.
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        _insert_token_sync(_user_id_for(email), _live())
+
+        order_intent = {"symbol": "VTI", "side": "buy", "amount": "500"}
+        order_intent.update(override)
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": str(uuid.uuid4()),
+                "order_intent": order_intent,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        # The broker was NEVER touched (rejected at the boundary).
+        assert spy.calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
 
 

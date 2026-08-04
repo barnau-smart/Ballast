@@ -36,7 +36,8 @@ from brokers.port import (
     OrderStatus,
     PortfolioSnapshot,
 )
-from coach.recommendation import OrderIntent, OrderSide
+from coach.recommendation import OrderIntent, OrderSide, OrderType
+from money import format_money
 
 # Schwab's OAuth authorize endpoint (used only to reconstruct the received-url
 # for the code exchange; the actual authorization_url is built by schwab-py).
@@ -323,15 +324,23 @@ class SchwabAdapter(BrokerPort):
     async def place_order(
         self, order_intent: OrderIntent, *, idempotency_key: str
     ) -> OrderOutcome:
-        """Place a whole-share MARKET order on Schwab and return its outcome (Story 6.3).
+        """Place a whole-share MARKET or marketable LIMIT order on Schwab (Story 6.3 / 8.1).
 
         The single execution write (AD-7) — no poll/retry/wait-loop. Sizing is the
-        locked v1 decision: fetch a placement-time quote, size a WHOLE-SHARE market
-        order (``quantity = floor(amount / ask)``) and refuse calmly via
+        locked v1 decision: fetch a placement-time quote, size a WHOLE-SHARE order
+        (``quantity = floor(amount / price)``, price = ask for MARKET, limit_price
+        for LIMIT) and refuse calmly via
         :class:`~brokers.port.OrderNotPlaceableError` if the dollar ``amount`` buys
         less than one share (or the quote is unusable) — no order is placed. Buy
         vs. sell chooses the matching share-quantity equity builder (schwab-py
         1.5.1 exposes no notional/fractional builder).
+
+        A LIMIT order (Story 8.1) is MARKETABLE-only: it is guarded to be
+        immediately fillable against the side-relevant leg (buy→ask, sell→bid) and
+        refused if not (resting limit orders are Story B). Its price is passed to
+        the ``equity_*_limit`` builder as a fixed-point STRING (money discipline).
+        Only the builder + quantity construction differs from the market path; the
+        post-placement fence below is shared and unchanged.
 
         Failure classes are kept honest and distinct: an HTTP-error placement
         response is a truthful broker ``REJECTED``; any ``httpx``/SDK TRANSPORT
@@ -349,7 +358,12 @@ class SchwabAdapter(BrokerPort):
         # is a config error that must surface plainly, NOT masquerade as a
         # timeout, so it is constructed OUTSIDE the transport net below.
         client = self._trading_client()
-        from schwab.orders.equities import equity_buy_market, equity_sell_market
+        from schwab.orders.equities import (
+            equity_buy_limit,
+            equity_buy_market,
+            equity_sell_limit,
+            equity_sell_market,
+        )
         from schwab.utils import (
             AccountHashMismatchException,
             UnsuccessfulOrderException,
@@ -366,23 +380,80 @@ class SchwabAdapter(BrokerPort):
         account_hash: str | None = None
         try:
             account_hash = self._account_hash(client)
-            ask = self._quote_ask(client, order_intent.symbol)
-            # Whole-share sizing: floor(amount / ask). ``amount``/``ask`` are
-            # positive Decimals, so integral-floor is an honest whole-share count.
-            quantity = int(
-                (order_intent.amount / ask).to_integral_value(rounding=ROUND_FLOOR)
-            )
-            if quantity < 1:
-                raise OrderNotPlaceableError(
-                    f"${order_intent.amount:.2f} buys less than one whole share "
-                    f"of {order_intent.symbol} at about ${ask:.2f} — no order "
-                    "was placed."
+            is_buy = order_intent.side == OrderSide.BUY
+            if order_intent.order_type == OrderType.LIMIT:
+                # Marketable LIMIT branch (Story 8.1): size on the LIMIT price,
+                # guard that the limit is immediately fillable against the
+                # side-relevant leg (buy→ask, sell→bid), and build the DAY/NORMAL
+                # limit spec. Only the builder + quantity differ from the market
+                # path; the post-placement fence below is shared and unchanged.
+                limit_price = order_intent.limit_price
+                quote = self._read_quote(client, order_intent.symbol)
+                reference = self._usable_price(
+                    quote,
+                    "askPrice" if is_buy else "bidPrice",
+                    order_intent.symbol,
                 )
-            builder = (
-                equity_buy_market(order_intent.symbol, quantity)
-                if order_intent.side == OrderSide.BUY
-                else equity_sell_market(order_intent.symbol, quantity)
-            )
+                # Whole-share sizing on the limit price.
+                quantity = int(
+                    (order_intent.amount / limit_price).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+                if quantity < 1:
+                    raise OrderNotPlaceableError(
+                        f"${order_intent.amount:.2f} buys less than one whole "
+                        f"share of {order_intent.symbol} at a ${limit_price:.2f} "
+                        "limit — no order was placed."
+                    )
+                # Marketable guard: a buy must meet/exceed the ask, a sell must
+                # meet/undercut the bid — otherwise the limit isn't immediately
+                # fillable (resting limit orders are coming later, Story B).
+                if is_buy and limit_price < reference:
+                    raise OrderNotPlaceableError(
+                        f"A buy limit at ${limit_price:.2f} is below the current "
+                        f"ask (${reference:.2f}), so this limit isn't immediately "
+                        "fillable; resting limit orders are coming later — no "
+                        "order was placed."
+                    )
+                if not is_buy and limit_price > reference:
+                    raise OrderNotPlaceableError(
+                        f"A sell limit at ${limit_price:.2f} is above the current "
+                        f"bid (${reference:.2f}), so this limit isn't immediately "
+                        "fillable; resting limit orders are coming later — no "
+                        "order was placed."
+                    )
+                # CRITICAL: pass the price as a fixed-point STRING, never a
+                # Decimal — schwab-py's ``set_price`` stores a str verbatim but
+                # runs a Decimal/float through binary-float truncation (money
+                # discipline; Story 8.1 §CRITICAL).
+                price_str = format_money(limit_price)
+                builder = (
+                    equity_buy_limit(order_intent.symbol, quantity, price_str)
+                    if is_buy
+                    else equity_sell_limit(order_intent.symbol, quantity, price_str)
+                )
+            else:
+                ask = self._quote_ask(client, order_intent.symbol)
+                # Whole-share sizing: floor(amount / ask). ``amount``/``ask`` are
+                # positive Decimals, so integral-floor is an honest whole-share
+                # count.
+                quantity = int(
+                    (order_intent.amount / ask).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+                if quantity < 1:
+                    raise OrderNotPlaceableError(
+                        f"${order_intent.amount:.2f} buys less than one whole "
+                        f"share of {order_intent.symbol} at about ${ask:.2f} — no "
+                        "order was placed."
+                    )
+                builder = (
+                    equity_buy_market(order_intent.symbol, quantity)
+                    if is_buy
+                    else equity_sell_market(order_intent.symbol, quantity)
+                )
             resp = client.place_order(account_hash, builder)
         except OrderNotPlaceableError:
             # A deliberate, calm pre-placement refusal — surface it, never a fill.
@@ -739,14 +810,14 @@ class SchwabAdapter(BrokerPort):
             self._account_hash_cache = hash_value
         return self._account_hash_cache
 
-    def _quote_ask(self, client, symbol: str) -> Decimal:
-        """Read the current ask for ``symbol`` (Decimal); refuse if unusable.
+    def _read_quote(self, client, symbol: str) -> dict:
+        """Read ``symbol``'s inner quote node + run the passive pre-flight tap.
 
-        Sizing uses the ask (the locked decision). A missing or non-positive ask
-        means we cannot honestly size a whole-share order, so we refuse calmly
-        via :class:`~brokers.port.OrderNotPlaceableError` rather than placing on a
-        guessed price. The exact quote JSON shape is fixture-driven and
-        re-confirmed at go-live.
+        Factored out of :meth:`_quote_ask` (Story 8.1) so both the MARKET ask read
+        and a LIMIT's side-relevant leg (ask for a buy, bid for a sell) share one
+        network read and the SAME Story 7.6 quote capture. Returns the innermost
+        ``{...}["quote"]`` dict (``{}`` when absent). The exact quote JSON shape is
+        fixture-driven and re-confirmed at go-live.
         """
         resp = client.get_quote(symbol)
         data = resp.json() or {}
@@ -754,25 +825,44 @@ class SchwabAdapter(BrokerPort):
         # (redacted) only when capture is enabled; no-op when OFF.
         self._preflight_capture("quote", data)
         node = data.get(symbol) or {}
-        quote = node.get("quote") or {}
-        ask_raw = quote.get("askPrice")
-        if ask_raw is None:
+        return node.get("quote") or {}
+
+    def _usable_price(self, quote: dict, field: str, symbol: str) -> Decimal:
+        """Return the finite, positive ``quote[field]`` as ``Decimal``; refuse if not.
+
+        The shared unusable-quote refusal (Story 8.1): a missing / non-numeric /
+        non-positive / non-finite ``field`` (``askPrice`` or ``bidPrice``) means we
+        cannot honestly size or guard against a real price, so refuse calmly via
+        :class:`~brokers.port.OrderNotPlaceableError` rather than placing on a
+        guessed price. A NaN/Infinity value parses to a valid-but-non-finite
+        Decimal (no raise on parse), so ``is_finite()`` is checked before any ``<=``
+        comparison (which would otherwise raise ``InvalidOperation``).
+        """
+        raw = quote.get(field)
+        if raw is None:
             raise OrderNotPlaceableError(
                 f"No usable quote for {symbol} right now — no order was placed."
             )
         try:
-            ask = Decimal(str(ask_raw))
+            price = Decimal(str(raw))
         except (InvalidOperation, ValueError):
-            ask = Decimal("0")
-        # A NaN/Infinity ask parses to a valid-but-non-finite Decimal (no raise
-        # above), and comparing it with ``<=`` would raise ``InvalidOperation``
-        # (an ``ArithmeticError``) — reject it as unusable up front so a garbage
-        # quote is a calm refusal, never a raw exception leaking the port.
-        if not ask.is_finite() or ask <= 0:
+            price = Decimal("0")
+        if not price.is_finite() or price <= 0:
             raise OrderNotPlaceableError(
                 f"No usable quote for {symbol} right now — no order was placed."
             )
-        return ask
+        return price
+
+    def _quote_ask(self, client, symbol: str) -> Decimal:
+        """Read the current ask for ``symbol`` (Decimal); refuse if unusable.
+
+        Sizing on the MARKET path uses the ask (the locked decision). Delegates to
+        :meth:`_read_quote` + :meth:`_usable_price` so the market read and the
+        Story 8.1 limit read share one code path and one pre-flight tap.
+        """
+        return self._usable_price(
+            self._read_quote(client, symbol), "askPrice", symbol
+        )
 
     def _map_order(
         self,

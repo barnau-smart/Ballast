@@ -37,18 +37,71 @@ class OrderSide(str, Enum):
     SELL = "sell"
 
 
+class OrderType(str, Enum):
+    """The order-execution type (Story 8.1 — order-interface expansion).
+
+    ``MARKET`` fills at the prevailing price (the v1 default); ``LIMIT`` caps the
+    price via an explicit ``limit_price`` (Story A supports only MARKETABLE limits
+    — they fill immediately). ``STOP``/``STOP_LIMIT`` are forward-compat enum
+    members REJECTED at the gate until Story B. String-backed to mirror
+    :class:`OrderSide` and serialize cleanly into JSON snapshots.
+    """
+
+    MARKET = "market"
+    LIMIT = "limit"
+    STOP = "stop"
+    STOP_LIMIT = "stop_limit"
+
+
+class Session(str, Enum):
+    """The trading session an order is valid in (Story 8.1).
+
+    ``REGULAR`` is the standard market session (the v1 default). ``AM``/``PM`` are
+    the extended (pre-/post-market) sessions — forward-compat members REJECTED at
+    the gate until Story B.
+    """
+
+    REGULAR = "regular"
+    AM = "am"
+    PM = "pm"
+
+
+class Duration(str, Enum):
+    """How long an order stays working (Story 8.1).
+
+    ``DAY`` expires at the close of the trading day (the v1 default). ``GTC``
+    (good-till-canceled) rests across sessions — a forward-compat member REJECTED
+    at the gate until Story B (resting-order lifecycle).
+    """
+
+    DAY = "day"
+    GTC = "gtc"
+
+
 @dataclass(frozen=True)
 class OrderIntent:
     """The optional typed executable payload handed to the Broker Port.
 
     ``symbol`` is the instrument; ``side`` is an :class:`OrderSide`; ``amount`` is
-    ``Decimal`` (never float). Order-semantics validation (4.6-4.8) is NOT this
-    story's concern — this is only the structural payload shape.
+    ``Decimal`` (never float). The order-model fields (Story 8.1) are OPTIONAL and
+    DEFAULTED so every existing 3-arg construction (positional or keyword) stays
+    valid and existing MARKET flows are byte-for-byte unchanged: ``order_type``
+    defaults to :attr:`OrderType.MARKET`, ``session`` to :attr:`Session.REGULAR`,
+    ``duration`` to :attr:`Duration.DAY`, and ``limit_price``/``stop_price`` to
+    ``None``. Money fields are ``Decimal`` (never float). The field-requirement
+    matrix + deferred-feature rejection is enforced at placement time by
+    :func:`coach.execution.validate_order_intent`, not here — this is only the
+    structural payload shape.
     """
 
     symbol: str
     side: OrderSide
     amount: Decimal
+    order_type: OrderType = OrderType.MARKET
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    session: Session = Session.REGULAR
+    duration: Duration = Duration.DAY
 
 
 @dataclass(frozen=True)
@@ -128,6 +181,12 @@ def recommendation_from_output(output: dict) -> Recommendation:
     raw_intent = output.get("order_intent")
     if isinstance(raw_intent, dict):
         try:
+            # DELIBERATE (Story 8.1): the LLM contract stays MARKET-only. Only
+            # symbol/side/amount are parsed from the coach output; the new
+            # order-model fields take their MARKET/REGULAR/DAY/None defaults. This
+            # is what structurally enforces the locked decision "the LLM coach
+            # never sets a limit price" — limit fields are human-entered on the
+            # /approve path, never proposable by the model.
             order_intent = OrderIntent(
                 symbol=str(raw_intent.get("symbol", "")),
                 side=OrderSide(raw_intent.get("side", OrderSide.BUY.value)),
