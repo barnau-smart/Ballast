@@ -81,6 +81,7 @@ from coach.execution import (
     OrderNotSupportedError,
     OrderScopeError,
     SessionIntegrityError,
+    cancel_pending_decision,
     execute_approved_order,
     reconcile_pending_decision,
 )
@@ -350,6 +351,36 @@ class ReconcileResponse(BaseModel):
     avg_price: str | None = None
     broker_ref: str | None = None
     needs_reconfirmation: bool
+
+
+class CancelResponse(BaseModel):
+    """The result of a cancel on a cosigned resting order (Story 8.2), money as strings.
+
+    ``status``/``filled_qty``/``avg_price``/``broker_ref`` are the truthful
+    post-cancel :class:`~brokers.port.OrderOutcome` — ``rejected`` on a confirmed
+    cancel (cancel reuses ``REJECTED``; there is no ``cancelled`` member). Returned
+    at 200 whenever the broker was actually called; a refused cancel (already
+    settled / partially filled / no order id) is a calm 422 envelope, never this
+    body.
+
+    ``needs_reconfirmation`` (Story 8.2, mirroring
+    :class:`ReconcileResponse`) is ``True`` whenever the post-cancel read-back is
+    anything other than a confirmed terminal ``rejected`` — a transport
+    ``timeout`` or a still-``pending`` (cancel not yet applied) order, AND ALSO
+    the race-window case where the order actually ``filled``/``partial``-filled
+    just before the DELETE applied (``cancel_order`` reads back the true broker
+    state through ``_map_order``, exactly as the reconcile path does, so a cancel
+    that loses the race truthfully surfaces the fill rather than a phantom
+    cancel). In every case the outcome is the honest latest-known truth, is
+    persisted, and stays reconcilable; the response is still 200. ``False`` only
+    on a confirmed terminal ``rejected`` cancel.
+    """
+
+    status: str
+    filled_qty: str
+    avg_price: str | None = None
+    broker_ref: str | None = None
+    needs_reconfirmation: bool = False
 
 
 # --- Serialization helpers ---------------------------------------------------
@@ -863,4 +894,105 @@ async def reconcile_decision(
         ),
         broker_ref=outcome.broker_ref,
         needs_reconfirmation=result.needs_reconfirmation,
+    )
+
+
+@router.post("/decisions/{decision_id}/cancel", response_model=CancelResponse)
+async def cancel_decision(
+    decision_id: UUID,
+    scope: Scope = Depends(get_scope),
+    broker_session: BrokerageSession = Depends(require_live_broker_session),
+    broker: BrokerPort = Depends(get_execution_broker),
+    session: AsyncSession = Depends(get_async_session),
+) -> CancelResponse:
+    """CANCEL a cosigned resting order by its persisted ``broker_ref`` (Story 8.2).
+
+    The HTTP boundary for the resting-order lifecycle's cancel verb, mirroring
+    :func:`reconcile_decision`. A resting limit that co-signed ``pending`` can be
+    affirmatively cancelled: the broker cancels it, it maps to ``rejected`` (cancel
+    reuses ``REJECTED`` — there is no ``cancelled`` member), and it is not
+    re-placeable.
+
+    Only reached on an authenticated user AND a live brokerage session
+    (:func:`require_live_broker_session` → calm 409 reconnect otherwise). Loads the
+    record through the sole reader (:func:`load_decision`, per-user scoped — a
+    foreign/unknown id is invisible → 404). A record not yet ``cosigned`` has no
+    placed order to cancel → calm 422. Otherwise it delegates to the Coach Engine's
+    :func:`cancel_pending_decision` (the SOLE caller of ``cancel_order``, AD-7),
+    which re-asserts placement-time integrity (mapped HERE to the same calm 409
+    ``RECONNECT_MESSAGE`` as ``approve``/``reconcile`` on a
+    :class:`SessionIntegrityError`).
+
+    A cancel that is REFUSED without touching the broker — the order is already
+    terminal/settled (``filled``/``rejected``, which also makes a second cancel
+    idempotent) or carries no ``broker_ref`` — is a calm 422, NEVER a 500. When the
+    broker WAS called (``cancelled=True``) the ``rejected`` outcome is persisted via
+    :func:`record_reconciliation` under ``lock_decision`` (additive; the immutable
+    snapshots are never mutated) and committed. Money crosses the wire as
+    fixed-point strings.
+    """
+    record = await load_decision(decision_id, scope=scope, session=session)
+    if record is None:
+        # Unknown or foreign decision_id → invisible under this user's scope.
+        raise HTTPException(status_code=404, detail="Decision record not found.")
+    if record.status != "cosigned":
+        # A proposed/cosigning record placed no order — nothing to cancel yet.
+        raise HTTPException(
+            status_code=422,
+            detail="This decision has no placed order to cancel yet.",
+        )
+
+    try:
+        result = await cancel_pending_decision(
+            record, broker=broker, broker_session=broker_session
+        )
+    except SessionIntegrityError as exc:
+        # Session lapsed or provider mismatched at cancel time — the same calm
+        # reconnect envelope as the entry gate; the broker was never touched.
+        raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
+    except SchwabNotConfiguredError as exc:
+        # A DETERMINISTIC config/auth fault surfaced by ``cancel_order`` at client
+        # build — map it to the SAME calm 409 reconnect envelope, DISTINCT from a
+        # transport blip. Nothing is persisted (the fault precedes the persist).
+        raise HTTPException(status_code=409, detail=RECONNECT_MESSAGE) from exc
+
+    if result.refused:
+        # Already settled / already partially filled / no order id — a calm 422
+        # (never a 500); the broker was never touched. Idempotent: a second cancel
+        # sees the first's terminal rejected and lands here too. A ``partial`` order
+        # is refused because cancelling it would erase its real filled shares (B1
+        # scope).
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This order can no longer be cancelled — it is already settled or "
+                "partially filled."
+            ),
+        )
+
+    # The broker WAS called (cancelled=True): persist the outcome under a row lock
+    # (Story 7.2) via the sole writer (AD-6), advancing pending → rejected (or
+    # persisting the honest indeterminate timeout/pending latest-known truth), then
+    # commit. Mirrors the reconcile persist exactly.
+    locked = await lock_decision(decision_id, scope=scope, session=session)
+    if locked is not None:
+        record_reconciliation(locked, outcome=result.outcome)
+        await session.commit()
+
+    outcome = result.outcome
+    # Honesty signal (Story 8.2, mirrors the reconcile endpoint): a cancel is a
+    # CLEAN success only when the broker positively confirmed a terminal
+    # ``rejected`` (canceled) state. A ``timeout`` (transport blip after the DELETE)
+    # or a still-``pending`` read-back means the order's true state is unknown /
+    # still working — flag it so the response doesn't claim a clean cancel. The
+    # outcome is persisted above and stays reconcilable.
+    needs_reconfirmation = outcome.status.value != "rejected"
+    return CancelResponse(
+        status=outcome.status.value,
+        filled_qty=format_money(outcome.filled_qty),
+        avg_price=(
+            None if outcome.avg_price is None else format_money(outcome.avg_price)
+        ),
+        broker_ref=outcome.broker_ref,
+        needs_reconfirmation=needs_reconfirmation,
     )

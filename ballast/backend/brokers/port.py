@@ -259,3 +259,33 @@ class BrokerPort(ABC):
         method never logs token/secret material.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        """Cancel a previously-placed order **by its persisted broker order id** (8.2).
+
+        The only NEW broker verb of Story 8.2 (the resting-order lifecycle): a
+        resting limit that co-signed ``pending`` can be affirmatively cancelled.
+        Cancel reuses the closed 5-member :class:`OrderStatus` contract — a
+        cancelled order surfaces as ``REJECTED`` (terminal, not re-placeable);
+        there is NO new ``cancelled`` member (Schwab already normalizes
+        ``CANCELED`` → ``REJECTED`` in ``_map_order``).
+
+        Called ONLY by the Coach Engine's cancel owner
+        (:func:`coach.execution.cancel_pending_decision`, AD-7) — never by an API
+        handler directly. That owner asserts placement-time session integrity
+        FIRST and short-circuits a terminal / no-``broker_ref`` order WITHOUT ever
+        reaching this method, so this is only ever invoked with a usable
+        ``broker_ref`` on a live, provider-matched session.
+
+        The concrete adapter cancels the order at the broker and reads back the
+        authoritative post-cancel state (mapping ``CANCELED`` → ``REJECTED``). A
+        transport/SDK/parse failure is INDETERMINATE → ``TIMEOUT`` with the
+        ``broker_ref`` PRESERVED and NO raw exception leaking past the port
+        (mirrors the :meth:`get_order_status_by_ref` fence discipline), so the
+        order stays reconcilable.
+
+        Money in the returned outcome is ``Decimal`` (never binary float). This
+        method never logs token/secret material.
+        """
+        raise NotImplementedError

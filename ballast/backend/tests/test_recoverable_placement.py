@@ -362,6 +362,123 @@ async def test_concurrent_reconcile_never_regresses_terminal_outcome():
         _delete_user(owner)
 
 
+@pytest.mark.asyncio
+async def test_partial_advances_to_filled_but_never_regresses():
+    """Story 8.2: an effective ``partial`` advances to ``filled`` but never regresses.
+
+    Closes the Epic 6 partial-fill action item: ``partial`` is no longer terminal,
+    so a re-reconcile can advance it to ``filled`` (or a larger partial), but the
+    advance-only guard in ``record_reconciliation`` must IGNORE an incoming
+    ``pending``/``timeout`` re-read so a partial can never regress.
+    """
+    from coach.decision_record import lock_decision, effective_outcome_status
+
+    owner = _make_user()
+    try:
+        decision_id = _insert_proposed(owner, idempotency_key="k-p")
+        scope = Scope.for_user(owner)
+        intent = OrderIntent(symbol="VTI", side=OrderSide.BUY, amount=Decimal("500"))
+
+        # Cosign with an indeterminate (pending) outcome carrying a ref.
+        async with async_session_maker() as session:
+            await claim_for_cosign(decision_id, scope=scope, session=session)
+            record = await lock_decision(
+                decision_id, scope=scope, session=session
+            )
+            cosign(
+                record,
+                order_intent=intent,
+                outcome=OrderOutcome(
+                    status=OrderStatus.PENDING,
+                    filled_qty=Decimal("0"),
+                    avg_price=None,
+                    broker_ref="ref-p",
+                ),
+                idempotency_key="k-p",
+            )
+            await session.commit()
+
+        partial = OrderOutcome(
+            status=OrderStatus.PARTIAL,
+            filled_qty=Decimal("1"),
+            avg_price=Decimal("500.00"),
+            broker_ref="ref-p",
+        )
+        pending_reread = OrderOutcome(
+            status=OrderStatus.PENDING,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="ref-p",
+        )
+        timeout_reread = OrderOutcome(
+            status=OrderStatus.TIMEOUT,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="ref-p",
+        )
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("2"),
+            avg_price=Decimal("500.00"),
+            broker_ref="ref-p",
+        )
+
+        # 1) pending → partial (written).
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            record_reconciliation(locked, outcome=partial)
+            await session.commit()
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            assert effective_outcome_status(locked) == "partial"
+            await session.rollback()
+
+        smaller_partial_reread = OrderOutcome(
+            status=OrderStatus.PARTIAL,
+            filled_qty=Decimal("0"),  # fewer filled shares than the confirmed 1
+            avg_price=Decimal("500.00"),
+            broker_ref="ref-p",
+        )
+
+        # 2) partial → pending re-read: IGNORED (no regression).
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            record_reconciliation(locked, outcome=pending_reread)
+            await session.commit()
+        # 3) partial → timeout re-read: IGNORED (no regression).
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            record_reconciliation(locked, outcome=timeout_reread)
+            await session.commit()
+        # 3b) partial → SMALLER partial re-read: IGNORED — a stale/racing read
+        # reporting fewer filled shares must never overwrite the confirmed partial
+        # and erase real filled shares (share count is monotonic toward settlement).
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            record_reconciliation(locked, outcome=smaller_partial_reread)
+            await session.commit()
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            assert effective_outcome_status(locked) == "partial"  # still partial
+            snap = locked.reconciliation_snapshot["outcome"]
+            assert snap["filled_qty"] == "1"  # the confirmed fill is preserved
+            await session.rollback()
+
+        # 4) partial → filled: ADVANCES (written).
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            record_reconciliation(locked, outcome=filled)
+            await session.commit()
+        async with async_session_maker() as session:
+            locked = await lock_decision(decision_id, scope=scope, session=session)
+            assert effective_outcome_status(locked) == "filled"
+            snap = locked.reconciliation_snapshot["outcome"]
+            assert snap["filled_qty"] == "2"
+            await session.rollback()
+    finally:
+        _delete_user(owner)
+
+
 # =============================================================================
 # (c) Two concurrent balance reconciles — newest wins, atomic, stale writes none
 # =============================================================================

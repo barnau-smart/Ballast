@@ -429,37 +429,169 @@ def test_equity_sell_limit_builds_day_normal_limit_payload():
 
 
 @pytest.mark.asyncio
-async def test_place_order_non_marketable_buy_limit_refuses(monkeypatch):
-    # BUY limit BELOW the ask isn't immediately fillable → calm refusal, no place.
-    client = _FakeClient(quote={"VOO": {"quote": {"askPrice": 100, "bidPrice": 99}}})
+async def test_place_order_non_marketable_buy_limit_rests_pending(monkeypatch):
+    # Story 8.2: a BUY limit below the ask is NO LONGER refused — it is PLACED as a
+    # resting/working order and ``_map_order`` maps the working status to PENDING.
+    # No marketable guard, no quote read needed; the sub-share floor still applies.
+    client = _FakeClient(
+        order={"status": "WORKING", "filledQuantity": 0},
+    )
     _install_client(monkeypatch, client)
     calls = _record_limit_builders(monkeypatch)
+    _set_order_id(monkeypatch, 880)
 
-    with pytest.raises(OrderNotPlaceableError, match="coming later"):
-        await _adapter().place_order(
-            _limit_intent(side=OrderSide.BUY, amount="500", limit_price="90.00"),
-            idempotency_key="lk3",
-        )
-    assert client.placed == []
-    assert calls == []
+    outcome = await _adapter().place_order(
+        _limit_intent(side=OrderSide.BUY, amount="500", limit_price="90.00"),
+        idempotency_key="lk3",
+    )
+
+    # floor(500 / 90) = 5 shares; placed as a resting BUY limit at "90.00".
+    assert calls == [("buy_limit", "VOO", 5, "90.00")]
+    assert len(client.placed) == 1
+    assert outcome.status == OrderStatus.PENDING
+    assert outcome.broker_ref == "880"
 
 
 @pytest.mark.asyncio
-async def test_place_order_non_marketable_sell_limit_refuses(monkeypatch):
-    # SELL limit ABOVE the bid isn't immediately fillable → calm refusal, no place.
-    client = _FakeClient(quote={"VTI": {"quote": {"askPrice": 101, "bidPrice": 100}}})
+async def test_place_order_non_marketable_sell_limit_rests_pending(monkeypatch):
+    # Story 8.2: a SELL limit above the bid rests PENDING (placed, not refused).
+    client = _FakeClient(
+        order={"status": "WORKING", "filledQuantity": 0},
+    )
     _install_client(monkeypatch, client)
     calls = _record_limit_builders(monkeypatch)
+    _set_order_id(monkeypatch, 881)
 
-    with pytest.raises(OrderNotPlaceableError, match="coming later"):
-        await _adapter().place_order(
-            _limit_intent(
-                side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="110.00"
-            ),
-            idempotency_key="lk4",
-        )
-    assert client.placed == []
-    assert calls == []
+    outcome = await _adapter().place_order(
+        _limit_intent(
+            side=OrderSide.SELL, symbol="VTI", amount="550", limit_price="110.00"
+        ),
+        idempotency_key="lk4",
+    )
+
+    # floor(550 / 110) = 5 shares via the SELL-limit builder at "110.00".
+    assert calls == [("sell_limit", "VTI", 5, "110.00")]
+    assert outcome.status == OrderStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_place_order_gtc_limit_sets_good_till_cancel(monkeypatch):
+    # Story 8.2 (AC 4): a GTC limit calls the REAL builder then
+    # ``.set_duration(GOOD_TILL_CANCEL)`` — the built payload's duration is
+    # GOOD_TILL_CANCEL (no live call). We use the REAL builders (not the recorders)
+    # so the built order-spec is authoritative.
+    common = importlib.import_module("schwab.orders.common")
+    client = _FakeClient(order={"status": "WORKING", "filledQuantity": 0})
+    _install_client(monkeypatch, client)
+    _set_order_id(monkeypatch, 890)
+
+    built: list = []
+    real_buy = _equities.equity_buy_limit
+
+    def _capturing_buy(symbol, quantity, price):
+        builder = real_buy(symbol, quantity, price)
+        built.append(builder)
+        return builder
+
+    monkeypatch.setattr(_equities, "equity_buy_limit", _capturing_buy)
+
+    from coach.recommendation import Duration
+
+    await _adapter().place_order(
+        OrderIntent(
+            symbol="VOO",
+            side=OrderSide.BUY,
+            amount=Decimal("200"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("100.00"),
+            duration=Duration.GTC,
+        ),
+        idempotency_key="gtc1",
+    )
+
+    assert len(built) == 1
+    spec = built[0].build()
+    assert spec["duration"] == "GOOD_TILL_CANCEL"
+    assert spec["orderType"] == "LIMIT"
+    assert spec["price"] == "100.00"
+    # Sanity: the SDK constant the adapter used exists and equals the built value.
+    assert common.Duration.GOOD_TILL_CANCEL.value == "GOOD_TILL_CANCEL"
+
+
+def test_equity_buy_limit_gtc_via_real_builder():
+    # AC 4: build the REAL 8.1 limit builder, override duration to GOOD_TILL_CANCEL,
+    # and assert the built payload — the exact sequence the adapter runs for GTC.
+    common = importlib.import_module("schwab.orders.common")
+    spec = (
+        _equities.equity_buy_limit("VOO", 2, "100.00")
+        .set_duration(common.Duration.GOOD_TILL_CANCEL)
+        .build()
+    )
+    assert spec["orderType"] == "LIMIT"
+    assert spec["price"] == "100.00"
+    assert spec["duration"] == "GOOD_TILL_CANCEL"
+
+
+# --- cancel_order (Story 8.2) -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_deletes_then_reads_back_rejected(monkeypatch):
+    # A canceled order reads back CANCELED → REJECTED (reusing the closed contract).
+    client = _FakeClient(order={"status": "CANCELED", "filledQuantity": 0})
+    _install_client(monkeypatch, client)
+    cancel_calls: list = []
+    client.cancel_order = lambda oid, h: cancel_calls.append((oid, h))
+
+    outcome = await _adapter().cancel_order("904")
+
+    # DELETE issued with (int order id, account hash), then a read-back + map.
+    assert cancel_calls == [(904, "HASH123")]
+    assert client.get_order_calls == [(904, "HASH123")]
+    assert outcome.status == OrderStatus.REJECTED
+    assert outcome.broker_ref == "904"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_non_integer_ref_pending_no_sdk(monkeypatch):
+    # A garbage/non-integer ref degrades to PENDING WITHOUT touching the SDK.
+    client = _FakeClient()
+    _install_client(monkeypatch, client)
+    client.cancel_order = lambda oid, h: (_ for _ in ()).throw(
+        AssertionError("cancel must not be called on a non-integer ref")
+    )
+
+    outcome = await _adapter().cancel_order("not-an-id")
+    assert outcome.status == OrderStatus.PENDING
+    assert client.get_order_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_transport_failure_is_timeout_no_leak(monkeypatch):
+    # A transport failure after the DELETE is INDETERMINATE → TIMEOUT with the ref
+    # preserved and no raw exception leaking past the port.
+    client = _FakeClient(get_order_exc=httpx.ConnectError("boom"))
+    _install_client(monkeypatch, client)
+    client.cancel_order = lambda oid, h: None
+
+    outcome = await _adapter().cancel_order("905")
+    assert outcome.status == OrderStatus.TIMEOUT
+    assert outcome.broker_ref == "905"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_readback_still_working_is_pending(monkeypatch):
+    # (PATCH 3) The DELETE succeeds but the read-back shows the order STILL WORKING
+    # (cancel not yet applied) → an honest PENDING, NOT a claimed-clean REJECTED.
+    # The endpoint uses this to set needs_reconfirmation (the cancel is
+    # unconfirmed/still-working), keeping the order reconcilable.
+    client = _FakeClient(order={"status": "WORKING", "filledQuantity": 0})
+    _install_client(monkeypatch, client)
+    client.cancel_order = lambda oid, h: None
+
+    outcome = await _adapter().cancel_order("907")
+    assert outcome.status == OrderStatus.PENDING
+    assert outcome.broker_ref == "907"
 
 
 @pytest.mark.asyncio
@@ -478,20 +610,34 @@ async def test_place_order_sub_share_limit_refuses(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_place_order_limit_unusable_quote_refuses(monkeypatch):
-    # A missing side-relevant leg (bid for a sell) is an unusable quote → refuse.
-    client = _FakeClient(quote={"VTI": {"quote": {"askPrice": 101}}})  # no bidPrice
+async def test_place_order_limit_does_not_read_quote(monkeypatch):
+    # Story 8.2: the LIMIT branch no longer reads a quote at all (the marketable
+    # guard is gone). A quote whose bid is missing is now IRRELEVANT to a limit —
+    # the order is placed (rests) and get_quote is never called.
+    client = _FakeClient(
+        quote={"VTI": {"quote": {"askPrice": 101}}},  # no bidPrice — ignored now
+        order={"status": "WORKING", "filledQuantity": 0},
+    )
     _install_client(monkeypatch, client)
     _record_limit_builders(monkeypatch)
+    _set_order_id(monkeypatch, 906)
 
-    with pytest.raises(OrderNotPlaceableError):
-        await _adapter().place_order(
-            _limit_intent(
-                side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="100.00"
-            ),
-            idempotency_key="lk6",
-        )
-    assert client.placed == []
+    get_quote_calls: list = []
+    real_get_quote = client.get_quote
+    client.get_quote = lambda symbol: (
+        get_quote_calls.append(symbol) or real_get_quote(symbol)
+    )
+
+    outcome = await _adapter().place_order(
+        _limit_intent(
+            side=OrderSide.SELL, symbol="VTI", amount="500", limit_price="100.00"
+        ),
+        idempotency_key="lk6",
+    )
+    assert outcome.status == OrderStatus.PENDING
+    assert len(client.placed) == 1
+    # The LIMIT branch never reads a quote (no marketable guard anymore).
+    assert get_quote_calls == []
 
 
 # --- fetch_portfolio (Story 6.5) ----------------------------------------------

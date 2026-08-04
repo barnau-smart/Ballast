@@ -319,6 +319,7 @@ class _SpyAdapter(BrokerPort):
         self.calls: list[tuple[OrderIntent, str]] = []
         self.status_calls: list[str] = []
         self.ref_calls: list[str] = []
+        self.cancel_calls: list[str] = []
         self._delegate = FakeBrokerAdapter()
 
     def authorization_url(self, state: str) -> str:
@@ -346,6 +347,10 @@ class _SpyAdapter(BrokerPort):
         self.ref_calls.append(broker_ref)
         return await self._delegate.get_order_status_by_ref(broker_ref)
 
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        self.cancel_calls.append(broker_ref)
+        return await self._delegate.cancel_order(broker_ref)
+
 
 class _ScriptedAdapter(BrokerPort):
     """A broker double that returns a SCRIPTED placement/reconciliation outcome.
@@ -367,13 +372,16 @@ class _ScriptedAdapter(BrokerPort):
         placement: OrderOutcome,
         reconciled: OrderOutcome | None = None,
         reconciled_by_ref: OrderOutcome | None = None,
+        cancelled: OrderOutcome | None = None,
     ) -> None:
         self._placement = placement
         self._reconciled = reconciled
         self._reconciled_by_ref = reconciled_by_ref
+        self._cancelled = cancelled
         self.calls: list[tuple[OrderIntent, str]] = []
         self.status_calls: list[str] = []
         self.ref_calls: list[str] = []
+        self.cancel_calls: list[str] = []
         self._delegate = FakeBrokerAdapter()
 
     def authorization_url(self, state: str) -> str:
@@ -408,6 +416,15 @@ class _ScriptedAdapter(BrokerPort):
                 "scripted — the reconcile should not have touched the broker."
             )
         return self._reconciled_by_ref
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        self.cancel_calls.append(broker_ref)
+        if self._cancelled is None:
+            raise AssertionError(
+                "cancel_order was called but no cancelled outcome was scripted — "
+                "the cancel should not have touched the broker."
+            )
+        return self._cancelled
 
 
 # =============================================================================
@@ -699,6 +716,9 @@ class _NotPlaceableAdapter(BrokerPort):
             "get_order_status_by_ref must not be reached on a refusal"
         )
 
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        raise AssertionError("cancel_order must not be reached on a refusal")
+
 
 def _broker_ref_for(owner: uuid.UUID) -> str | None:
     """Read this owner's decision_record.broker_ref column (Story 6.3)."""
@@ -938,6 +958,9 @@ class _AccountSelectionAdapter(BrokerPort):
         raise AssertionError(
             "get_order_status_by_ref must not be reached on a refusal"
         )
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        raise AssertionError("cancel_order must not be reached on a refusal")
 
 
 def test_approve_account_selection_refusal_is_calm_422_releases_claim(client):
@@ -1995,10 +2018,11 @@ def test_approve_marketable_limit_cosigns_truthfully(client):
         _delete_user(email)
 
 
-def test_approve_non_marketable_limit_422_releases_claim(client):
-    # Story 8.1 (AC 2): a non-marketable BUY limit (below the fill price) is a calm
-    # 422 (never a 500, never a phantom fill), the claim is released so the
-    # decision returns to 'proposed' and stays retryable.
+def test_approve_non_marketable_limit_rests_pending(client):
+    # Story 8.2 (was 8.1 refusal): a non-marketable BUY limit (below the fill
+    # price) is NO LONGER refused — it is a legitimate RESTING order that co-signs
+    # ``pending`` with a stable broker_ref (never a phantom fill), resolvable later
+    # via /reconcile or cancellable via /cancel.
     email = _unique_email()
     spy = _SpyAdapter()
     client.app.dependency_overrides[get_broker] = lambda: spy
@@ -2019,33 +2043,19 @@ def test_approve_non_marketable_limit_422_releases_claim(client):
                     "side": "buy",
                     "amount": "500",
                     "order_type": "limit",
-                    "limit_price": "90.00",  # below the fake fill price → not marketable
+                    "limit_price": "90.00",  # below the fake fill price → rests
                 },
             },
             headers=headers,
         )
-        assert resp.status_code == 422, resp.text
-        assert "coming later" in resp.json()["error"]["message"]
-        # Claim released → the decision is back to 'proposed' (retryable).
-        assert _decision_rows(uid)[0]["status"] == "proposed"
-
-        # Retry with a marketable limit now succeeds (the record was never stuck).
-        retry = client.post(
-            "/api/coach/approve",
-            json={
-                "decision_id": decision_id,
-                "order_intent": {
-                    "symbol": "VTI",
-                    "side": "buy",
-                    "amount": "500",
-                    "order_type": "limit",
-                    "limit_price": "100.00",
-                },
-            },
-            headers=headers,
-        )
-        assert retry.status_code == 200, retry.text
-        assert retry.json()["status"] == "filled"
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "pending"  # resting, never a phantom fill
+        # Placed exactly once; cosigned with a queryable broker_ref.
+        assert len(spy.calls) == 1
+        rows = _decision_rows(uid)
+        assert rows[0]["status"] == "cosigned"
+        assert _broker_ref_for(uid) is not None
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
@@ -2058,7 +2068,9 @@ def test_approve_non_marketable_limit_422_releases_claim(client):
         {"order_type": "stop_limit", "limit_price": "100.00", "stop_price": "90.00"},
         {"session": "am"},
         {"session": "pm"},
-        {"duration": "gtc"},
+        # NOTE (Story 8.2): {"duration": "gtc"} was REMOVED — GTC is now ACCEPTED
+        # (covered by test_gtc_limit_cosign_snapshot_carries_duration_schema_v1).
+        # STOP/STOP_LIMIT/AM/PM stay rejected.
     ],
 )
 def test_approve_deferred_features_rejected_422_no_broker(client, override):
@@ -2094,6 +2106,48 @@ def test_approve_deferred_features_rejected_422_no_broker(client, override):
         assert "supported in this version" in resp.json()["error"]["message"]
         # The broker was NEVER touched (rejected before any placement) and the
         # claim is released → the decision returns to 'proposed' (retryable).
+        assert spy.calls == []
+        assert _decision_rows(uid)[0]["status"] == "proposed"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_approve_gtc_market_rejected_422_no_broker(client):
+    # Story 8.2 (backward-compat invariant): GTC is LIMIT-only. A MARKET order with
+    # duration=gtc is a field-shape violation (OrderScopeError) — a market order
+    # fills immediately so "good-till-canceled" is meaningless on it, and the schwab
+    # adapter only applies GOOD_TILL_CANCEL in its LIMIT branch (a GTC market would
+    # otherwise be placed as DAY → intent/order divergence). Refused at the engine
+    # gate with a calm 422, BEFORE any broker call. This is the HTTP-boundary lock
+    # for the case the deferred-features parametrize dropped when GTC became
+    # accepted (the unit-level guard is test_gtc_market_is_scope_error).
+    email = _unique_email()
+    spy = _SpyAdapter()
+    client.app.dependency_overrides[get_broker] = lambda: spy
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
+
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {
+                    "symbol": "VTI",
+                    "side": "buy",
+                    "amount": "500",
+                    "duration": "gtc",  # MARKET (no order_type) + GTC → scope error
+                },
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        # The broker was NEVER touched and the claim is released → 'proposed'.
         assert spy.calls == []
         assert _decision_rows(uid)[0]["status"] == "proposed"
     finally:
@@ -2285,6 +2339,9 @@ class _BlockingSpyAdapter(BrokerPort):
 
     async def get_order_status_by_ref(self, broker_ref: str) -> OrderOutcome:
         return await self._delegate.get_order_status_by_ref(broker_ref)
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        return await self._delegate.cancel_order(broker_ref)
 
 
 def _proposed_decision_row(owner: uuid.UUID) -> dict:
@@ -3795,6 +3852,711 @@ def test_reconcile_summary_outcome_status_reflects_effective(client):
             d for d in listing2["decisions"] if d["decision_id"] == decision_id
         )
         assert summary2["outcome_status"] == "filled"
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+# =============================================================================
+# STORY 8.2 — RESTING-ORDER LIFECYCLE: GTC + CANCEL (HTTP boundary)
+# =============================================================================
+
+
+def _cosign_snapshot_for(owner: uuid.UUID) -> dict:
+    """Read this owner's decision_record.cosign_snapshot column (Story 8.2)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cosign_snapshot FROM decision_record WHERE owner_id = %s",
+                (str(owner),),
+            )
+            (snap,) = cur.fetchone()
+    return snap
+
+
+def _approve_resting_limit(
+    client: TestClient,
+    headers: dict,
+    *,
+    broker_ref: str,
+    order_intent: dict,
+) -> str:
+    """Cosign ONE resting LIMIT that co-signs ``pending`` carrying ``broker_ref``.
+
+    Drives recommend→approve through a scripted adapter whose placement is a
+    resting ``pending`` outcome with the given ``broker_ref`` — so the cosigned
+    record persists ``status=cosigned``, ``cosign_snapshot.outcome.status=pending``
+    (never a phantom fill), the requested ``order_intent`` (carrying e.g. a GTC
+    duration), and ``broker_ref`` in its queryable column. Returns the decision_id.
+    """
+    placement = OrderOutcome(
+        status=OrderStatus.PENDING,
+        filled_qty=Decimal("0"),
+        avg_price=None,
+        broker_ref=broker_ref,
+    )
+    # A pending placement is INDETERMINATE, so approve reconciles once via
+    # get_order_status; script it to report the same still-pending state + ref.
+    reconciled = OrderOutcome(
+        status=OrderStatus.PENDING,
+        filled_qty=Decimal("0"),
+        avg_price=None,
+        broker_ref=broker_ref,
+    )
+    adapter = _ScriptedAdapter(placement=placement, reconciled=reconciled)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    decision_id = _recommend_decision_id(client, headers)
+    resp = client.post(
+        "/api/coach/approve",
+        json={"decision_id": decision_id, "order_intent": order_intent},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "pending"
+    return decision_id
+
+
+def test_gtc_limit_cosign_snapshot_carries_duration_schema_v1(client):
+    # AC 4 (HTTP): a GTC LIMIT approves as a resting pending order; the cosign
+    # snapshot ADDITIVELY carries duration:"gtc" and schema_version stays 1.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="g1",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+                "duration": "gtc",
+            },
+        )
+        snap = _cosign_snapshot_for(uid)
+        assert snap["order_intent"]["duration"] == "gtc"
+        assert snap["order_intent"]["order_type"] == "limit"
+        row = _decision_rows(uid)[0]
+        assert row["schema_version"] == 1
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_day_limit_cosign_snapshot_omits_duration(client):
+    # A DAY limit still OMITS duration from the persisted order_intent (emit-when-
+    # non-default), byte-compatible with 8.1.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="d1",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+        snap = _cosign_snapshot_for(uid)
+        assert "duration" not in snap["order_intent"]
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_resting_order_maps_rejected_and_persists(client):
+    # (matrix: cancel resting) A pending cosigned resting order cancels → the broker
+    # cancels, it maps to rejected, is persisted, and is not re-placeable.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cx1",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+        assert _broker_ref_for(uid) == "cx1"
+
+        cancelled = OrderOutcome(
+            status=OrderStatus.REJECTED,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="cx1",
+        )
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            cancelled=cancelled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["broker_ref"] == "cx1"
+        # Cancelled exactly once; NEVER placed on the cancel path.
+        assert cancel_adapter.cancel_calls == ["cx1"]
+        assert cancel_adapter.calls == []
+        # Persisted the rejected outcome additively.
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"]["outcome"]["status"] == "rejected"
+        assert row["reconciled_at"] is not None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_twice_second_is_calm_422_no_double_call(client):
+    # (matrix: cancel idempotent) A second cancel sees the first's terminal rejected
+    # → calm 422 (never 500), and the broker is NOT called a second time.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cx2",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        cancelled = OrderOutcome(
+            status=OrderStatus.REJECTED,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref="cx2",
+        )
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            cancelled=cancelled,
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+
+        first = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert first.status_code == 200, first.text
+
+        # A second adapter that FAILS LOUDLY if cancel_order runs (it must not).
+        second_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: second_adapter
+        second = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert second.status_code == 422, second.text
+        assert second_adapter.cancel_calls == []  # broker NOT touched
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_terminal_filled_order_is_calm_422_broker_untouched(client):
+    # (matrix: cancel terminal) A cosigned order surfaced FILLED cannot be
+    # cancelled → calm 422 "already settled"; the broker is NEVER touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        # A definitive FILLED placement cosigns terminal (no reconcile needed).
+        filled = OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("5"),
+            avg_price=Decimal("100.00"),
+            broker_ref="cxf",
+        )
+        adapter = _ScriptedAdapter(placement=filled)
+        client.app.dependency_overrides[get_broker] = lambda: adapter
+        decision_id = _recommend_decision_id(client, headers)
+        resp = client.post(
+            "/api/coach/approve",
+            json={
+                "decision_id": decision_id,
+                "order_intent": {"symbol": "VTI", "side": "buy", "amount": "500"},
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "filled"
+
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        cancel = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert cancel.status_code == 422, cancel.text
+        assert cancel_adapter.cancel_calls == []  # broker NEVER touched
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_no_broker_ref_is_calm_422_broker_untouched(client):
+    # (matrix: cancel no order id) A cosigned pending order with broker_ref=None
+    # cannot be cancelled by ref → calm 422; the broker is NEVER touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _cosign_pending_with_ref(client, headers, broker_ref=None)
+        assert _broker_ref_for(uid) is None
+
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 422, resp.text
+        assert cancel_adapter.cancel_calls == []  # broker NEVER touched
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_foreign_id_404_broker_untouched(client):
+    # (matrix: per-user scope) Another user's decision is invisible → 404; the
+    # broker is never touched.
+    owner_email = _unique_email()
+    other_email = _unique_email()
+    try:
+        _register(client, owner_email)
+        owner_token = _login(client, owner_email)
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+        owner_uid = _user_id_for(owner_email)
+        _insert_token_sync(owner_uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            owner_headers,
+            broker_ref="cxo",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        _register(client, other_email)
+        other_token = _login(client, other_email)
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+        other_uid = _user_id_for(other_email)
+        _insert_token_sync(other_uid, _live())
+
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=other_headers
+        )
+        assert resp.status_code == 404, resp.text
+        assert cancel_adapter.cancel_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(owner_email)
+        _delete_user(other_email)
+
+
+def test_cancel_not_cosigned_returns_422_broker_untouched(client):
+    # A proposed (not cosigned) decision has no placed order → calm 422; broker
+    # never touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        proposed_id = _recommend_decision_id(client, headers)
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{proposed_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 422, resp.text
+        assert cancel_adapter.cancel_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_session_not_live_returns_409_broker_untouched(client):
+    # A cosigned resting order but an EXPIRED session → calm 409 reconnect at the
+    # entry gate; the broker is never touched.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cxs",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        # Expire the session so the live-session gate refuses at entry.
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE brokerage_token SET expires_at = %s WHERE owner_id = %s",
+                    (_expired(), str(uid)),
+                )
+            conn.commit()
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 409, resp.text
+        assert cancel_adapter.cancel_calls == []
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def _approve_partial_limit(
+    client: TestClient, headers: dict, *, broker_ref: str
+) -> str:
+    """Cosign ONE LIMIT whose effective outcome is a definitive ``partial``.
+
+    A ``partial`` placement is DEFINITIVE (surfaced directly, no in-request
+    reconcile), so the cosigned record persists ``cosign_snapshot.outcome.status
+    == "partial"`` with the real filled shares. As of Story 8.2 ``partial`` is
+    NON-terminal — so this drives the PATCH-1 path where a cancel must still REFUSE
+    it (not touch the broker) to preserve the partial-fill truth. Returns the
+    decision_id.
+    """
+    partial = OrderOutcome(
+        status=OrderStatus.PARTIAL,
+        filled_qty=Decimal("3"),
+        avg_price=Decimal("90.00"),
+        broker_ref=broker_ref,
+    )
+    adapter = _ScriptedAdapter(placement=partial)
+    client.app.dependency_overrides[get_broker] = lambda: adapter
+    decision_id = _recommend_decision_id(client, headers)
+    resp = client.post(
+        "/api/coach/approve",
+        json={
+            "decision_id": decision_id,
+            "order_intent": {
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "partial"
+    return decision_id
+
+
+def test_cancel_partial_order_is_calm_422_broker_untouched_snapshot_intact(client):
+    # (PATCH 1) A cosigned order whose effective outcome is ``partial`` (non-terminal
+    # as of 8.2) must be REFUSED without touching the broker — cancelling would let
+    # the broker's rejected cancel result overwrite the partial snapshot and erase
+    # the real filled shares. Assert: 422, cancel_order NEVER called, and the
+    # persisted partial snapshot (filled_qty/avg_price) is unchanged.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_partial_limit(client, headers, broker_ref="cxp")
+        # The partial snapshot as persisted at cosign (the truth we must preserve).
+        before = _cosign_snapshot_for(uid)["outcome"]
+        assert before["status"] == "partial"
+        assert before["filled_qty"] == "3"
+        assert before["avg_price"] == "90.00"
+
+        # A cancel adapter that FAILS LOUDLY if cancel_order runs (it must not).
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 422, resp.text
+        assert cancel_adapter.cancel_calls == []  # broker NEVER touched
+
+        # The persisted partial snapshot is UNCHANGED (filled shares preserved),
+        # and no reconciliation clobbered it.
+        after = _cosign_snapshot_for(uid)["outcome"]
+        assert after == before
+        recon = _reconciliation_row(uid)
+        assert recon["reconciliation_snapshot"] is None
+        assert recon["reconciled_at"] is None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_timeout_readback_returns_200_needs_reconfirmation(client):
+    # (PATCH 3) A live cancel whose broker read-back is INDETERMINATE (TIMEOUT after
+    # the DELETE) → 200 with needs_reconfirmation=True and the honest outcome
+    # persisted (still reconcilable). It does NOT claim a clean cancel.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cxt",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        # cancel_order returns an INDETERMINATE timeout (transport blip after DELETE),
+        # preserving the broker_ref so the order stays reconcilable.
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            cancelled=OrderOutcome(
+                status=OrderStatus.TIMEOUT,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref="cxt",
+            ),
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "timeout"
+        assert body["needs_reconfirmation"] is True
+        assert cancel_adapter.cancel_calls == ["cxt"]
+        # The honest indeterminate outcome is persisted (stays reconcilable).
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"]["outcome"]["status"] == "timeout"
+        assert row["reconciled_at"] is not None
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_cancel_rejected_readback_returns_200_no_reconfirmation(client):
+    # (PATCH 3) A normal confirmed cancel (broker read-back rejected) → 200 with
+    # needs_reconfirmation=False. This is the clean-cancel case.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cxr",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        cancel_adapter = _ScriptedAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            ),
+            cancelled=OrderOutcome(
+                status=OrderStatus.REJECTED,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref="cxr",
+            ),
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["needs_reconfirmation"] is False
+        assert cancel_adapter.cancel_calls == ["cxr"]
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+class _ConfigFaultCancelAdapter(_ScriptedAdapter):
+    """A cancel double whose ``cancel_order`` raises a DETERMINISTIC config fault.
+
+    Mirrors :class:`_ConfigFaultReconcileAdapter` for the cancel verb: models the
+    exact class ``SchwabAdapter.cancel_order`` lets propagate — a
+    ``SchwabNotConfiguredError`` raised at client build
+    (``_trading_client``/``_account_hash``), never by the actual DELETE/read. It
+    must surface DISTINCTLY as a calm 409 reconnect, NOT be laundered into a
+    ``timeout`` result. ``provider = "fake"`` so it passes the session integrity
+    gate and the endpoint actually reaches the broker call.
+    """
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        self.cancel_calls.append(broker_ref)
+        raise SchwabNotConfiguredError(
+            "Schwab trading requires a linked, decrypted brokerage token."
+        )
+
+
+def test_cancel_config_fault_is_calm_409_persists_nothing(client):
+    # (Story 8.2 follow-up, matrix: cancel hits config/auth fault) A live+matched
+    # session whose cancel_order raises a DETERMINISTIC SchwabNotConfiguredError at
+    # client build → the endpoint returns a calm 409 RECONNECT_MESSAGE, DISTINCT
+    # from a transport TIMEOUT, and persists NOTHING (the fault precedes
+    # record_reconciliation). This locks the cancel endpoint's dedicated
+    # SchwabNotConfiguredError handler, mirroring the reconcile config-fault test.
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+
+        decision_id = _approve_resting_limit(
+            client,
+            headers,
+            broker_ref="cfc",
+            order_intent={
+                "symbol": "VTI",
+                "side": "buy",
+                "amount": "500",
+                "order_type": "limit",
+                "limit_price": "90.00",
+            },
+        )
+
+        cancel_adapter = _ConfigFaultCancelAdapter(
+            placement=OrderOutcome(
+                status=OrderStatus.PENDING, filled_qty=Decimal("0")
+            )
+        )
+        client.app.dependency_overrides[get_broker] = lambda: cancel_adapter
+
+        resp = client.post(
+            f"/api/coach/decisions/{decision_id}/cancel", headers=headers
+        )
+        # Calm 409 reconnect — NOT a 200 timeout result, NOT a 500.
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["message"] == RECONNECT_MESSAGE
+        # The cancel WAS reached (proves it is the build-surfaced config class),
+        # but nothing was persisted.
+        assert cancel_adapter.cancel_calls == ["cfc"]
+        row = _reconciliation_row(uid)
+        assert row["reconciliation_snapshot"] is None
+        assert row["reconciled_at"] is None
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)

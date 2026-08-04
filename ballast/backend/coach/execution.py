@@ -163,10 +163,11 @@ def validate_order_intent(intent: OrderIntent) -> None:
     ``place_order`` — so the broker is never touched on any rejection. Two refusal
     classes, kept distinct:
 
-    - **Deferred features** (Story B) → :class:`OrderNotSupportedError`:
-      ``order_type`` in {``STOP``, ``STOP_LIMIT``}, ``session`` in {``AM``, ``PM``},
-      or ``duration == GTC``. Checked FIRST so an unsupported feature is refused
-      as "not supported in this version" rather than as a field-shape violation.
+    - **Deferred features** (still deferred after Story 8.2) →
+      :class:`OrderNotSupportedError`: ``order_type`` in {``STOP``, ``STOP_LIMIT``}
+      or ``session`` in {``AM``, ``PM``}. Checked FIRST so an unsupported feature is
+      refused as "not supported in this version" rather than as a field-shape
+      violation. ``duration == GTC`` is now ACCEPTED (Story 8.2 resting orders).
     - **Field-shape violations** (a malformed but in-scope order) →
       :class:`OrderScopeError`: a ``MARKET`` order carrying a ``limit_price`` or
       ``stop_price``; a ``LIMIT`` order missing a positive, finite ``limit_price``
@@ -185,10 +186,17 @@ def validate_order_intent(intent: OrderIntent) -> None:
             "Extended-hours (pre-market / after-hours) sessions aren't supported "
             "in this version yet."
         )
-    if intent.duration == Duration.GTC:
-        raise OrderNotSupportedError(
-            "Good-till-canceled (GTC) orders aren't supported in this version yet."
-        )
+    # Story 8.2: ``Duration.GTC`` is now ACCEPTED (a good-till-canceled resting
+    # order) — but ONLY on a LIMIT order. STOP/STOP_LIMIT and AM/PM stay rejected
+    # above.
+
+    # Field-shape rule (Story 8.2): GTC is coupled to LIMIT. A market order fills
+    # immediately, so "good-till-canceled" is meaningless on it — and the schwab
+    # adapter only applies GOOD_TILL_CANCEL in its LIMIT branch, so a GTC MARKET
+    # intent would be placed as DAY (intent/placed order diverge). Refuse it as a
+    # field-shape violation (the authoritative engine gate).
+    if intent.order_type != OrderType.LIMIT and intent.duration == Duration.GTC:
+        raise OrderScopeError("A market order can't be good-till-canceled.")
 
     # Field-requirement matrix for the two supported order types.
     if intent.order_type == OrderType.MARKET:
@@ -310,15 +318,18 @@ async def reconcile_pending_decision(
 
     Then, keyed on the newest-known truth (:func:`effective_outcome_status`):
 
-    - If the effective status is TERMINAL (``filled``/``partial``/``rejected``) the
-      broker is NEVER touched — the recorded outcome is returned, ``reconciled``
-      False, ``needs_reconfirmation`` False (idempotent).
-    - If NON-terminal (``pending``/``timeout``) but ``record.broker_ref is None``
+    - If the effective status is TERMINAL (``filled``/``rejected`` — ``partial`` is
+      NO LONGER terminal as of 8.2) the broker is NEVER touched — the recorded
+      outcome is returned, ``reconciled`` False, ``needs_reconfirmation`` False
+      (idempotent).
+    - If NON-terminal (``pending``/``timeout``/``partial``) but
+      ``record.broker_ref is None``
       the broker is NEVER touched — the order is unconfirmable by id, so it stays
       pending with ``needs_reconfirmation`` True (never search/guess/re-place).
-    - Otherwise it reads the one order by ``record.broker_ref`` via
-      ``get_order_status_by_ref``; ``needs_reconfirmation`` is True iff that read is
-      ``timeout`` — the ONLY outcome that cannot be positively confirmed (a
+    - Otherwise it RE-READS the one order by ``record.broker_ref`` via
+      ``get_order_status_by_ref`` (a non-terminal ``partial`` re-reads the broker
+      and can advance to ``filled``); ``needs_reconfirmation`` is True iff that read
+      is ``timeout`` — the ONLY outcome that cannot be positively confirmed (a
       successful read, even a still-``pending``/working order, IS a positive
       confirmation the order exists and is retryable-without-a-human) — and
       ``reconciled`` is True (the caller persists the reconciled outcome).
@@ -365,6 +376,97 @@ async def reconcile_pending_decision(
         needs_reconfirmation=needs_reconfirmation,
         reconciled=True,
     )
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """The result of a cancel attempt on a cosigned resting order (Story 8.2).
+
+    ``outcome`` is the truthful :class:`~brokers.port.OrderOutcome`: the broker's
+    post-cancel state (``rejected`` on success) when the broker was actually
+    called, or the recorded terminal/unconfirmable outcome when the cancel was
+    calmly REFUSED without touching the broker. ``cancelled`` is ``True`` iff the
+    broker's :meth:`~brokers.port.BrokerPort.cancel_order` was actually invoked
+    (so the caller knows to persist the reconciliation snapshot). ``refused`` is
+    ``True`` when the order could NOT be cancelled WITHOUT a broker call — it is
+    already terminal/settled (``filled``/``rejected``), already PARTIALLY FILLED
+    (``partial`` — non-cancellable in B1; cancelling it would let the broker's
+    ``rejected`` cancel result overwrite the ``partial`` snapshot and erase the real
+    filled shares), or has no ``broker_ref`` to address — so the API maps it to a
+    calm 422 (NEVER a 500), and the broker is never touched.
+    """
+
+    outcome: OrderOutcome
+    cancelled: bool
+    refused: bool
+
+
+async def cancel_pending_decision(
+    record: "DecisionRecord",
+    *,
+    broker: BrokerPort,
+    broker_session: BrokerageSession,
+) -> CancelResult:
+    """Cancel a cosigned resting order by its persisted ``broker_ref`` (Story 8.2).
+
+    The SOLE caller of :meth:`~brokers.port.BrokerPort.cancel_order` (AD-7). As its
+    FIRST action it asserts the EXACT placement-time session + provider integrity
+    gate (:func:`_assert_session_integrity`, shared with
+    :func:`execute_approved_order` / :func:`reconcile_pending_decision`), raising
+    :class:`SessionIntegrityError` BEFORE any broker call — so a cancel can never
+    run against a dead or mismatched-provider session.
+
+    Then, keyed on the newest-known truth (:func:`effective_outcome_status`):
+
+    - If the effective status is TERMINAL (``filled``/``rejected``) OR ``partial``
+      the order can NO LONGER be cleanly cancelled: the broker is NEVER touched,
+      ``refused`` is True (the API maps it to a calm 422 "already settled or
+      partially filled"). For a terminal status this makes cancel idempotent — a
+      second cancel sees the first's terminal ``rejected`` and refuses. For a
+      ``partial`` (non-terminal as of 8.2, still re-reconcilable) B1 deliberately
+      refuses: a remainder-cancel that preserves the filled shares is out of scope,
+      and calling the broker would let its ``rejected`` cancel result overwrite the
+      ``partial`` snapshot and erase the real filled shares.
+    - If ``record.broker_ref is None`` the order is unaddressable (no id to
+      cancel): the broker is NEVER touched, ``refused`` is True (calm 422).
+    - Otherwise it cancels the one order by ``record.broker_ref`` via
+      ``broker.cancel_order`` and returns its post-cancel ``outcome`` with
+      ``cancelled`` True (the API persists it via ``record_reconciliation``,
+      advancing ``pending`` → ``rejected``).
+    """
+    from coach.decision_record import effective_outcome_status, _is_terminal
+
+    # Session + provider integrity FIRST — identical gate to a placement/reconcile,
+    # so a cancel never runs against a dead/mismatched session (broker untouched).
+    _assert_session_integrity(broker, broker_session)
+
+    status = effective_outcome_status(record)
+    if _is_terminal(status) or status == "partial":
+        # Already settled (filled/rejected) OR already partially filled — in B1 a
+        # partially-executed order can't be cleanly cancelled (remainder-cancel +
+        # fill-preservation is out of scope), and cancelling it would let the
+        # broker's ``rejected`` cancel result overwrite the ``partial`` snapshot and
+        # ERASE the real filled shares. So refuse WITHOUT touching the broker
+        # (idempotent for the terminal case: a second cancel sees the first's
+        # terminal rejected). ``partial`` is non-terminal (still re-reconcilable) but
+        # is deliberately not cancellable in B1.
+        return CancelResult(
+            outcome=_recorded_outcome(record),
+            cancelled=False,
+            refused=True,
+        )
+
+    if record.broker_ref is None:
+        # No confirmed order id — the order is unaddressable, so it cannot be
+        # cancelled by ref. NEVER touch the broker, NEVER search/guess.
+        return CancelResult(
+            outcome=_recorded_outcome(record),
+            cancelled=False,
+            refused=True,
+        )
+
+    outcome = await broker.cancel_order(record.broker_ref)
+    return CancelResult(outcome=outcome, cancelled=True, refused=False)
 
 
 def _recorded_outcome(record: "DecisionRecord") -> OrderOutcome:

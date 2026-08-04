@@ -185,8 +185,12 @@ def test_extended_sessions_not_supported(session):
         )
 
 
-def test_gtc_duration_not_supported():
-    with pytest.raises(OrderNotSupportedError):
+def test_gtc_market_is_scope_error():
+    # (PATCH 2) Story 8.2: GTC is coupled to LIMIT. GTC is meaningless on a MARKET
+    # order (it fills immediately; the schwab adapter only applies GOOD_TILL_CANCEL
+    # in its LIMIT branch, so a GTC MARKET would be placed as DAY — intent/placed
+    # order diverge). A GTC MARKET intent is a field-shape violation → OrderScopeError.
+    with pytest.raises(OrderScopeError):
         validate_order_intent(
             OrderIntent(
                 "VTI",
@@ -195,3 +199,17 @@ def test_gtc_duration_not_supported():
                 duration=Duration.GTC,
             )
         )
+
+
+def test_gtc_limit_accepted():
+    # A GTC LIMIT (the primary resting-order shape) passes the gate.
+    validate_order_intent(
+        OrderIntent(
+            "VTI",
+            OrderSide.BUY,
+            Decimal("500"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("90.00"),
+            duration=Duration.GTC,
+        )
+    )

@@ -36,7 +36,7 @@ from brokers.port import (
     OrderStatus,
     PortfolioSnapshot,
 )
-from coach.recommendation import OrderIntent, OrderSide, OrderType
+from coach.recommendation import Duration, OrderIntent, OrderSide, OrderType
 from money import format_money
 
 # Schwab's OAuth authorize endpoint (used only to reconstruct the received-url
@@ -358,6 +358,7 @@ class SchwabAdapter(BrokerPort):
         # is a config error that must surface plainly, NOT masquerade as a
         # timeout, so it is constructed OUTSIDE the transport net below.
         client = self._trading_client()
+        from schwab.orders.common import Duration as SchwabDuration
         from schwab.orders.equities import (
             equity_buy_limit,
             equity_buy_market,
@@ -382,18 +383,21 @@ class SchwabAdapter(BrokerPort):
             account_hash = self._account_hash(client)
             is_buy = order_intent.side == OrderSide.BUY
             if order_intent.order_type == OrderType.LIMIT:
-                # Marketable LIMIT branch (Story 8.1): size on the LIMIT price,
-                # guard that the limit is immediately fillable against the
-                # side-relevant leg (buy→ask, sell→bid), and build the DAY/NORMAL
-                # limit spec. Only the builder + quantity differ from the market
-                # path; the post-placement fence below is shared and unchanged.
+                # LIMIT branch (Story 8.1 marketable + Story 8.2 resting): size on
+                # the LIMIT price and build the NORMAL limit spec (DAY, or
+                # GOOD_TILL_CANCEL when the intent is GTC). The Story 8.1 marketable
+                # guard is REMOVED — a non-marketable limit is no longer refused; it
+                # is a legitimate RESTING order that Schwab accepts as a working
+                # order and ``_map_order`` maps to ``PENDING``. Only the builder +
+                # quantity differ from the market path; the post-placement fence
+                # below is shared and unchanged.
                 limit_price = order_intent.limit_price
                 # Defense-in-depth (Story 8.1 review): the execution gate
                 # guarantees a finite, positive limit_price on the production
                 # path. Guard here too so a raw TypeError/InvalidOperation from
-                # the sizing division/marketable compare can never leak into the
-                # transport net below and be MISCLASSIFIED as an INDETERMINATE
-                # placement — refuse calmly, before any placement, instead.
+                # the sizing division can never leak into the transport net below
+                # and be MISCLASSIFIED as an INDETERMINATE placement — refuse
+                # calmly, before any placement, instead.
                 if (
                     limit_price is None
                     or not limit_price.is_finite()
@@ -403,12 +407,6 @@ class SchwabAdapter(BrokerPort):
                         "This limit order has no usable limit price — no order "
                         "was placed."
                     )
-                quote = self._read_quote(client, order_intent.symbol)
-                reference = self._usable_price(
-                    quote,
-                    "askPrice" if is_buy else "bidPrice",
-                    order_intent.symbol,
-                )
                 # Whole-share sizing on the limit price.
                 quantity = int(
                     (order_intent.amount / limit_price).to_integral_value(
@@ -422,23 +420,6 @@ class SchwabAdapter(BrokerPort):
                         f"share of {order_intent.symbol} at a ${limit_price:.2f} "
                         "limit — no order was placed."
                     )
-                # Marketable guard: a buy must meet/exceed the ask, a sell must
-                # meet/undercut the bid — otherwise the limit isn't immediately
-                # fillable (resting limit orders are coming later, Story B).
-                if is_buy and limit_price < reference:
-                    raise OrderNotPlaceableError(
-                        f"A buy limit at ${limit_price:.2f} is below the current "
-                        f"ask (${reference:.2f}), so this limit isn't immediately "
-                        "fillable; resting limit orders are coming later — no "
-                        "order was placed."
-                    )
-                if not is_buy and limit_price > reference:
-                    raise OrderNotPlaceableError(
-                        f"A sell limit at ${limit_price:.2f} is above the current "
-                        f"bid (${reference:.2f}), so this limit isn't immediately "
-                        "fillable; resting limit orders are coming later — no "
-                        "order was placed."
-                    )
                 # CRITICAL: pass the price as a fixed-point STRING, never a
                 # Decimal — schwab-py's ``set_price`` stores a str verbatim but
                 # runs a Decimal/float through binary-float truncation (money
@@ -449,6 +430,12 @@ class SchwabAdapter(BrokerPort):
                     if is_buy
                     else equity_sell_limit(order_intent.symbol, quantity, price_str)
                 )
+                # GTC override (Story 8.2): a good-till-canceled limit rests across
+                # sessions until filled or cancelled. The 8.1 builder defaults to
+                # DAY; override the duration ONLY for a GTC intent (DAY is
+                # untouched, so a DAY limit's built payload stays byte-identical).
+                if order_intent.duration == Duration.GTC:
+                    builder.set_duration(SchwabDuration.GOOD_TILL_CANCEL)
             else:
                 ask = self._quote_ask(client, order_intent.symbol)
                 # Whole-share sizing: floor(amount / ask). ``amount``/``ask`` are
@@ -688,6 +675,75 @@ class SchwabAdapter(BrokerPort):
             # port, never a phantom fill. PRESERVE the known ``broker_ref`` so the
             # order stays reconcilable. Surface TIMEOUT. This is a READ: it never
             # re-places, never searches.
+            return OrderOutcome(
+                status=OrderStatus.TIMEOUT,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=broker_ref,
+                account_ref=account_hash,
+            )
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        """Cancel a placed Schwab order by its persisted order id (Story 8.2).
+
+        Mirrors :meth:`get_order_status_by_ref` in shape and fence discipline. The
+        Coach Engine's cancel owner asserts session integrity FIRST and
+        short-circuits a terminal / no-``broker_ref`` order WITHOUT calling here, so
+        this is only reached with a usable ``broker_ref`` on a live, matched
+        session — but a garbage/non-integer ref still degrades safely rather than
+        raising past the port. ``client.cancel_order(int(broker_ref), hash)`` issues
+        the Schwab DELETE (no body), then the authoritative post-cancel state is
+        READ BACK via ``client.get_order`` and mapped through :meth:`_map_order`
+        (``CANCELED`` already normalizes to ``REJECTED`` — terminal, not
+        re-placeable). A ``SchwabNotConfiguredError`` at client build surfaces
+        DISTINCTLY (the endpoint maps it to a calm 409 reconnect); any
+        transport/SDK/parse failure is INDETERMINATE → ``TIMEOUT`` with the
+        ``broker_ref`` PRESERVED and no raw exception leaking the port, so the
+        order stays reconcilable. Never logs token/secret material.
+        """
+        self._require_configured()
+        # An empty / non-integer ref cannot address a Schwab order — surface an
+        # honest PENDING WITHOUT touching the SDK (never cancel-by-search, never
+        # guess). Mirrors ``get_order_status_by_ref``'s up-front ``int()`` guard.
+        if broker_ref is None or not str(broker_ref).strip():
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=None,
+            )
+        try:
+            order_id = int(str(broker_ref).strip())
+        except (ValueError, TypeError):
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=None,
+            )
+        account_hash: str | None = None
+        try:
+            client = self._trading_client()
+            account_hash = self._account_hash(client)
+            # The Schwab DELETE cancel — no response body of interest.
+            client.cancel_order(order_id, account_hash)
+            # Read back the authoritative post-cancel state and map it (a canceled
+            # order → REJECTED via ``_map_order``'s ``_REJECTED_STATUSES``).
+            status_resp = client.get_order(order_id, account_hash)
+            return self._map_order(
+                status_resp.json(), broker_ref=broker_ref, account_ref=account_hash
+            )
+        except SchwabNotConfiguredError:
+            # A DETERMINISTIC config/auth fault raised ONLY at client build — surface
+            # it DISTINCTLY (the endpoint maps it to a calm 409 reconnect) rather
+            # than laundering it into TIMEOUT. Mirrors ``get_order_status_by_ref``.
+            raise
+        except Exception:
+            # Same FENCE as the reconcile read: a transport/SDK/parse failure after
+            # the DELETE is INDETERMINATE (the cancel may or may not have applied) —
+            # never leak a raw exception, never a phantom terminal state. PRESERVE
+            # the known ``broker_ref`` so the order stays reconcilable. Surface
+            # TIMEOUT; the caller can re-read or re-cancel.
             return OrderOutcome(
                 status=OrderStatus.TIMEOUT,
                 filled_qty=Decimal("0"),

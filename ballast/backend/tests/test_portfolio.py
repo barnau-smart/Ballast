@@ -543,6 +543,11 @@ class _FetchFailsAdapter(BrokerPort):
         # (Story 6.7). Delegate to the fake so the double stays a valid adapter.
         return await FakeBrokerAdapter().get_order_status_by_ref(broker_ref)
 
+    async def cancel_order(self, broker_ref):
+        # Not exercised by this test; the BrokerPort contract now requires it
+        # (Story 8.2). Delegate to the fake so the double stays a valid adapter.
+        return await FakeBrokerAdapter().cancel_order(broker_ref)
+
 
 def test_link_survives_portfolio_fetch_failure(client):
     email = _unique_email()

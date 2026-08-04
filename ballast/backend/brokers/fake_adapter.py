@@ -163,23 +163,24 @@ class FakeBrokerAdapter(BrokerPort):
         recorded = self._orders.get(idempotency_key)
         if recorded is not None:
             return recorded
+        broker_ref = f"fake-order-{idempotency_key}"
         if order_intent.order_type == OrderType.LIMIT:
-            # Marketable LIMIT branch (Story 8.1): floor sizing at the limit price,
-            # a fill at exactly the limit price, and a marketable guard vs the
-            # deterministic reference quote. A non-marketable / sub-share limit
-            # raises ``OrderNotPlaceableError`` BEFORE anything is recorded.
-            filled_qty, avg_price = self._limit_fill(order_intent)
+            # LIMIT branch: a MARKETABLE limit (Story 8.1) fills immediately at the
+            # limit price; a NON-marketable limit (Story 8.2) is a legitimate
+            # RESTING order — it is PLACED and co-signs ``PENDING`` with a stable
+            # ``broker_ref`` (NEVER a phantom fill), resolving later through the
+            # existing reconcile-by-ref path. Only the sub-share order is refused
+            # calmly BEFORE anything is recorded.
+            outcome = self._limit_fill(order_intent, broker_ref=broker_ref)
         else:
             # MARKET path — byte-for-byte UNCHANGED (AC 5): fractional
             # ``amount / FAKE_FILL_PRICE``, no flooring, no <1-share refusal.
-            filled_qty = order_intent.amount / FAKE_FILL_PRICE
-            avg_price = FAKE_FILL_PRICE
-        outcome = OrderOutcome(
-            status=OrderStatus.FILLED,
-            filled_qty=filled_qty,
-            avg_price=avg_price,
-            broker_ref=f"fake-order-{idempotency_key}",
-        )
+            outcome = OrderOutcome(
+                status=OrderStatus.FILLED,
+                filled_qty=order_intent.amount / FAKE_FILL_PRICE,
+                avg_price=FAKE_FILL_PRICE,
+                broker_ref=broker_ref,
+            )
         self._orders[idempotency_key] = outcome
         # Also index by the broker reference so the durable cross-request reconcile
         # read (Story 6.7) can find this order by its persisted ``broker_ref``.
@@ -187,18 +188,22 @@ class FakeBrokerAdapter(BrokerPort):
             self._orders_by_ref[outcome.broker_ref] = outcome
         return outcome
 
-    def _limit_fill(self, order_intent: OrderIntent) -> tuple[Decimal, Decimal]:
-        """Compute a deterministic marketable-LIMIT fill (Story 8.1).
+    def _limit_fill(
+        self, order_intent: OrderIntent, *, broker_ref: str
+    ) -> OrderOutcome:
+        """Compute a deterministic LIMIT :class:`OrderOutcome` (Story 8.1 + 8.2).
 
         :data:`FAKE_FILL_PRICE` is the reference quote for BOTH the ask and the
-        bid. Marketable guard: a BUY is refused when ``limit_price`` is below the
-        (ask) reference; a SELL when it is above the (bid) reference — a
-        non-marketable limit isn't immediately fillable, so it is refused calmly
-        via :class:`~brokers.port.OrderNotPlaceableError` (resting limit orders are
-        Story B). Sizing floors ``amount / limit_price`` to whole shares and
-        refuses a sub-share order the same way. The fill is at exactly the limit
-        price. Fully deterministic (no wall-clock, no randomness). Returns
-        ``(filled_qty, avg_price)``.
+        bid. A MARKETABLE limit (Story 8.1) — a BUY at/above the (ask) reference or
+        a SELL at/below the (bid) reference — fills immediately at exactly the
+        limit price (``FILLED``). A NON-marketable limit (Story 8.2) is NOT refused
+        anymore: it is a legitimate RESTING order, so it is PLACED and returns a
+        deterministic ``PENDING`` outcome carrying the stable ``broker_ref`` (NEVER
+        a phantom fill) — it resolves later through the existing reconcile-by-ref
+        path. Sizing floors ``amount / limit_price`` to whole shares and refuses a
+        SUB-SHARE order calmly via :class:`~brokers.port.OrderNotPlaceableError`
+        (kept from 8.1, applied to resting orders too). Fully deterministic (no
+        wall-clock, no randomness).
         """
         limit_price = order_intent.limit_price
         # Defense-in-depth (Story 8.1 review): the execution gate
@@ -210,22 +215,9 @@ class FakeBrokerAdapter(BrokerPort):
             raise OrderNotPlaceableError(
                 "This limit order has no usable limit price — no order was placed."
             )
-        if order_intent.side == OrderSide.BUY:
-            if limit_price < FAKE_FILL_PRICE:
-                raise OrderNotPlaceableError(
-                    f"A buy limit at ${limit_price:.2f} is below the current "
-                    f"price (${FAKE_FILL_PRICE:.2f}), so this limit isn't "
-                    "immediately fillable; resting limit orders are coming later "
-                    "— no order was placed."
-                )
-        else:
-            if limit_price > FAKE_FILL_PRICE:
-                raise OrderNotPlaceableError(
-                    f"A sell limit at ${limit_price:.2f} is above the current "
-                    f"price (${FAKE_FILL_PRICE:.2f}), so this limit isn't "
-                    "immediately fillable; resting limit orders are coming later "
-                    "— no order was placed."
-                )
+        # Sub-share refusal FIRST (kept from 8.1, applies to resting too): a dollar
+        # amount that buys/sells < 1 whole share at the limit is refused calmly
+        # BEFORE anything is placed/recorded.
         quantity = int(
             (order_intent.amount / limit_price).to_integral_value(
                 rounding=ROUND_FLOOR
@@ -237,7 +229,29 @@ class FakeBrokerAdapter(BrokerPort):
                 f"${order_intent.amount:.2f} {verb} less than one whole share at "
                 f"a ${limit_price:.2f} limit — no order was placed."
             )
-        return Decimal(quantity), limit_price
+        # Marketability decides FILL-NOW vs REST (Story 8.2): a BUY meeting/exceeding
+        # the (ask) reference and a SELL meeting/undercutting the (bid) reference are
+        # immediately fillable; otherwise the order RESTS (co-signs ``PENDING``).
+        if order_intent.side == OrderSide.BUY:
+            marketable = limit_price >= FAKE_FILL_PRICE
+        else:
+            marketable = limit_price <= FAKE_FILL_PRICE
+        if not marketable:
+            # A legitimate RESTING order — PLACED, co-signs ``PENDING`` with a
+            # stable ``broker_ref`` (never a fill). It resolves later via the
+            # durable reconcile-by-ref path (seeded in tests).
+            return OrderOutcome(
+                status=OrderStatus.PENDING,
+                filled_qty=Decimal("0"),
+                avg_price=None,
+                broker_ref=broker_ref,
+            )
+        return OrderOutcome(
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal(quantity),
+            avg_price=limit_price,
+            broker_ref=broker_ref,
+        )
 
     async def get_order_status(self, idempotency_key: str) -> OrderOutcome:
         """Return the recorded :class:`OrderOutcome` for ``idempotency_key`` (no network).
@@ -300,3 +314,42 @@ class FakeBrokerAdapter(BrokerPort):
             avg_price=None,
             broker_ref=None,
         )
+
+    async def cancel_order(self, broker_ref: str) -> OrderOutcome:
+        """Cancel a placed order by its ``broker_ref`` (Story 8.2, no network).
+
+        The deterministic offline stand-in for the live cancel: a cancelled order
+        maps to ``REJECTED`` (reusing the closed 5-member contract — there is NO
+        ``cancelled`` member), which is terminal and NOT re-placeable. The
+        ``broker_ref → OrderOutcome`` store is updated so a later
+        :meth:`get_order_status_by_ref` observes the cancelled (``REJECTED``)
+        state — the offline analogue of the broker now reporting the order
+        ``CANCELED``. Fully deterministic (no wall-clock, no randomness). Never
+        logs token/secret material.
+
+        The Coach Engine's cancel owner asserts session integrity FIRST and
+        short-circuits a terminal / no-``broker_ref`` order without ever calling
+        here, so this is only reached with a usable ``broker_ref``.
+
+        Defense-in-depth + idempotence (Story 8.2 review): if ``broker_ref`` already
+        maps to a TERMINAL outcome (``FILLED``/``REJECTED``) in ``_orders_by_ref``,
+        that recorded outcome is returned UNCHANGED — never clobbered with a fresh
+        rejection (which would erase a real ``FILLED``'s filled shares, or re-write
+        an already-``REJECTED``). This also makes a repeated ``cancel_order`` on the
+        same ref idempotent. Only a non-terminal / unknown ref becomes ``REJECTED``.
+        """
+        existing = self._orders_by_ref.get(broker_ref)
+        if existing is not None and existing.status in (
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+        ):
+            # Already terminal — return it unchanged (no clobber, idempotent).
+            return existing
+        cancelled = OrderOutcome(
+            status=OrderStatus.REJECTED,
+            filled_qty=Decimal("0"),
+            avg_price=None,
+            broker_ref=broker_ref,
+        )
+        self._orders_by_ref[broker_ref] = cancelled
+        return cancelled

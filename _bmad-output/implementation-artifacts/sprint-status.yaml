@@ -130,7 +130,7 @@ development_status:
   # 3-story split A/B/C; 8.1 is backend+API+tests (no UI), fill-immediate marketable limits.
   epic-8: in-progress
   8-1-marketable-limit-orders-order-model: done
-  8-2-resting-order-lifecycle: backlog
+  8-2-resting-order-lifecycle: done
   8-3-order-entry-ui-beginner-warnings: backlog
   epic-8-retrospective: optional
 

@@ -609,18 +609,21 @@ def cosign(
 
 
 #: The terminal (settled) outcome statuses — a reconcile short-circuits on these
-#: (nothing more to read; the broker's answer is final). ``timeout``/``pending``
-#: are NON-terminal (indeterminate): the true state is not yet known, so a durable
-#: reconcile may still resolve them (mirrors ``coach.execution.INDETERMINATE``).
-_TERMINAL_STATUSES: frozenset[str] = frozenset({"filled", "partial", "rejected"})
+#: (nothing more to read; the broker's answer is final). As of Story 8.2
+#: ``partial`` is NO LONGER terminal: a partially-filled order can still advance to
+#: ``filled`` (the Epic 6 partial-fill decision), so a reconcile re-reads it —
+#: ``record_reconciliation`` supplies the advance-only guard that keeps it from
+#: regressing. ``timeout``/``pending``/``partial`` are all NON-terminal here.
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"filled", "rejected"})
 
 
 def _is_terminal(status: str) -> bool:
-    """True iff ``status`` is a settled/terminal outcome (filled/partial/rejected).
+    """True iff ``status`` is a settled/terminal outcome (filled/rejected).
 
     A terminal outcome is the broker's final answer — a reconcile returns it
-    unchanged and never re-reads the broker. ``timeout``/``pending`` are NON-terminal
-    (still resolvable by a later durable reconcile).
+    unchanged and never re-reads the broker. ``timeout``/``pending``/``partial`` are
+    NON-terminal (still resolvable/advanceable by a later durable reconcile, Story
+    8.2).
     """
     return status in _TERMINAL_STATUSES
 
@@ -646,6 +649,25 @@ def effective_outcome_status(record: DecisionRecord) -> str:
     return outcome.get("status", "")
 
 
+def _effective_filled_qty(record: DecisionRecord) -> Decimal:
+    """The newest-known filled quantity for ``record`` (Story 8.2).
+
+    Mirrors :func:`effective_outcome_status`'s snapshot precedence exactly — the
+    reconciliation snapshot when it carries a status, else the cosign snapshot — so
+    the qty read is drawn from the SAME outcome the status came from. ``filled_qty``
+    is persisted as a fixed-point string; parse it back to ``Decimal`` (never binary
+    float). Absent/unknown → ``Decimal("0")``.
+    """
+    reconciliation = record.reconciliation_snapshot or {}
+    reconciled_outcome = reconciliation.get("outcome") or {}
+    if reconciled_outcome.get("status"):
+        raw = reconciled_outcome.get("filled_qty")
+    else:
+        cosign = record.cosign_snapshot or {}
+        raw = (cosign.get("outcome") or {}).get("filled_qty")
+    return Decimal(str(raw)) if raw is not None else Decimal("0")
+
+
 def record_reconciliation(
     record: DecisionRecord,
     *,
@@ -665,11 +687,22 @@ def record_reconciliation(
     progresses ``pending → filled``, so these two fields are overwritten each time.
     The CALLER commits.
 
-    Monotonic toward settlement: if the record's newest-known outcome is ALREADY
-    terminal (``filled``/``rejected``), this is a no-op — a settled money truth is
-    never walked backward to a less-settled state. The sole caller only reconciles
-    a non-terminal record, so this is defense-in-depth at the writer (AD-6) against
-    a stale/racing read regressing a confirmed outcome.
+    Advance-only toward settlement (Story 8.2): a money truth is never walked
+    backward to a less-settled state.
+
+    - If the record's newest-known outcome is ALREADY fully terminal
+      (``filled``/``rejected``), this is a no-op — the confirmed money truth stands.
+    - If the newest-known outcome is ``partial`` (no longer terminal as of 8.2) and
+      the incoming ``outcome.status`` is INDETERMINATE (``pending``/``timeout``),
+      this is a no-op — a partial fill must NOT regress to a less-settled
+      indeterminate state. A ``partial`` DOES accept an advance to ``filled`` or a
+      larger-qty ``partial`` (both write below).
+    - Otherwise (``pending``/``timeout`` → anything, ``partial`` → ``filled`` /
+      larger ``partial``) the reconciliation snapshot is written.
+
+    The sole caller only reconciles a non-fully-terminal record, so this is
+    defense-in-depth at the writer (AD-6) against a stale/racing read regressing a
+    confirmed outcome.
     """
     if record.status != "cosigned":
         raise ValueError(
@@ -677,10 +710,22 @@ def record_reconciliation(
             f"placed order to reconcile otherwise); record status is "
             f"{record.status!r}."
         )
-    if _is_terminal(effective_outcome_status(record)):
-        # Already settled — never regress a terminal outcome (monotonic toward
-        # settlement); the confirmed money truth stands.
+    current = effective_outcome_status(record)
+    if current in ("filled", "rejected"):
+        # Fully terminal — never overwrite the confirmed money truth.
         return
+    if current == "partial":
+        # A partial fill advances only: to ``filled`` or an EQUAL/LARGER partial.
+        if outcome.status.value in ("pending", "timeout"):
+            # Indeterminate re-read (INDETERMINATE = {pending, timeout}) — never
+            # regress a partial to a less-settled state.
+            return
+        if outcome.filled_qty < _effective_filled_qty(record):
+            # Fewer filled shares than already confirmed — a stale/racing broker
+            # read (e.g. a shrunken ``partial``, or a ``rejected``/``pending`` that
+            # dropped the fill count) must NEVER overwrite the confirmed partial and
+            # ERASE real filled shares. Share count is monotonic toward settlement.
+            return
     record.reconciliation_snapshot = {
         "outcome": {
             "status": outcome.status.value,
