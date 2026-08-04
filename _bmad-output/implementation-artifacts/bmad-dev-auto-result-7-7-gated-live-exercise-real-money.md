@@ -8,6 +8,8 @@ status: blocked
 
 Status: blocked
 
+> **Re-verified 2026-08-04 (fresh `/bmad-dev-auto 7-7` invocation):** working tree clean on `main`; no `.env` and no `SCHWAB_*`/`ANTHROPIC_API_KEY`/`TOKEN_ENCRYPTION_KEY` in the environment; `sprint-status.yaml` shows `7-7-gated-live-exercise-real-money: backlog` and `7-6` preflight `done`; epics.md still marks the story **"Human pause point — not a loop task."** No offline code slice exists to build. Remains blocked — unchanged. The gate has not been crossed.
+>
 > **Re-verified 2026-08-03 (fresh `/bmad-dev-auto 7-7` invocation):** working tree clean on `main`; no `.env` and no `SCHWAB_*`/`ANTHROPIC_API_KEY` in the environment; `sprint-status.yaml` shows `7-7-gated-live-exercise-real-money: backlog` and `7-6` preflight `done`; epics.md still marks the story **"Human pause point — not a loop task."** No offline code slice exists to build. Remains blocked — unchanged.
 Blocking condition (re-confirmed 2026-08-03, Story 7.6 now `done`): Story 7.7 is the credential- and real-money human gate — it cannot be run by the autonomous loop. It requires real `SCHWAB_*` + `ANTHROPIC_API_KEY` + a **funded** Schwab account, places a **real order with real money** against live Schwab, and contains a **reserved product decision** (partial-fill terminality) that is MasterB's to make. Every acceptance criterion needs live real-world I/O that cannot be executed or tested offline. The loop must not fabricate live payload results or place a real trade. Handing to MasterB to run manually.
 
