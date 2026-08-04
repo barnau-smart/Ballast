@@ -1,8 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { apiFetch } from '../lib/session.js'
+import {
+  DEFAULT_OPTIONS,
+  buildOrderIntent,
+  deriveWarnings,
+  validateOrderMatrix,
+} from '../lib/orderOptions.js'
 import { CoachCard } from './CoachCard.jsx'
 import './CoachConsult.css'
+import './OrderOptions.css'
 
 /**
  * The live coach consult (Story 4.11) — Epic 4's "emotional centerpiece"
@@ -69,6 +76,13 @@ export function CoachConsult() {
   const [approveMessage, setApproveMessage] = useState('')
   const [outcome, setOutcome] = useState(null)
 
+  // Story 8.3 — the human's approve-time order-model override (progressive
+  // disclosure). Defaults to the blessed MARKET order so the composed intent
+  // stays byte-identical `{symbol, side, amount}`. `dismissed` holds the set of
+  // footgun-warning kinds the user has read and set aside (informed consent).
+  const [options, setOptions] = useState(DEFAULT_OPTIONS)
+  const [dismissed, setDismissed] = useState([])
+
   const mounted = useRef(true)
   const placingRef = useRef(false) // synchronous double-submit guard
   useEffect(() => {
@@ -95,6 +109,10 @@ export function CoachConsult() {
     setApprove('idle')
     setApproveMessage('')
     setOutcome(null)
+    // A fresh ask/decline returns the order-options override to the blessed
+    // MARKET default and clears any dismissed footgun warnings.
+    setOptions(DEFAULT_OPTIONS)
+    setDismissed([])
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -158,6 +176,7 @@ export function CoachConsult() {
 
   async function onApprove() {
     if (!recommendation?.decision_id || !orderIntent) return
+    if (!matrix.ok) return // the client mirror blocks an invalid combination
     if (placingRef.current) return // synchronous double-click guard
     placingRef.current = true
     setApprove('placing')
@@ -168,7 +187,10 @@ export function CoachConsult() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           decision_id: recommendation.decision_id,
-          order_intent: orderIntent,
+          // Story 8.3: upgrade the blessed MARKET base with the human's
+          // approve-time order-model override. MARKET+REGULAR+DAY stays
+          // byte-identical `{symbol, side, amount}`.
+          order_intent: buildOrderIntent(orderIntent, options),
         }),
       })
       if (!mounted.current) return
@@ -229,6 +251,24 @@ export function CoachConsult() {
     approve !== 'placed'
   const placedPosition =
     outcome && (outcome.status === 'filled' || outcome.status === 'partial')
+
+  // Story 8.3 — the client-side matrix mirror + footgun warnings, derived live
+  // from the human's approve-time options. The mirror gates Approve (defense in
+  // depth; the backend stays authoritative); warnings the user has dismissed
+  // drop out but never block.
+  const matrix = validateOrderMatrix(options)
+  const warnings = deriveWarnings(options).filter(
+    (w) => !dismissed.includes(w.kind),
+  )
+  const isLimit = options.order_type === 'limit'
+
+  function setOption(patch) {
+    setOptions((prev) => ({ ...prev, ...patch }))
+  }
+
+  function dismissWarning(kind) {
+    setDismissed((prev) => (prev.includes(kind) ? prev : [...prev, kind]))
+  }
 
   return (
     <div className="ballast-consult" data-testid="coach-consult">
@@ -355,6 +395,189 @@ export function CoachConsult() {
 
           {showCosign ? (
             <div className="ballast-consult__cosign" data-testid="coach-cosign">
+              <div
+                className="ballast-order-options"
+                data-testid="order-options"
+              >
+                <p className="ballast-order-options__heading">Order options</p>
+                <div className="ballast-order-options__row">
+                  <div className="ballast-order-options__field">
+                    <label
+                      className="ballast-order-options__label"
+                      htmlFor="order-type-select"
+                    >
+                      Order type
+                    </label>
+                    <select
+                      id="order-type-select"
+                      className="ballast-form__input"
+                      data-testid="order-type-select"
+                      value={options.order_type}
+                      onChange={(e) => {
+                        const order_type = e.target.value
+                        // Guard: the disabled STOP/STOP_LIMIT options are
+                        // unsupported — ignore a change to one via any path so
+                        // they're truly unselectable.
+                        if (
+                          order_type === 'stop' ||
+                          order_type === 'stop_limit'
+                        )
+                          return
+                        // Leaving LIMIT clears the limit-only fields so a stale
+                        // price/GTC can't linger on a MARKET intent, AND clears
+                        // dismissed footgun warnings so re-entering LIMIT
+                        // re-shows them for fresh informed consent.
+                        setOptions((prev) => ({
+                          ...prev,
+                          order_type,
+                          ...(order_type === 'limit'
+                            ? {}
+                            : { limit_price: '', duration: 'day' }),
+                        }))
+                        if (order_type !== 'limit') setDismissed([])
+                      }}
+                    >
+                      <option value="market">Market</option>
+                      <option value="limit">Limit</option>
+                      <option value="stop" disabled>
+                        Stop — not available in this version
+                      </option>
+                      <option value="stop_limit" disabled>
+                        Stop-limit — not available in this version
+                      </option>
+                    </select>
+                    <p
+                      className="ballast-order-options__note"
+                      data-testid="order-type-unsupported-note"
+                    >
+                      Stop and stop-limit orders aren’t available in this
+                      version.
+                    </p>
+                  </div>
+
+                  {isLimit ? (
+                    <div className="ballast-order-options__field">
+                      <label
+                        className="ballast-order-options__label"
+                        htmlFor="order-limit-price-input"
+                      >
+                        Limit price
+                      </label>
+                      <input
+                        id="order-limit-price-input"
+                        className="ballast-form__input"
+                        data-testid="order-limit-price-input"
+                        type="text"
+                        inputMode="decimal"
+                        value={options.limit_price}
+                        placeholder="99.50"
+                        onChange={(e) =>
+                          setOption({ limit_price: e.target.value })
+                        }
+                      />
+                    </div>
+                  ) : null}
+
+                  {isLimit ? (
+                    <div className="ballast-order-options__field">
+                      <label
+                        className="ballast-order-options__label"
+                        htmlFor="order-duration-select"
+                      >
+                        Time in force
+                      </label>
+                      <select
+                        id="order-duration-select"
+                        className="ballast-form__input"
+                        data-testid="order-duration-select"
+                        value={options.duration}
+                        onChange={(e) => {
+                          setOption({ duration: e.target.value })
+                          // Re-arm the GTC footgun warning on any duration
+                          // toggle so a dismiss → Day → GTC round-trip (without
+                          // ever leaving LIMIT) re-shows it for fresh consent.
+                          setDismissed((prev) =>
+                            prev.filter((k) => k !== 'gtc'),
+                          )
+                        }}
+                      >
+                        <option value="day">Day</option>
+                        <option value="gtc">Good ’til canceled (GTC)</option>
+                      </select>
+                    </div>
+                  ) : null}
+
+                  <div className="ballast-order-options__field">
+                    <label
+                      className="ballast-order-options__label"
+                      htmlFor="order-session-select"
+                    >
+                      Session
+                    </label>
+                    <select
+                      id="order-session-select"
+                      className="ballast-form__input"
+                      data-testid="order-session-select"
+                      value={options.session}
+                      onChange={(e) => {
+                        const session = e.target.value
+                        // Guard: AM/PM extended-hours sessions are unsupported —
+                        // ignore a change to one so they're truly unselectable.
+                        if (session === 'am' || session === 'pm') return
+                        setOption({ session })
+                      }}
+                    >
+                      <option value="regular">Regular</option>
+                      <option value="am" disabled>
+                        Pre-market — not available in this version
+                      </option>
+                      <option value="pm" disabled>
+                        After-hours — not available in this version
+                      </option>
+                    </select>
+                    <p
+                      className="ballast-order-options__note"
+                      data-testid="order-session-unsupported-note"
+                    >
+                      Pre-market and after-hours sessions aren’t available in
+                      this version.
+                    </p>
+                  </div>
+                </div>
+
+                {warnings.map((w) => (
+                  <div
+                    key={w.kind}
+                    className="ballast-order-options__warning"
+                    data-testid={`order-warning-${w.kind}`}
+                    role="status"
+                  >
+                    <p className="ballast-order-options__warning-text">
+                      {w.message}
+                    </p>
+                    <button
+                      type="button"
+                      className="ballast-order-options__dismiss"
+                      data-testid={`order-warning-dismiss-${w.kind}`}
+                      onClick={() => dismissWarning(w.kind)}
+                    >
+                      dismiss
+                    </button>
+                  </div>
+                ))}
+
+                {!matrix.ok ? (
+                  <p
+                    id="order-mirror-block"
+                    className="ballast-order-options__mirror"
+                    data-testid="order-mirror-block"
+                    role="status"
+                  >
+                    {matrix.detail}
+                  </p>
+                ) : null}
+              </div>
+
               <p className="ballast-consult__cosign-note">
                 <span aria-hidden="true">✎</span> I’ll put my name on this with
                 you.
@@ -365,7 +588,10 @@ export function CoachConsult() {
                   className="ballast-consult__approve"
                   data-testid="coach-approve"
                   onClick={onApprove}
-                  disabled={approve === 'placing'}
+                  disabled={approve === 'placing' || !matrix.ok}
+                  aria-describedby={
+                    !matrix.ok ? 'order-mirror-block' : undefined
+                  }
                 >
                   {approve === 'placing' ? 'Placing…' : 'Approve & Co-sign'}
                 </button>

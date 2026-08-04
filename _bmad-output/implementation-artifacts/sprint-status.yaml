@@ -131,7 +131,7 @@ development_status:
   epic-8: in-progress
   8-1-marketable-limit-orders-order-model: done
   8-2-resting-order-lifecycle: done
-  8-3-order-entry-ui-beginner-warnings: backlog
+  8-3-order-entry-ui-beginner-warnings: done
   epic-8-retrospective: optional
 
 action_items:

@@ -67,8 +67,134 @@ const DETAIL_PAYLOAD = {
   },
 }
 
+// A resting/working order (Story 8.3): effective status `pending` with a
+// broker_ref present — the only shape that surfaces a Cancel control.
+const WORKING_LIST_PAYLOAD = {
+  decisions: [
+    {
+      decision_id: 'dec-working',
+      action_label: 'Buy VTI near the low',
+      symbol: 'VTI',
+      co_signed_at: '2026-07-28T15:00:00+00:00',
+      outcome_status: 'pending',
+    },
+  ],
+}
+
+const WORKING_DETAIL_PAYLOAD = {
+  decision_id: 'dec-working',
+  schema_version: 1,
+  status: 'cosigned',
+  created_at: '2026-07-28T14:59:00+00:00',
+  co_signed_at: '2026-07-28T15:00:00+00:00',
+  recommendation_snapshot: {
+    action_label: 'Buy VTI near the low',
+    reasoning: 'A resting limit that waits for your price.',
+    order_intent: null,
+    evidence: [],
+    uncertainties: ['A resting order may not fill.'],
+  },
+  cosign_snapshot: {
+    order_intent: {
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+      order_type: 'limit',
+      limit_price: '99.50',
+    },
+    outcome: {
+      status: 'pending',
+      filled_qty: '0',
+      avg_price: null,
+      broker_ref: 'fake-order-resting-1',
+    },
+  },
+}
+
+// A detail whose cosign snapshot still reads `pending` with a broker_ref (the
+// resting/working shape), but whose NEWER reconciliation snapshot reports the
+// order `filled`. The reconcile snapshot is the newer truth and must win —
+// so the order is NOT shown as working and no Cancel control renders.
+const RECONCILED_DETAIL_PAYLOAD = {
+  decision_id: 'dec-working',
+  schema_version: 1,
+  status: 'cosigned',
+  created_at: '2026-07-28T14:59:00+00:00',
+  co_signed_at: '2026-07-28T15:00:00+00:00',
+  recommendation_snapshot: {
+    action_label: 'Buy VTI near the low',
+    reasoning: 'A resting limit that waits for your price.',
+    order_intent: null,
+    evidence: [],
+    uncertainties: ['A resting order may not fill.'],
+  },
+  cosign_snapshot: {
+    order_intent: {
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+      order_type: 'limit',
+      limit_price: '99.50',
+    },
+    outcome: {
+      status: 'pending',
+      filled_qty: '0',
+      avg_price: null,
+      broker_ref: 'fake-order-resting-1',
+    },
+  },
+  reconciliation_snapshot: {
+    outcome: {
+      status: 'filled',
+      filled_qty: '5',
+      avg_price: '99.50',
+      broker_ref: 'fake-order-resting-1',
+    },
+  },
+}
+
 function stubFetch(handler) {
   vi.stubGlobal('fetch', vi.fn(handler))
+}
+
+// A route-by-URL stub for the working-order flow: list + detail + a cancel
+// response the test supplies.
+function stubWorking(cancel) {
+  const fn = vi.fn((url, init) => {
+    const u = String(url)
+    if (u.endsWith('/api/coach/decisions/dec-working/cancel')) {
+      return Promise.resolve({
+        ok: cancel.ok ?? true,
+        status: cancel.status ?? 200,
+        json: () => Promise.resolve(cancel.body ?? {}),
+      })
+    }
+    if (u.endsWith('/api/coach/decisions/dec-working')) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(WORKING_DETAIL_PAYLOAD),
+      })
+    }
+    if (u.endsWith('/api/coach/decisions')) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(WORKING_LIST_PAYLOAD),
+      })
+    }
+    throw new Error(`unexpected fetch: ${u} ${init?.method ?? ''}`)
+  })
+  vi.stubGlobal('fetch', fn)
+  return fn
+}
+
+async function openWorkingDecision() {
+  await waitFor(() =>
+    expect(screen.getByTestId('decisions-list')).toBeInTheDocument(),
+  )
+  screen.getByTestId('decisions-item-dec-working').click()
+  await waitFor(() =>
+    expect(screen.getByTestId('decisions-working')).toBeInTheDocument(),
+  )
 }
 
 function renderDecisions() {
@@ -241,5 +367,218 @@ describe('Decisions surface — co-signed history & verbatim replay', () => {
       expect(screen.getByTestId('decision-replay')).toBeInTheDocument(),
     )
     expect(detailCalls).toBe(2)
+  })
+
+  // --- Story 8.3: resting/working order lifecycle + Cancel -------------------
+
+  it('a pending order with a broker_ref shows "working" + a Cancel control', async () => {
+    stubWorking({ body: {} })
+    renderDecisions()
+    await openWorkingDecision()
+
+    expect(screen.getByTestId('decisions-working-label')).toHaveTextContent(
+      /working/i,
+    )
+    expect(screen.getByTestId('decisions-cancel')).toBeInTheDocument()
+  })
+
+  it('cancel → rejected updates the row honestly and hides the Cancel control', async () => {
+    const fn = stubWorking({
+      body: { status: 'rejected', filled_qty: '0', needs_reconfirmation: false },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(screen.getByTestId('decisions-cancelled')).toBeInTheDocument(),
+    )
+    // Cancel is gone; the honest cancelled note remains.
+    expect(screen.queryByTestId('decisions-cancel')).not.toBeInTheDocument()
+    expect(screen.getByTestId('decisions-cancelled')).toHaveTextContent(
+      /cancelled/i,
+    )
+    // A POST cancel request was actually fired.
+    const cancelCall = fn.mock.calls.find((c) =>
+      String(c[0]).endsWith('/api/coach/decisions/dec-working/cancel'),
+    )
+    expect(cancelCall[1].method).toBe('POST')
+  })
+
+  it('cancel → needs_reconfirmation shows an honest "state unclear" note, NOT a clean cancel', async () => {
+    stubWorking({
+      body: { status: 'pending', filled_qty: '0', needs_reconfirmation: true },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('decisions-cancel-unclear'),
+      ).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('decisions-cancel-unclear')).toHaveTextContent(
+      /unclear/i,
+    )
+    // Never a clean-cancel claim.
+    expect(screen.queryByTestId('decisions-cancelled')).not.toBeInTheDocument()
+  })
+
+  it('cancel → calm 422 surfaces the backend detail verbatim, row unchanged', async () => {
+    // The REAL app-wide error envelope is `{error:{type,message}}` (api/app.py),
+    // not a bare `{detail}` — the calm reason lives at `error.message`.
+    stubWorking({
+      ok: false,
+      status: 422,
+      body: {
+        error: {
+          type: 'http_error',
+          message:
+            'This order can no longer be cancelled — it is already settled or partially filled.',
+        },
+      },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('decisions-cancel-refused'),
+      ).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('decisions-cancel-refused')).toHaveTextContent(
+      'This order can no longer be cancelled — it is already settled or partially filled.',
+    )
+    // The row is unchanged — still working, Cancel still available for retry.
+    expect(screen.getByTestId('decisions-cancel')).toBeInTheDocument()
+    expect(screen.queryByTestId('decisions-cancelled')).not.toBeInTheDocument()
+  })
+
+  it('cancel → 409 surfaces the backend reconnect message verbatim from the {error:{message}} envelope', async () => {
+    // A message DISTINCT from the frontend fallback proves it is read from
+    // `error.message` (the real envelope), not the hardcoded fallback string.
+    const backendReconnect =
+      'Your Schwab connection needs a quick reconnect before this can go through.'
+    stubWorking({
+      ok: false,
+      status: 409,
+      body: { error: { type: 'http_error', message: backendReconnect } },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('decisions-cancel-reconnect'),
+      ).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('decisions-cancel-reconnect')).toHaveTextContent(
+      backendReconnect,
+    )
+  })
+
+  it('cancel → needs_reconfirmation with status=filled is honest about the fill (nothing called off)', async () => {
+    stubWorking({
+      body: { status: 'filled', filled_qty: '5', needs_reconfirmation: true },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('decisions-cancel-filled'),
+      ).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('decisions-cancel-filled')).toHaveTextContent(
+      /filled before the cancel took effect/i,
+    )
+    // A full fill is not a clean cancel — the Cancel control and the cancelled
+    // note are both gone.
+    expect(screen.queryByTestId('decisions-cancel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('decisions-cancelled')).not.toBeInTheDocument()
+  })
+
+  it('cancel → needs_reconfirmation with status=partial does NOT claim a full fill', async () => {
+    stubWorking({
+      body: { status: 'partial', filled_qty: '2', needs_reconfirmation: true },
+    })
+    renderDecisions()
+    await openWorkingDecision()
+
+    screen.getByTestId('decisions-cancel').click()
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('decisions-cancel-partial'),
+      ).toBeInTheDocument(),
+    )
+    // Honest partial copy: some shares filled, the rest was called off — never
+    // the full-fill "nothing was called off" wording, never a clean cancel.
+    const note = screen.getByTestId('decisions-cancel-partial')
+    expect(note).toHaveTextContent(/part of this order filled/i)
+    expect(note).toHaveTextContent(/the rest was called off/i)
+    expect(
+      screen.queryByTestId('decisions-cancel-filled'),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByTestId('decisions-cancelled')).not.toBeInTheDocument()
+    // A partial is terminal for the working state — no Cancel control remains.
+    expect(screen.queryByTestId('decisions-cancel')).not.toBeInTheDocument()
+  })
+
+  it('a reconciliation snapshot (filled) beats a stale cosign pending — not working, no Cancel', async () => {
+    stubFetch((url) => {
+      if (url.endsWith('/api/coach/decisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(WORKING_LIST_PAYLOAD),
+        })
+      }
+      if (url.endsWith('/api/coach/decisions/dec-working')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(RECONCILED_DETAIL_PAYLOAD),
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    renderDecisions()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('decisions-list')).toBeInTheDocument(),
+    )
+    screen.getByTestId('decisions-item-dec-working').click()
+    await waitFor(() =>
+      expect(screen.getByTestId('decision-replay')).toBeInTheDocument(),
+    )
+    // The newer reconcile status (filled) wins over the cosign pending — the
+    // order is terminal, so no working banner and no Cancel control.
+    expect(screen.queryByTestId('decisions-working')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('decisions-cancel')).not.toBeInTheDocument()
+  })
+
+  it('a filled (non-working) decision shows no Cancel control', async () => {
+    stubFetch((url) => {
+      if (url.endsWith('/api/coach/decisions')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(LIST_PAYLOAD) })
+      }
+      if (url.endsWith('/api/coach/decisions/dec-2')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(DETAIL_PAYLOAD) })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    renderDecisions()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('decisions-list')).toBeInTheDocument(),
+    )
+    screen.getByTestId('decisions-item-dec-2').click()
+    await waitFor(() =>
+      expect(screen.getByTestId('decision-replay')).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('decisions-working')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('decisions-cancel')).not.toBeInTheDocument()
   })
 })

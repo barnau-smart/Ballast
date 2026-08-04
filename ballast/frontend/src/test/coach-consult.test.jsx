@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { CoachConsult } from '../components/CoachConsult.jsx'
 
@@ -487,6 +487,284 @@ describe('CoachConsult — live propose → approve/decline', () => {
       /couldn.t confirm this yet/i,
     )
     expect(screen.queryByTestId('coach-replay-chip')).not.toBeInTheDocument()
+  })
+
+  // --- Story 8.3: order-options override + footgun warnings ----------------
+
+  function setOption(testid, value) {
+    fireEvent.change(screen.getByTestId(testid), { target: { value } })
+  }
+
+  it('untouched order-options → approve sends byte-identical {symbol,side,amount}, no warnings', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    // No footgun warnings on the default MARKET intent.
+    expect(screen.queryByTestId('order-warning-resting-limit')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent).toEqual({
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+    })
+    expect(Object.keys(body.order_intent).sort()).toEqual([
+      'amount',
+      'side',
+      'symbol',
+    ])
+  })
+
+  it('composing a LIMIT sends order_type + limit_price as the exact string; "may rest" warning shows and is dismissable', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    setOption('order-limit-price-input', '99.50')
+
+    // Calm "may rest" warning appears and can be dismissed.
+    const warning = await screen.findByTestId('order-warning-resting-limit')
+    expect(warning).toHaveTextContent(/may not fill right away/i)
+    fireEvent.click(screen.getByTestId('order-warning-dismiss-resting-limit'))
+    expect(
+      screen.queryByTestId('order-warning-resting-limit'),
+    ).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent).toEqual({
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+      order_type: 'limit',
+      limit_price: '99.50',
+    })
+    // The exact string, never Number-coerced.
+    expect(body.order_intent.limit_price).toBe('99.50')
+  })
+
+  it('a float-hostile LIMIT price (100.00) survives the form→state→serialize path as the exact string', async () => {
+    // '100.00' is a value where String(Number('100.00')) === '100' — proving
+    // the real component path never coerces the money string through a float.
+    expect(String(Number('100.00'))).toBe('100')
+
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    setOption('order-limit-price-input', '100.00')
+
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent.limit_price).toBe('100.00')
+  })
+
+  it('LIMIT + GTC sends duration:"gtc" and shows BOTH footgun warnings', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    setOption('order-limit-price-input', '99.50')
+    setOption('order-duration-select', 'gtc')
+
+    expect(
+      await screen.findByTestId('order-warning-resting-limit'),
+    ).toBeInTheDocument()
+    expect(screen.getByTestId('order-warning-gtc')).toHaveTextContent(
+      /stays open for days/i,
+    )
+
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-outcome')).toBeInTheDocument(),
+    )
+    const approveCall = fn.mock.calls.find((c) =>
+      String(c[0]).includes('/api/coach/approve'),
+    )
+    const body = JSON.parse(approveCall[1].body)
+    expect(body.order_intent).toEqual({
+      symbol: 'VTI',
+      side: 'buy',
+      amount: '500',
+      order_type: 'limit',
+      limit_price: '99.50',
+      duration: 'gtc',
+    })
+  })
+
+  it('dismissing the GTC warning then toggling duration Day→GTC re-arms it (fresh consent)', async () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT }, approve: { body: OUTCOME } })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    setOption('order-limit-price-input', '99.50')
+    setOption('order-duration-select', 'gtc')
+    expect(await screen.findByTestId('order-warning-gtc')).toBeInTheDocument()
+
+    // Dismiss the GTC footgun warning.
+    fireEvent.click(screen.getByTestId('order-warning-dismiss-gtc'))
+    await waitFor(() =>
+      expect(screen.queryByTestId('order-warning-gtc')).not.toBeInTheDocument(),
+    )
+
+    // Toggle duration away and BACK to GTC without ever leaving LIMIT — the
+    // warning must re-appear so informed consent is re-armed for the new choice.
+    setOption('order-duration-select', 'day')
+    setOption('order-duration-select', 'gtc')
+    expect(await screen.findByTestId('order-warning-gtc')).toHaveTextContent(
+      /stays open for days/i,
+    )
+  })
+
+  it('LIMIT with no/invalid price → Approve disabled + calm mirror message, no /approve call', async () => {
+    const fn = stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: { body: OUTCOME },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    // Left blank → mirror blocks with the exact backend message.
+    expect(await screen.findByTestId('order-mirror-block')).toHaveTextContent(
+      'A limit order needs a limit price greater than zero.',
+    )
+    expect(screen.getByTestId('coach-approve')).toBeDisabled()
+
+    fireEvent.click(screen.getByTestId('coach-approve'))
+    // Disabled + guarded: no /approve request fired.
+    expect(
+      fn.mock.calls.some((c) => String(c[0]).includes('/api/coach/approve')),
+    ).toBe(false)
+  })
+
+  it('STOP and after-hours are shown disabled with a calm not-available note', async () => {
+    stubFetch({ recommend: { body: REC_NO_INTENT }, approve: { body: OUTCOME } })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    const typeSelect = screen.getByTestId('order-type-select')
+    const stopOption = within(typeSelect).getByRole('option', { name: /^stop —/i })
+    expect(stopOption).toBeDisabled()
+    expect(screen.getByTestId('order-type-unsupported-note')).toHaveTextContent(
+      /aren.t available in this version/i,
+    )
+
+    const sessionSelect = screen.getByTestId('order-session-select')
+    const pmOption = within(sessionSelect).getByRole('option', {
+      name: /after-hours/i,
+    })
+    expect(pmOption).toBeDisabled()
+    expect(
+      screen.getByTestId('order-session-unsupported-note'),
+    ).toHaveTextContent(/aren.t available in this version/i)
+  })
+
+  it('a backend 422 on a LIMIT surfaces the detail verbatim (defense in depth)', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      approve: {
+        ok: false,
+        status: 422,
+        body: { detail: 'A limit order needs a limit price greater than zero.' },
+      },
+    })
+    renderConsult()
+
+    ask('Invest my paycheck?')
+    setOrder({ symbol: 'VTI', amount: '500', side: 'buy' })
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+
+    setOption('order-type-select', 'limit')
+    setOption('order-limit-price-input', '99.50') // client mirror passes
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-refused')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-refused')).toHaveTextContent(
+      'A limit order needs a limit price greater than zero.',
+    )
   })
 
   it('double-clicking Approve fires only ONE /approve request', async () => {

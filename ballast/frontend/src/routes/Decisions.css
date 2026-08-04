@@ -70,3 +70,55 @@
   flex-direction: column;
   gap: var(--ballast-space-16);
 }
+
+/* Story 8.3 — a resting/working order + its Cancel control. Calm, never-red:
+ * the "working" label and Cancel affordance use phosphor/muted tokens, not
+ * brand-red (a cancel is a calm reversal, never an alarm). */
+.ballast-decisions__working {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-uncertainty);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-16);
+}
+
+.ballast-decisions__working-label {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-decisions__cancel {
+  align-self: flex-start;
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-base);
+  letter-spacing: var(--ballast-space-4);
+  color: var(--ballast-color-phosphor);
+  background-color: transparent;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-20);
+  cursor: pointer;
+}
+
+.ballast-decisions__cancel:disabled {
+  color: var(--ballast-color-muted);
+  cursor: default;
+}
+
+.ballast-decisions__cancel:focus-visible {
+  outline-style: solid;
+  outline-width: var(--ballast-space-4);
+  outline-color: var(--ballast-color-phosphor);
+}
+
+.ballast-decisions__link {
+  color: var(--ballast-color-phosphor);
+}

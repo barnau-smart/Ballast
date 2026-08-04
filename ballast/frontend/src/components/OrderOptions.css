@@ -1,0 +1,105 @@
+/*
+ * Story 8.3 — order-options override + footgun warnings on the co-sign surface.
+ * Calm, NEVER-RED (NFR8): the progressive-disclosure controls, the dismissable
+ * warnings, and the disabled "not available in this version" affordances all use
+ * low-contrast phosphor/muted tokens — brand-red stays reserved for the co-sign
+ * ACTION only. All values reference --ballast-* design tokens (no raw hex/px).
+ */
+
+.ballast-order-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-16);
+}
+
+.ballast-order-options__heading {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  letter-spacing: var(--ballast-space-4);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-order-options__row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-order-options__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+  flex: 1 1 auto;
+}
+
+.ballast-order-options__label {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+}
+
+.ballast-order-options__note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-order-options__mirror {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+/* A calm, dismissable footgun warning — never-red. Uses the neutral uncertainty
+ * accent (the same low-alarm token the uncertainty callout uses), not brand-red. */
+.ballast-order-options__warning {
+  display: flex;
+  flex-direction: row;
+  gap: var(--ballast-space-12);
+  align-items: flex-start;
+  justify-content: space-between;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-uncertainty);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-12);
+}
+
+.ballast-order-options__warning-text {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-order-options__dismiss {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-phosphor);
+  background-color: transparent;
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-4) var(--ballast-space-12);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.ballast-order-options__dismiss:focus-visible {
+  outline-style: solid;
+  outline-width: var(--ballast-space-4);
+  outline-color: var(--ballast-color-phosphor);
+}
