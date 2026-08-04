@@ -2062,8 +2062,11 @@ def test_approve_non_marketable_limit_422_releases_claim(client):
     ],
 )
 def test_approve_deferred_features_rejected_422_no_broker(client, override):
-    # Story 8.1 (AC 3): a deferred order feature is rejected with a calm 422 at the
-    # schema boundary, BEFORE any broker call.
+    # Story 8.1 (AC 3): a deferred order feature is rejected with a calm, EXPLICIT
+    # "not supported in this version" 422 by the engine gate, BEFORE any broker
+    # call. (Review 2026-08-04: the boundary no longer rejects these — doing so
+    # produced the generic "Request validation failed"; the engine gate's message
+    # is the one AC 3 requires and it must reach the client.)
     email = _unique_email()
     spy = _SpyAdapter()
     client.app.dependency_overrides[get_broker] = lambda: spy
@@ -2071,21 +2074,28 @@ def test_approve_deferred_features_rejected_422_no_broker(client, override):
         _register(client, email)
         token = _login(client, email)
         headers = {"Authorization": f"Bearer {token}"}
-        _insert_token_sync(_user_id_for(email), _live())
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        decision_id = _recommend_decision_id(client, headers)
 
         order_intent = {"symbol": "VTI", "side": "buy", "amount": "500"}
         order_intent.update(override)
         resp = client.post(
             "/api/coach/approve",
             json={
-                "decision_id": str(uuid.uuid4()),
+                "decision_id": decision_id,
                 "order_intent": order_intent,
             },
             headers=headers,
         )
         assert resp.status_code == 422, resp.text
-        # The broker was NEVER touched (rejected at the boundary).
+        # The explicit deferred-feature copy (not the generic validation message)
+        # reaches the client (AC 3).
+        assert "supported in this version" in resp.json()["error"]["message"]
+        # The broker was NEVER touched (rejected before any placement) and the
+        # claim is released → the decision returns to 'proposed' (retryable).
         assert spy.calls == []
+        assert _decision_rows(uid)[0]["status"] == "proposed"
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)

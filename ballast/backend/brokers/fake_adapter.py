@@ -201,6 +201,15 @@ class FakeBrokerAdapter(BrokerPort):
         ``(filled_qty, avg_price)``.
         """
         limit_price = order_intent.limit_price
+        # Defense-in-depth (Story 8.1 review): the execution gate
+        # (validate_order_intent) already guarantees a finite, positive
+        # limit_price for a LIMIT on the production path, but a direct/future
+        # caller must never make the comparisons/division below raise a raw
+        # TypeError/InvalidOperation — refuse calmly instead.
+        if limit_price is None or not limit_price.is_finite() or limit_price <= 0:
+            raise OrderNotPlaceableError(
+                "This limit order has no usable limit price — no order was placed."
+            )
         if order_intent.side == OrderSide.BUY:
             if limit_price < FAKE_FILL_PRICE:
                 raise OrderNotPlaceableError(
@@ -223,9 +232,10 @@ class FakeBrokerAdapter(BrokerPort):
             )
         )
         if quantity < 1:
+            verb = "buys" if order_intent.side == OrderSide.BUY else "sells"
             raise OrderNotPlaceableError(
-                f"${order_intent.amount:.2f} buys less than one whole share at a "
-                f"${limit_price:.2f} limit — no order was placed."
+                f"${order_intent.amount:.2f} {verb} less than one whole share at "
+                f"a ${limit_price:.2f} limit — no order was placed."
             )
         return Decimal(quantity), limit_price
 

@@ -144,36 +144,31 @@ class OrderIntentIn(BaseModel):
 
     @model_validator(mode="after")
     def _validate_order_matrix(self) -> "OrderIntentIn":
-        """Enforce the field-requirement matrix at the schema boundary (Story 8.1).
+        """Fast price-shape check for the two SUPPORTED order types (Story 8.1).
 
-        A bad shape is a 422 HERE, BEFORE the engine — two layers by design (the
-        engine's :func:`coach.execution.validate_order_intent` stays the
-        authoritative gate). Deferred features (``stop``/``stop_limit`` type,
-        ``am``/``pm`` session, ``gtc`` duration) are refused as "not supported in
-        this version"; a MARKET carrying a limit/stop price or a LIMIT missing a
-        positive limit price / carrying a stop price is a field-shape violation.
-        Messages are kept consistent with the engine's.
+        A malformed MARKET (carrying a limit/stop price) or LIMIT (missing a
+        positive, finite ``limit_price`` / carrying a ``stop_price``) is a 422
+        HERE, before the engine.
+
+        Deferred features (``stop``/``stop_limit`` type, ``am``/``pm`` session,
+        ``gtc`` duration) are DELIBERATELY NOT rejected here — they pass the
+        boundary and are refused by the authoritative engine gate
+        (:func:`coach.execution.validate_order_intent` →
+        :class:`~coach.execution.OrderNotSupportedError`), which ``approve`` maps
+        to a calm 422 carrying the explicit "not supported in this version"
+        message. Rejecting them here would raise ``ValueError`` →
+        ``RequestValidationError``, which ``app.py`` flattens to the generic
+        "Request validation failed", swallowing that explicit copy (Story 8.1
+        review, 2026-08-04). ``stop``/``stop_limit`` therefore skip the
+        price-shape check below (the engine refuses the *type* before any
+        shape).
         """
-        if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
-            raise ValueError(
-                "Stop and stop-limit orders aren't supported in this version yet."
-            )
-        if self.session in (Session.AM, Session.PM):
-            raise ValueError(
-                "Extended-hours (pre-market / after-hours) sessions aren't "
-                "supported in this version yet."
-            )
-        if self.duration == Duration.GTC:
-            raise ValueError(
-                "Good-till-canceled (GTC) orders aren't supported in this "
-                "version yet."
-            )
         if self.order_type == OrderType.MARKET:
             if self.limit_price is not None or self.stop_price is not None:
                 raise ValueError(
                     "A market order can't carry a limit or stop price."
                 )
-        else:  # LIMIT
+        elif self.order_type == OrderType.LIMIT:
             if self.stop_price is not None:
                 raise ValueError("A limit order can't carry a stop price.")
             if (
@@ -184,17 +179,24 @@ class OrderIntentIn(BaseModel):
                 raise ValueError(
                     "A limit order needs a limit price greater than zero."
                 )
+        # STOP / STOP_LIMIT: not shape-validated here; the engine gate refuses
+        # the type with the explicit deferred-feature message.
         return self
 
 
 class OrderIntentOut(BaseModel):
     """A serialized ``order_intent`` — money fields as decimal STRINGS on the wire.
 
-    The order-model fields (Story 8.1) are omit-when-default / null-when-None,
-    mirroring the persisted snapshot: a MARKET intent serializes to just
-    ``{symbol, side, amount}``; a LIMIT intent additively carries ``order_type`` +
-    ``limit_price``. The Coach never proposes a limit, so ``/recommend`` output
-    stays market-only in practice — the schema is kept forward-compatible.
+    The order-model fields (Story 8.1) are **null-when-default on the wire**: a
+    MARKET intent serializes to ``{symbol, side, amount, order_type: null,
+    limit_price: null, stop_price: null, session: null, duration: null}`` and a
+    LIMIT intent carries ``order_type: "limit"`` + ``limit_price`` (the rest
+    null). This differs from the PERSISTED snapshot
+    (:func:`~coach.decision_record._order_intent_json`), which OMITS the default
+    keys entirely — the wire carries explicit nulls, the snapshot carries none.
+    (Additive-null only: the Coach never proposes a limit, so ``/recommend``
+    output is always the MARKET case; existing consumers see extra ``null`` keys,
+    never a changed value.) The schema is kept forward-compatible.
     """
 
     symbol: str
@@ -356,8 +358,8 @@ class ReconcileResponse(BaseModel):
 def _order_intent_out(intent: OrderIntent | None) -> OrderIntentOut | None:
     if intent is None:
         return None
-    # Omit-when-default / null-when-None (Story 8.1), mirroring the persisted
-    # snapshot: a MARKET intent stays ``{symbol, side, amount}`` on the wire.
+    # Null-when-default on the wire (Story 8.1): defaulted fields serialize as
+    # explicit ``null`` (the persisted snapshot OMITS them — see OrderIntentOut).
     return OrderIntentOut(
         symbol=intent.symbol,
         side=intent.side,

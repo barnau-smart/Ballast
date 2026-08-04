@@ -388,6 +388,21 @@ class SchwabAdapter(BrokerPort):
                 # limit spec. Only the builder + quantity differ from the market
                 # path; the post-placement fence below is shared and unchanged.
                 limit_price = order_intent.limit_price
+                # Defense-in-depth (Story 8.1 review): the execution gate
+                # guarantees a finite, positive limit_price on the production
+                # path. Guard here too so a raw TypeError/InvalidOperation from
+                # the sizing division/marketable compare can never leak into the
+                # transport net below and be MISCLASSIFIED as an INDETERMINATE
+                # placement — refuse calmly, before any placement, instead.
+                if (
+                    limit_price is None
+                    or not limit_price.is_finite()
+                    or limit_price <= 0
+                ):
+                    raise OrderNotPlaceableError(
+                        "This limit order has no usable limit price — no order "
+                        "was placed."
+                    )
                 quote = self._read_quote(client, order_intent.symbol)
                 reference = self._usable_price(
                     quote,
@@ -401,8 +416,9 @@ class SchwabAdapter(BrokerPort):
                     )
                 )
                 if quantity < 1:
+                    verb = "buys" if is_buy else "sells"
                     raise OrderNotPlaceableError(
-                        f"${order_intent.amount:.2f} buys less than one whole "
+                        f"${order_intent.amount:.2f} {verb} less than one whole "
                         f"share of {order_intent.symbol} at a ${limit_price:.2f} "
                         "limit — no order was placed."
                     )
