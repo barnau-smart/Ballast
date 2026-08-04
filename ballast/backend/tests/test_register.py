@@ -22,6 +22,12 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from db.connection import get_connection
 
+# Story 8.5: this file's whole purpose is auth-persistence SECURITY — it asserts
+# the stored password is a valid pwdlib/Argon2 hash the real helper verifies. Opt
+# out of the test-only fast hasher (tests/conftest.py) so these run production
+# Argon2; the fast hasher would defeat the very property under test.
+pytestmark = pytest.mark.real_hasher
+
 
 def _unique_email() -> str:
     return f"reg-test-{uuid.uuid4().hex}@example.com"

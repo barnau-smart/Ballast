@@ -28,3 +28,19 @@ test = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Story 8.5: the suite is fast enough (whole default lane runs in ~1 minute, well
+# under the 600s timeout) that NO fast/slow split is needed today — the shared
+# session-scoped app + one-time DDL + test-only fast password hasher (see
+# tests/conftest.py) carry the win. The `slow` marker is registered so that if a
+# genuinely expensive test is ever added, it can be tagged `@pytest.mark.slow`
+# and the lanes split without churn.
+#
+# Commands (run from ballast/backend, DB up: `docker compose up -d db`):
+#   Fast default lane (everything):      uv run pytest -q
+#   Just the (formerly slow) coach API:  uv run pytest tests/test_coach_api.py -q
+#   Full suite incl. any future slow:    uv run pytest -q -m "slow or not slow"
+# No test is currently classified `slow`; the default lane == the full suite.
+markers = [
+    "slow: marks a test as slow (deselect with '-m \"not slow\"'); none today (Story 8.5)",
+    "real_hasher: run this test against production pwdlib/Argon2 (opts OUT of the test-only fast password hasher in tests/conftest.py); for tests that assert real hashing/security properties (e.g. test_register.py)",
+]

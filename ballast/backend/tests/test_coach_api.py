@@ -31,10 +31,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-import pytest_asyncio
 from fastapi.testclient import TestClient
 
-from api.app import create_app
 from api.deps import RECONNECT_MESSAGE, require_live_broker_session
 from brokers.crypto import encrypt_token
 from brokers.factory import get_broker
@@ -63,7 +61,7 @@ from coach.execution import (
 )
 from coach.recommendation import OrderIntent, OrderSide, OrderType
 from db.connection import get_connection
-from db.models import BrokerageToken, DecisionRecord, MarketDaily, PortfolioCache
+from db.models import DecisionRecord
 from db.scope import Scope
 from db.session import async_session_maker, engine
 
@@ -75,82 +73,14 @@ SYM = "VTI"  # index-core, so an approve of it is in v1 scope
 BASE_DAY = date(2015, 1, 1)
 
 
-# --- table + fixture setup ---------------------------------------------------
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def ensure_tables():
-    """Ensure the owned tables exist (matches the create-all lifecycle).
-
-    ``create(checkfirst=True)`` is a no-op on an ALREADY-existing table, so a test
-    DB carried over from before Story 6.1 would lack the new unique index on
-    ``decision_record.idempotency_key`` (a fresh ``create_all`` would build it).
-    Reconcile that explicitly with ``CREATE UNIQUE INDEX IF NOT EXISTS`` so the
-    test DB matches a fresh schema without an Alembic migration.
-    """
-    from sqlalchemy import text
-
-    async with engine.begin() as conn:
-        await conn.run_sync(BrokerageToken.__table__.create, checkfirst=True)
-        await conn.run_sync(PortfolioCache.__table__.create, checkfirst=True)
-        await conn.run_sync(MarketDaily.__table__.create, checkfirst=True)
-        await conn.run_sync(DecisionRecord.__table__.create, checkfirst=True)
-        await conn.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                "uq_decision_record_idempotency_key "
-                "ON decision_record (idempotency_key)"
-            )
-        )
-        # Story 6.3 hoists broker_ref into a queryable column; reconcile a
-        # carried-over test DB the same way (create_all won't ALTER an existing
-        # table). Harmless/no-op once the column exists.
-        await conn.execute(
-            text(
-                "ALTER TABLE decision_record "
-                "ADD COLUMN IF NOT EXISTS broker_ref VARCHAR(64)"
-            )
-        )
-        # Story 6.6 adds the (owner_id, co_signed_at) composite index backing the
-        # paginated history read; reconcile a carried-over DB the same way (a
-        # fresh create_all would build it). Harmless/no-op once it exists.
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS "
-                "ix_decision_record_owner_co_signed_at "
-                "ON decision_record (owner_id, co_signed_at)"
-            )
-        )
-        # Story 6.7 adds the additive durable-reconciliation columns; reconcile a
-        # carried-over DB the same way (create_all won't ALTER an existing table).
-        await conn.execute(
-            text(
-                "ALTER TABLE decision_record "
-                "ADD COLUMN IF NOT EXISTS reconciliation_snapshot JSON"
-            )
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE decision_record "
-                "ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ"
-            )
-        )
-        # Story 7.2 adds the reclaimer's bounded-age key ``cosigning_at``;
-        # reconcile a carried-over DB the same way (create_all won't ALTER an
-        # existing table). Harmless/no-op once the column exists.
-        await conn.execute(
-            text(
-                "ALTER TABLE decision_record "
-                "ADD COLUMN IF NOT EXISTS cosigning_at TIMESTAMPTZ"
-            )
-        )
-    yield
-
-
-@pytest.fixture
-def client() -> TestClient:
-    with TestClient(create_app()) as c:
-        yield c
+# --- fixtures ----------------------------------------------------------------
+#
+# Story 8.5: the session-scoped ``client`` (shared app + TestClient), the
+# one-time ``ensure_tables`` schema reconciliation (every DDL statement
+# preserved verbatim), the test-only fast password hasher, and the per-test
+# ``dependency_overrides`` isolation guard now all live in ``tests/conftest.py``
+# and are consumed by every test in this file unchanged. Per-test isolation is
+# unchanged: tests still use ``_unique_email`` users and clean up their own rows.
 
 
 # --- helpers -----------------------------------------------------------------
