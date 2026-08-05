@@ -42,20 +42,28 @@ from __future__ import annotations
 import hashlib
 import os
 
-# --- 0. force the fully-offline FAKE LLM for the whole suite (DOMINANT fix) ---
+# --- 0. isolate the whole suite from the developer's local ``.env`` ----------
 #
-# THE real bottleneck (root-caused 2026-08-05): the local ``.env`` runs the
-# demo/live config ``LLM_ADAPTER=anthropic`` with a real key, and NOTHING in the
-# suite forced it back to fake (the module docstrings *claim* ``LLM_ADAPTER=fake``
-# but no code set it). So every test that hits ``/recommend`` made a REAL
-# Anthropic API call — ~10 s of network latency each at ~1% CPU — which is what
-# actually made ``test_coach_api.py`` take ~13 min, and made
-# ``test_recommend_surfaces_fr11_warning`` flaky (a real model reply instead of
-# the deterministic fake). ``get_settings()`` is uncached and process env vars
-# take precedence over ``.env``, so setting this BEFORE any ``api`` import (hence
-# before any ``get_settings()`` call) makes every request use the in-process
-# ``FakeLLMGateway``. A test that specifically needs the real gateway can still
-# ``monkeypatch.setenv`` it for its own scope.
+# THE root cause of both the old ~13-min slowness AND four "fake-by-default"
+# factory-test failures (found 2026-08-05): the local ``.env`` runs the demo/live
+# config (``LLM_ADAPTER=anthropic`` + a real key, ``MARKETDATA_ADAPTER=tiingo``),
+# and pydantic-settings reads that file on EVERY ``Settings()`` — even when a test
+# ``monkeypatch.delenv(...)``s a var, ``.env`` puts it right back. So tests hit
+# the real Anthropic API (slow + non-deterministic), and tests asserting the
+# code-default adapter ("returns fake by default", "no key raises") failed because
+# ``.env`` supplied a real value the test couldn't clear.
+#
+# Fix: neutralize the env file for tests, so the suite sees ONLY explicit env vars
+# + the code defaults in ``api/config.Settings`` — which are exactly the intended
+# offline baseline (``*_ADAPTER=fake``, empty keys, and a ``DATABASE_URL`` default
+# identical to the docker URL, so the DB is unaffected). This must run BEFORE
+# anything instantiates ``Settings`` — ``db.session`` builds the engine at import
+# via ``get_settings()`` — so patch ``model_config`` first, before those imports.
+from api.config import Settings as _Settings
+
+_Settings.model_config["env_file"] = None
+# Belt-and-suspenders: also pin fake LLM in the process env, so even a real
+# ``LLM_ADAPTER`` exported in the shell (not just via .env) can't reach a test.
 os.environ["LLM_ADAPTER"] = "fake"
 
 import pytest
