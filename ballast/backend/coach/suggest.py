@@ -29,7 +29,8 @@ phantom order (this engine touches no ``place_order``/``decision_record`` path).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, Decimal
+from datetime import date
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +55,37 @@ from strategy.index_core import is_index_core
 # are named so a later real-data tuning pass is a one-line change.
 SUGGEST_LOOKBACK_DAYS: int = 20
 SUGGEST_DISCOUNT: Decimal = Decimal("0.01")
+
+# --- Story 8.6 honesty/robustness constants (all named for one-line tuning) --
+#
+# ``SUGGEST_MIN_DISCOUNT_FROM_ASK`` — the falling-market FLOOR. In a fresh
+# sell-off the recent-20-day low can be barely below today's ask, so the base
+# ``* (1 - SUGGEST_DISCOUNT)`` formula collapses to only ~1% below the market and
+# the resting buy sits almost marketable. This guarantees the suggestion is NEVER
+# closer than 2% below the live ask. Applied via ``min(base, floor)`` so it ONLY
+# tightens the new-lows case and never weakens the deeper discount in rising/flat
+# markets.
+SUGGEST_MIN_DISCOUNT_FROM_ASK: Decimal = Decimal("0.02")
+
+# --- Data-freshness thresholds (Story 8.6, calendar-day gap, injected as_of) --
+#
+# ``SUGGEST_STALE_AFTER_DAYS`` — beyond this many calendar days between the
+# injected reference date (``as_of``) and the NEWEST stored bar, the suggestion is
+# still returned but carries a calm ``stale_data`` note so the user knows the
+# price is anchored on delayed data. Chosen at 5 days: a normal weekend + a market
+# holiday can legitimately leave the newest daily bar ~4 days old (e.g. asking on
+# a Tuesday after a long weekend), so 5 is the first gap that reliably means "the
+# feed is actually behind", not just a closed market.
+#
+# ``SUGGEST_STALE_REFUSE_AFTER_DAYS`` — beyond this HARD cutoff the data is too
+# old to price against at all, so we refuse calmly (``OrderScopeError`` → 422)
+# rather than anchor a real-money resting order on a stale low. Chosen at 30 days:
+# roughly a full trading month of missing bars is unambiguously a broken/paused
+# feed, well past any holiday gap, and pricing a live order off a month-old low
+# would be dishonest. Between STALE_AFTER (note) and REFUSE_AFTER (refuse) we
+# still help the user but tell the truth about the delay.
+SUGGEST_STALE_AFTER_DAYS: int = 5
+SUGGEST_STALE_REFUSE_AFTER_DAYS: int = 30
 
 #: The tiny narration-only output schema for the LLM (Story 8.4). Deliberately
 #: SEPARATE from ``RECOMMENDATION_OUTPUT_SCHEMA`` — the ``/recommend`` path stays
@@ -96,24 +128,104 @@ class SuggestedOrder:
     amount: Decimal
     shares: int
     reasoning: str
+    # Story 8.6 — backend-computed honesty facts (NEVER computed by the LLM).
+    # ``pct_below_ask`` = (ask - limit_price) / ask, quantized to 4 dp (a fraction,
+    # e.g. Decimal("0.0200") for 2% below); ``fill_note`` is the calm banded
+    # plain-English fill-likelihood copy. ``stale_note`` is a calm delayed-data
+    # signal (``None`` when the newest bar is fresh).
+    pct_below_ask: Decimal
+    fill_note: str
+    stale_note: str | None = None
+
+
+# --- Story 8.6 fill-likelihood bands (deterministic, pure) -------------------
+#
+# The distance below the live ask that separates a resting buy that may fill soon
+# from one that is well below the market. Bands are inclusive on the LOW edge:
+# ``pct_below_ask < NEAR`` = near-market; ``< FAR`` = meaningfully-below; else
+# far-below. Named so a real-data tuning pass is a one-line change.
+FILL_NEAR_MARKET_MAX: Decimal = Decimal("0.02")
+FILL_MEANINGFUL_MAX: Decimal = Decimal("0.05")
+
+
+def fill_likelihood(pct_below_ask: Decimal) -> tuple[str, str]:
+    """Return a deterministic ``(band, fill_note)`` for a distance below the ask.
+
+    PURE: a function of ``pct_below_ask`` alone (no network, no LLM, no wall-clock)
+    so the same distance always yields the same band + calm copy. ``pct_below_ask``
+    is the fraction ``(ask - limit_price) / ask`` (e.g. ``Decimal("0.02")`` for 2%
+    below). The copy is in the calm, honest coach voice — it NEVER promises a fill
+    and always reminds the user they can cancel.
+
+    - ``< 2%`` below → ``"near-market"``: this rests just below today's price, so it
+      may fill soon — but it isn't guaranteed, and you can cancel anytime.
+    - ``< 5%`` below → ``"meaningfully-below"``: this rests meaningfully below
+      today's price; it may take a while to fill, or may not — you can cancel
+      anytime.
+    - ``>= 5%`` below → ``"far-below"``: this is well below today's price, so it may
+      take a long while to fill, or may never fill — you can cancel anytime.
+    """
+    if pct_below_ask < FILL_NEAR_MARKET_MAX:
+        return (
+            "near-market",
+            "This rests just below today's price, so it may fill soon — though a "
+            "fill is never guaranteed. You can cancel anytime.",
+        )
+    if pct_below_ask < FILL_MEANINGFUL_MAX:
+        return (
+            "meaningfully-below",
+            "This rests meaningfully below today's price, so it may take a while to "
+            "fill — or may not fill at all. You can cancel anytime.",
+        )
+    return (
+        "far-below",
+        "This is well below today's price, so it may take a long while to fill, or "
+        "may never fill. That's fine — you can cancel anytime.",
+    )
 
 
 def compute_suggested_price(recent_low: Decimal, ask: Decimal) -> Decimal:
-    """Return the deterministic resting-limit price (LOCKED formula, Story 8.4).
+    """Return the deterministic resting-limit price (LOCKED formula + 8.6 floor).
 
-    ``limit_price = quantize_2dp_down( min(recent_low, ask) * (1 - SUGGEST_DISCOUNT) )``.
-    Because the discount applies to ``min(recent_low, ask)``, the result is ALWAYS
-    strictly below the live ask — a genuine resting buy that never fills
-    immediately. Quantized with ``ROUND_DOWN`` to 2 dp (a lower buy price only ever
-    favors the user). Pure and unit-pinnable: no network, no LLM, no wall-clock.
+    Base (Story 8.4): ``quantize_2dp_down( min(recent_low, ask) * (1 - SUGGEST_DISCOUNT) )``.
+    Because the discount applies to ``min(recent_low, ask)``, the base is ALWAYS
+    strictly below the live ask.
+
+    Story 8.6 FLOOR: in a fresh sell-off the recent low can be barely below the ask
+    and the base collapses to only ~1% below the market. So the final price is
+    ``min(base, quantize_2dp_down(ask * (1 - SUGGEST_MIN_DISCOUNT_FROM_ASK)))`` —
+    the ``min`` means the floor ONLY tightens the new-lows case (it can only lower
+    the price) and never weakens the deeper discount in rising/flat markets.
+    Quantized with ``ROUND_DOWN`` (a lower buy price only ever favors the user).
+    Pure and unit-pinnable: no network, no LLM, no wall-clock.
     """
     anchor = min(recent_low, ask)
     raw = anchor * (Decimal("1") - SUGGEST_DISCOUNT)
-    return raw.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    base = raw.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    floor = (ask * (Decimal("1") - SUGGEST_MIN_DISCOUNT_FROM_ASK)).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+    return min(base, floor)
 
 
-async def _recent_low(session: AsyncSession, symbol: str) -> Decimal | None:
-    """Return the min ``low`` over the most recent ``SUGGEST_LOOKBACK_DAYS`` bars.
+def _pct_below_ask(limit_price: Decimal, ask: Decimal) -> Decimal:
+    """Return the deterministic fraction ``(ask - limit_price) / ask`` (4 dp).
+
+    Pure. Quantized to 4 dp (``ROUND_HALF_UP``) so it is a stable, reproducible
+    fraction (e.g. ``Decimal("0.0200")`` for 2% below). Guards a non-positive ask
+    (never surfaced by the LOCKED price path, but defense-in-depth) by returning 0.
+    """
+    if not ask.is_finite() or ask <= 0:
+        return Decimal("0.0000")
+    return ((ask - limit_price) / ask).quantize(
+        Decimal("0.0001"), rounding=ROUND_HALF_UP
+    )
+
+
+async def _recent_low_and_asof(
+    session: AsyncSession, symbol: str
+) -> tuple[Decimal, date] | None:
+    """Return ``(min_low, newest_day)`` over the most recent lookback bars.
 
     Reads the GLOBAL ``market_daily`` table directly (no ``owner_id``, no
     ``ScopedRepository`` — it is global reference data, per the model's contract),
@@ -121,36 +233,57 @@ async def _recent_low(session: AsyncSession, symbol: str) -> Decimal | None:
     ``low`` (a bad ingestion row must not drag the min to a degenerate price and
     nuke an otherwise-valid symbol). Returns ``None`` when the symbol has NO usable
     bars (the caller maps that to a calm "not enough recent price history" refusal).
-    ``low`` is ``Decimal`` (Numeric column), never binary float.
+
+    Story 8.6: also surfaces the newest USABLE bar's ``day`` so the caller can
+    gate on data freshness against an injected ``as_of``. Freshness is derived
+    from the same bars that price the order — a filtered bad-low row must not set
+    the freshness clock either (it wouldn't contribute to ``min_low``, so it must
+    not masquerade as the freshest bar). ``low`` is ``Decimal`` (Numeric column),
+    never binary float.
     """
     result = await session.execute(
-        select(MarketDaily.low)
+        select(MarketDaily.low, MarketDaily.day)
         .where(MarketDaily.symbol == symbol)
         .order_by(MarketDaily.day.desc())
         .limit(SUGGEST_LOOKBACK_DAYS)
     )
-    lows = [
-        row[0]
-        for row in result.all()
+    rows = result.all()
+    kept = [
+        (row[0], row[1])
+        for row in rows
         if row[0] is not None and row[0].is_finite() and row[0] > 0
     ]
-    if not lows:
+    if not kept:
         return None
-    return min(lows)
+    # Newest USABLE bar drives freshness (max day among kept rows — independent of
+    # SQL row-emission order); min usable low drives the price.
+    newest_day = max(day for _low, day in kept)
+    return (min(low for low, _day in kept), newest_day)
 
 
-def _fallback_reasoning(*, symbol: str, limit_price: Decimal, ask: Decimal) -> str:
+def _fallback_reasoning(
+    *,
+    symbol: str,
+    limit_price: Decimal,
+    ask: Decimal,
+    fill_note: str = "",
+) -> str:
     """A deterministic, calm templated reasoning string (gateway-outage fallback).
 
     Mirrors ``build_default_plan`` resilience: if the LLM narration fails for ANY
     reason, the suggestion is NEVER blocked — this plain sentence stands in. It
-    states the already-computed facts honestly (numbers unchanged).
+    states the already-computed facts honestly (numbers unchanged). Story 8.6:
+    appends the deterministic fill-likelihood sentence so the templated fallback
+    carries the same honesty as the LLM narration.
     """
-    return (
+    base = (
         f"This rests a buy for {symbol} at ${limit_price:.2f} — a touch below its "
         f"recent low and below today's ask of ${ask:.2f}. It waits patiently at "
         "that price until it's reached, or until you cancel it. No rush, no chase."
     )
+    if fill_note:
+        return f"{base} {fill_note}"
+    return base
 
 
 def narrate_suggestion(
@@ -172,6 +305,18 @@ def narrate_suggestion(
     symbol = str(facts.get("symbol", ""))
     limit_price = facts.get("limit_price", Decimal("0"))
     ask = facts.get("ask", Decimal("0"))
+    fill_note = str(facts.get("fill_note", ""))
+    stale_note = facts.get("stale_note")
+    # Backend-owned display math lives OUTSIDE the try: it is pure and must never be
+    # mistaken for a gateway/LLM failure (an arithmetic bug should fail loudly, not
+    # silently degrade to the fallback). Percent for the model to weave in as a FACT
+    # (already computed by the backend — the model never derives it); ROUND_HALF_UP
+    # to stay consistent with the serialized ``pct_below_ask``.
+    pct = facts.get("pct_below_ask", Decimal("0"))
+    pct_display = (pct * Decimal("100")).quantize(
+        Decimal("0.1"), rounding=ROUND_HALF_UP
+    )
+    stale_line = f"\n- data freshness: {stale_note}" if stale_note else ""
     try:
         user_content = (
             "The order below is ALREADY computed and final — narrate it, do not "
@@ -181,8 +326,11 @@ def narrate_suggestion(
             f"- limit price: ${facts['limit_price']:.2f}\n"
             f"- recent 20-day low: ${facts['recent_low']:.2f}\n"
             f"- today's ask: ${facts['ask']:.2f}\n"
+            f"- distance below ask: {pct_display}%\n"
+            f"- fill likelihood (say this honestly): {fill_note}\n"
             f"- shares: {facts['shares']}\n"
             f"- total cost: ${facts['amount']:.2f}"
+            f"{stale_line}"
         )
         request = LLMRequest(
             messages=(LLMMessage(role="user", content=user_content),),
@@ -196,8 +344,11 @@ def narrate_suggestion(
         return reasoning
     except Exception:
         # Silent, resilient fallback (mirrors build_default_plan) — the number is
-        # unchanged; only the prose degrades to a deterministic template.
-        return _fallback_reasoning(symbol=symbol, limit_price=limit_price, ask=ask)
+        # unchanged; only the prose degrades to a deterministic template (which
+        # still carries the deterministic fill-likelihood sentence, Story 8.6).
+        return _fallback_reasoning(
+            symbol=symbol, limit_price=limit_price, ask=ask, fill_note=fill_note
+        )
 
 
 async def suggest_resting_order(
@@ -209,6 +360,7 @@ async def suggest_resting_order(
     gateway: LLMGateway,
     symbol: str,
     target_amount: Decimal | None,
+    as_of: date,
 ) -> SuggestedOrder:
     """Compute a deterministic resting BUY LIMIT (GTC) suggestion + narrate it.
 
@@ -239,11 +391,36 @@ async def suggest_resting_order(
             "orders in broad index funds and ETFs."
         )
 
-    recent_low = await _recent_low(session, normalized_symbol)
-    if recent_low is None:
+    low_and_asof = await _recent_low_and_asof(session, normalized_symbol)
+    if low_and_asof is None:
         raise OrderScopeError(
             "There isn't enough recent price history to suggest a resting order "
             f"for {normalized_symbol} yet."
+        )
+    recent_low, newest_day = low_and_asof
+
+    # Data-freshness gate (Story 8.6): compare the injected reference date against
+    # the newest stored bar. Beyond the HARD cutoff we refuse calmly rather than
+    # anchor a live order on stale data; between the note and refuse thresholds we
+    # still suggest but attach a calm delayed-data note. ``as_of`` is injected (the
+    # endpoint passes ``date.today()``, tests a fixed date) so the pricing path
+    # never reads the wall clock and stays deterministic.
+    # Never let the gap go negative: a bar dated after ``as_of`` (a benign
+    # timezone/clock skew, or a corrupt future-dated row) is not "stale" and must
+    # not read as negative — clamp to 0 so the thresholds below behave sanely.
+    staleness_days = max((as_of - newest_day).days, 0)
+    stale_note: str | None = None
+    if staleness_days > SUGGEST_STALE_REFUSE_AFTER_DAYS:
+        raise OrderScopeError(
+            f"The most recent price data for {normalized_symbol} is "
+            f"{staleness_days} days old — too stale to suggest a resting order "
+            "against right now. Nothing was suggested."
+        )
+    if staleness_days > SUGGEST_STALE_AFTER_DAYS:
+        stale_note = (
+            f"Heads up: the newest price data for {normalized_symbol} is "
+            f"{staleness_days} days old, so this suggestion is based on delayed "
+            "data. Double-check today's price before you approve."
         )
 
     # Live ask (a calm OrderNotPlaceableError on an unusable quote — the endpoint
@@ -282,6 +459,15 @@ async def suggest_resting_order(
         Decimal("0.01"), rounding=ROUND_DOWN
     )
 
+    # Story 8.6 — deterministic fill-likelihood, computed by the backend and fed to
+    # the LLM as a FACT (the model never derives it). Same bars+ask ⇒ same numbers.
+    # ``pct_below_ask`` is the 4dp-quantized value for the wire; the BAND is chosen
+    # from the exact unrounded fraction so display rounding can never nudge a value
+    # across a band edge (ask is guaranteed positive here — checked above).
+    pct_below_ask = _pct_below_ask(limit_price, ask)
+    exact_pct_below_ask = (ask - limit_price) / ask
+    _band, fill_note = fill_likelihood(exact_pct_below_ask)
+
     reasoning = narrate_suggestion(
         gateway,
         {
@@ -291,6 +477,9 @@ async def suggest_resting_order(
             "ask": ask,
             "shares": shares,
             "amount": amount,
+            "pct_below_ask": pct_below_ask,
+            "fill_note": fill_note,
+            "stale_note": stale_note,
         },
     )
 
@@ -303,4 +492,7 @@ async def suggest_resting_order(
         amount=amount,
         shares=shares,
         reasoning=reasoning,
+        pct_below_ask=pct_below_ask,
+        fill_note=fill_note,
+        stale_note=stale_note,
     )

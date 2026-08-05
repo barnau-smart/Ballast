@@ -92,6 +92,12 @@ export function CoachConsult() {
   const [suggest, setSuggest] = useState('idle')
   const [suggestMessage, setSuggestMessage] = useState('')
   const [suggestReasoning, setSuggestReasoning] = useState('')
+  // Story 8.6 — backend-computed honesty lines shown beside the reasoning: the
+  // banded fill-likelihood note (always present on a suggestion) and an optional
+  // calm delayed-data note. Both are threaded through `pendingSuggestion` so they
+  // survive the ask round-trip exactly like `reasoning`.
+  const [suggestFillNote, setSuggestFillNote] = useState('')
+  const [suggestStaleNote, setSuggestStaleNote] = useState('')
   // Story 8.4 — a computed AI suggestion held OUTSIDE `options` so it survives
   // the ask reset (`resetResult` blanks `options` back to MARKET). Re-seeded into
   // the co-sign `options` by `onAsk` so the resting LIMIT reaches /approve (AC-4).
@@ -132,6 +138,8 @@ export function CoachConsult() {
     setSuggest('idle')
     setSuggestMessage('')
     setSuggestReasoning('')
+    setSuggestFillNote('')
+    setSuggestStaleNote('')
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -204,6 +212,10 @@ export function CoachConsult() {
             duration: pending.duration,
           })
           setSuggestReasoning(pending.reasoning)
+          // Story 8.6 — re-seed the honesty notes so they survive the ask reset
+          // exactly like the reasoning.
+          setSuggestFillNote(pending.fill_note ?? '')
+          setSuggestStaleNote(pending.stale_note ?? '')
           setSuggest('suggested')
           setPendingSuggestion(null)
         }
@@ -303,6 +315,8 @@ export function CoachConsult() {
     setSuggest('suggesting')
     setSuggestMessage('')
     setSuggestReasoning('')
+    setSuggestFillNote('')
+    setSuggestStaleNote('')
     setPendingSuggestion(null) // a fresh suggest supersedes any prior one
     // A shown recommendation no longer matches once we repopulate the form.
     if (recommendation !== null) {
@@ -358,8 +372,13 @@ export function CoachConsult() {
           limit_price: data.limit_price,
           duration: 'gtc',
           reasoning: data.reasoning ?? '',
+          // Story 8.6 — carry the honesty notes so they survive the ask reset.
+          fill_note: data.fill_note ?? '',
+          stale_note: data.stale_note ?? '',
         })
         setSuggestReasoning(data.reasoning ?? '')
+        setSuggestFillNote(data.fill_note ?? '')
+        setSuggestStaleNote(data.stale_note ?? '')
         setSuggest('suggested')
         return
       }
@@ -521,6 +540,25 @@ export function CoachConsult() {
           role="status"
         >
           {suggestReasoning}
+          {/* Story 8.6 — the backend-computed honesty lines: the banded
+              fill-likelihood note (always present) and an optional calm
+              delayed-data note, shown as calm lines beside the reasoning. */}
+          {suggestFillNote ? (
+            <p
+              className="ballast-consult__suggest-fill-note"
+              data-testid="coach-suggest-fill-note"
+            >
+              {suggestFillNote}
+            </p>
+          ) : null}
+          {suggestStaleNote ? (
+            <p
+              className="ballast-consult__suggest-stale-note"
+              data-testid="coach-suggest-stale-note"
+            >
+              {suggestStaleNote}
+            </p>
+          ) : null}
         </div>
       ) : null}
 

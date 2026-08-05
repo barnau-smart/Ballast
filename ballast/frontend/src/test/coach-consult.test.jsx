@@ -809,6 +809,11 @@ describe('CoachConsult — live propose → approve/decline', () => {
     shares: 11,
     reasoning:
       'This rests a buy for VTI at $89.10 — a touch below its recent low. No rush.',
+    // Story 8.6 — backend-computed honesty facts.
+    pct_below_ask: '0.1090',
+    fill_note:
+      'This is well below today’s price, so it may take a long while to fill, or may never fill. You can cancel anytime.',
+    stale_note: null,
   }
 
   it('suggest-order 200 → populates side/amount/LIMIT/limit_price/GTC + shows reasoning, submits nothing', async () => {
@@ -845,6 +850,81 @@ describe('CoachConsult — live propose → approve/decline', () => {
     )
     const reqBody = JSON.parse(suggestCall[1].body)
     expect(reqBody.symbol).toBe('VTI')
+  })
+
+  it('suggest-order 200 → shows the fill-likelihood note beside the reasoning (Story 8.6)', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      suggest: { body: SUGGESTION },
+    })
+    renderConsult()
+
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-fill-note')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-suggest-fill-note')).toHaveTextContent(
+      /may never fill|cancel anytime/i,
+    )
+    // No stale note when the backend sent null.
+    expect(
+      screen.queryByTestId('coach-suggest-stale-note'),
+    ).not.toBeInTheDocument()
+  })
+
+  it('suggest-order 200 with stale_note → shows the calm delayed-data line (Story 8.6)', async () => {
+    stubFetch({
+      recommend: { body: REC_NO_INTENT },
+      suggest: {
+        body: {
+          ...SUGGESTION,
+          stale_note:
+            'Heads up: the newest price data for VTI is 7 days old, so this suggestion is based on delayed data.',
+        },
+      },
+    })
+    renderConsult()
+
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-stale-note')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('coach-suggest-stale-note')).toHaveTextContent(
+      /delayed data|days old/i,
+    )
+  })
+
+  it('suggest → ask: the fill note survives the ask round-trip into the co-sign step (Story 8.6)', async () => {
+    const REC_VTI = {
+      ...REC_WITH_INTENT,
+      decision_id: 'dec-vti-2',
+      order_intent: { symbol: 'VTI', side: 'buy', amount: '450.00' },
+    }
+    stubFetch({
+      recommend: { body: REC_VTI },
+      approve: { body: OUTCOME },
+      suggest: { body: SUGGESTION },
+    })
+    renderConsult()
+
+    setOrder({ symbol: 'VTI' })
+    fireEvent.click(screen.getByTestId('coach-suggest-order'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-suggest-fill-note')).toBeInTheDocument(),
+    )
+
+    submitAsk()
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-approve')).toBeInTheDocument(),
+    )
+    // The fill note is re-seeded (mirrors `reasoning`) so it survives the reset.
+    expect(screen.getByTestId('coach-suggest-fill-note')).toHaveTextContent(
+      /may never fill|cancel anytime/i,
+    )
   })
 
   it('suggest → ask → approve: the AI resting LIMIT + GTC survive the ask reset into the co-signed order (AC-4)', async () => {

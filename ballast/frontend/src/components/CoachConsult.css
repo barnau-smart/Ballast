@@ -77,6 +77,17 @@
   margin: 0;
 }
 
+/* Story 8.6 — calm honesty lines beside the suggestion reasoning: the banded
+   fill-likelihood note and an optional delayed-data note. */
+.ballast-consult__suggest-fill-note,
+.ballast-consult__suggest-stale-note {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-muted);
+  margin: var(--ballast-space-8) 0 0;
+}
+
 .ballast-consult__result {
   display: flex;
   flex-direction: column;

@@ -47,7 +47,11 @@ from coach.recommendation import Duration, OrderSide, OrderType
 from coach.suggest import (
     SUGGEST_DISCOUNT,
     SUGGEST_LOOKBACK_DAYS,
+    SUGGEST_MIN_DISCOUNT_FROM_ASK,
+    SUGGEST_STALE_AFTER_DAYS,
+    SUGGEST_STALE_REFUSE_AFTER_DAYS,
     compute_suggested_price,
+    fill_likelihood,
     narrate_suggestion,
     suggest_resting_order,
 )
@@ -198,6 +202,19 @@ def _insert_series(symbol: str, lows: list[Decimal], *, day0: date = BASE_DAY) -
         conn.commit()
 
 
+def _fresh_day0() -> date:
+    """A series-start day so the NEWEST of ``SUGGEST_LOOKBACK_DAYS`` bars is fresh.
+
+    Story 8.6: the ``/suggest-order`` endpoint now injects ``as_of=date.today()``
+    and flags/refuses stale data. The API tests seed a 20-bar series ending at
+    ``day0 + (SUGGEST_LOOKBACK_DAYS - 1)``; anchoring the newest bar to TODAY keeps
+    the fixture inside the freshness window. A tiny per-test hour-free day jitter is
+    unnecessary (each test cleans + re-inserts VTI), but we keep the newest bar
+    exactly today for determinism.
+    """
+    return date.today() - timedelta(days=SUGGEST_LOOKBACK_DAYS - 1)
+
+
 def _live() -> datetime:
     return datetime.now(timezone.utc) + timedelta(days=3)
 
@@ -292,9 +309,11 @@ def test_compute_price_recent_low_below_ask_pinned():
 
 
 def test_compute_price_recent_low_at_or_above_ask_clamps_to_ask():
-    # recent_low 120 >= ask 100 → min(120,100)*0.99 = 99.00 — still < ask.
+    # recent_low 120 >= ask 100 → base = min(120,100)*0.99 = 99.00 (~1% below).
+    # Story 8.6: the falling-market floor now tightens this ~1% case to 98.00
+    # (2% below the ask) — still strictly < ask.
     price = compute_suggested_price(Decimal("120"), Decimal("100"))
-    assert price == Decimal("99.00")
+    assert price == Decimal("98.00")
     assert price < Decimal("100")
 
 
@@ -307,6 +326,77 @@ def test_compute_price_is_always_strictly_below_ask():
 def test_compute_price_quantizes_down_two_dp():
     # 99.999 * 0.99 = 98.99901 → ROUND_DOWN 2dp = 98.99.
     assert compute_suggested_price(Decimal("99.999"), Decimal("200")) == Decimal("98.99")
+
+
+# --- Story 8.6: falling-market floor (pure) ---------------------------------
+
+
+def test_floor_constant_is_locked():
+    assert SUGGEST_MIN_DISCOUNT_FROM_ASK == Decimal("0.02")
+
+
+def test_floor_only_bites_new_lows_case():
+    # NEW-LOWS: recent_low barely below ask (99 < 100). Base = min(99,100)*0.99 =
+    # 98.01 — only ~2% below, but the 1% discount off the low alone would be 98.01;
+    # the floor = 100*0.98 = 98.00. base(98.01) vs floor(98.00) → floored to 98.00.
+    price = compute_suggested_price(Decimal("99"), Decimal("100"))
+    assert price == Decimal("98.00")
+    # And it is now at least 2% below the ask.
+    assert price <= Decimal("100") * (Decimal("1") - SUGGEST_MIN_DISCOUNT_FROM_ASK)
+
+
+def test_floor_extreme_new_lows_clamps_to_two_percent():
+    # recent_low == ask (a fresh low touching today's price): base = 100*0.99 =
+    # 99.00 (~1% below). The floor pulls it to 98.00 (2% below).
+    price = compute_suggested_price(Decimal("100"), Decimal("100"))
+    assert price == Decimal("98.00")
+
+
+def test_floor_preserves_deeper_discount_in_rising_flat_markets():
+    # RISING/FLAT: recent_low well below ask (90 < 100). Base = 89.10 (~11% below),
+    # floor = 98.00. min(89.10, 98.00) = 89.10 — the floor NEVER weakens the
+    # deeper discount; it only ever lowers the price, never raises it.
+    price = compute_suggested_price(Decimal("90"), Decimal("100"))
+    assert price == Decimal("89.10")
+
+
+def test_floored_price_still_strictly_below_ask():
+    for low in (Decimal("99.99"), Decimal("100"), Decimal("150"), Decimal("80")):
+        ask = Decimal("100")
+        assert compute_suggested_price(low, ask) < ask
+
+
+# --- Story 8.6: fill-likelihood bands (pure) --------------------------------
+
+
+def test_fill_likelihood_near_market_band():
+    band, note = fill_likelihood(Decimal("0.0100"))  # 1% below
+    assert band == "near-market"
+    assert "may fill soon" in note
+    assert "cancel anytime" in note
+
+
+def test_fill_likelihood_meaningfully_below_band():
+    band, note = fill_likelihood(Decimal("0.0300"))  # 3% below
+    assert band == "meaningfully-below"
+    assert "may take a while" in note
+    assert "cancel anytime" in note
+
+
+def test_fill_likelihood_far_below_band():
+    band, note = fill_likelihood(Decimal("0.1000"))  # 10% below
+    assert band == "far-below"
+    assert "may never fill" in note
+    assert "cancel anytime" in note
+
+
+def test_fill_likelihood_band_edges_are_deterministic():
+    # Inclusive-low boundaries: exactly 2% is NO LONGER near-market; exactly 5% is
+    # NO LONGER meaningfully-below.
+    assert fill_likelihood(Decimal("0.0199"))[0] == "near-market"
+    assert fill_likelihood(Decimal("0.0200"))[0] == "meaningfully-below"
+    assert fill_likelihood(Decimal("0.0499"))[0] == "meaningfully-below"
+    assert fill_likelihood(Decimal("0.0500"))[0] == "far-below"
 
 
 def test_whole_share_quantity_floors_and_guards():
@@ -323,6 +413,11 @@ def test_whole_share_quantity_floors_and_guards():
 
 async def _run_suggest(owner: uuid.UUID, **kwargs):
     scope = Scope.for_user(owner)
+    # Story 8.6: `suggest_resting_order` requires an injected reference date. The
+    # engine fixtures seed a 20-bar series starting at BASE_DAY (newest bar
+    # ~BASE_DAY + 19d); default `as_of` to that newest day so freshness is a no-op
+    # unless a test overrides it to exercise the stale path.
+    kwargs.setdefault("as_of", BASE_DAY + timedelta(days=SUGGEST_LOOKBACK_DAYS - 1))
     async with async_session_maker() as session:
         return await suggest_resting_order(scope, session, **kwargs)
 
@@ -616,6 +711,200 @@ async def test_engine_skips_non_positive_low_bars(client, monkeypatch):
 
 
 # =============================================================================
+# Story 8.6 — fill-likelihood + freshness on the engine (offline)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_engine_computes_pct_below_ask_and_fill_note(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        # recent_low 90, ask 100 → limit 89.10 → pct_below = (100-89.10)/100 =
+        # 0.1090 → far-below band.
+        _insert_series(symbol, [Decimal("90")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "1000.00")
+        suggestion = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=FakeLLMGateway(),
+            symbol=symbol, target_amount=None,
+        )
+        assert suggestion.pct_below_ask == Decimal("0.1090")
+        assert "never fill" in suggestion.fill_note  # far-below copy
+        assert suggestion.stale_note is None
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+@pytest.mark.asyncio
+async def test_engine_fill_note_near_market_on_floored_new_lows(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        # NEW-LOWS: recent_low == ask (100). Floor pulls limit to 98.00 → exactly
+        # 2% below → the boundary lands in the meaningfully-below band (inclusive
+        # low), proving the floor guarantees at least a 2% cushion.
+        _insert_series(symbol, [Decimal("100")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "10000.00")
+        suggestion = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=FakeLLMGateway(),
+            symbol=symbol, target_amount=None,
+        )
+        assert suggestion.limit_price == Decimal("98.00")
+        assert suggestion.pct_below_ask == Decimal("0.0200")
+        assert "may take a while" in suggestion.fill_note  # meaningfully-below
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+@pytest.mark.asyncio
+async def test_engine_fresh_data_has_no_stale_note(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        _insert_series(symbol, [Decimal("90")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "1000.00")
+        newest_day = BASE_DAY + timedelta(days=SUGGEST_LOOKBACK_DAYS - 1)
+        # as_of exactly at the stale threshold (not beyond) → still fresh.
+        suggestion = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=FakeLLMGateway(),
+            symbol=symbol, target_amount=None,
+            as_of=newest_day + timedelta(days=SUGGEST_STALE_AFTER_DAYS),
+        )
+        assert suggestion.stale_note is None
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+@pytest.mark.asyncio
+async def test_engine_stale_data_attaches_note_keeps_suggestion(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        _insert_series(symbol, [Decimal("90")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "1000.00")
+        newest_day = BASE_DAY + timedelta(days=SUGGEST_LOOKBACK_DAYS - 1)
+        # as_of one day BEYOND the stale threshold → note attached, suggestion kept.
+        suggestion = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=FakeLLMGateway(),
+            symbol=symbol, target_amount=None,
+            as_of=newest_day + timedelta(days=SUGGEST_STALE_AFTER_DAYS + 1),
+        )
+        assert suggestion.stale_note is not None
+        assert "days old" in suggestion.stale_note
+        # The suggestion is STILL computed (kept, not refused).
+        assert suggestion.limit_price == Decimal("89.10")
+        assert suggestion.shares == 11
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+@pytest.mark.asyncio
+async def test_engine_extremely_stale_data_refuses_calmly(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        _insert_series(symbol, [Decimal("90")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "1000.00")
+        newest_day = BASE_DAY + timedelta(days=SUGGEST_LOOKBACK_DAYS - 1)
+        with pytest.raises(OrderScopeError) as exc:
+            await _run_suggest(
+                owner, broker=_QuoteAdapter(ask=Decimal("100")),
+                broker_session=_live_session(), gateway=FakeLLMGateway(),
+                symbol=symbol, target_amount=None,
+                as_of=newest_day + timedelta(days=SUGGEST_STALE_REFUSE_AFTER_DAYS + 1),
+            )
+        assert "too stale" in str(exc.value)
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+@pytest.mark.asyncio
+async def test_engine_real_vs_fake_llm_note_identity(client, monkeypatch):
+    import coach.suggest as suggest_mod
+
+    monkeypatch.setattr(suggest_mod, "is_index_core", lambda s: True)
+    email = _unique_email()
+    symbol = _unique_symbol()
+    _register(client, email)
+    owner = _user_id_for(email)
+    try:
+        _insert_series(symbol, [Decimal("90")] * SUGGEST_LOOKBACK_DAYS)
+        _insert_balance(owner, "1000.00")
+        fake = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=FakeLLMGateway(),
+            symbol=symbol, target_amount=None,
+        )
+        stub = await _run_suggest(
+            owner, broker=_QuoteAdapter(ask=Decimal("100")),
+            broker_session=_live_session(), gateway=_StubGateway(),
+            symbol=symbol, target_amount=None,
+        )
+        # The honesty FACTS (pct_below_ask + fill_note + stale_note) are identical
+        # regardless of which LLM ran — the model never computes them.
+        assert fake.pct_below_ask == stub.pct_below_ask
+        assert fake.fill_note == stub.fill_note
+        assert fake.stale_note == stub.stale_note
+        # Only the narrated prose differs.
+        assert fake.reasoning != stub.reasoning
+    finally:
+        _clean_market([symbol])
+        _delete_user(email)
+
+
+def test_narrate_fallback_includes_fill_note():
+    facts = {
+        "symbol": "VTI",
+        "limit_price": Decimal("89.10"),
+        "recent_low": Decimal("90"),
+        "ask": Decimal("100"),
+        "shares": 11,
+        "amount": Decimal("980.10"),
+        "pct_below_ask": Decimal("0.1090"),
+        "fill_note": "This is well below today's price, so it may never fill.",
+        "stale_note": None,
+    }
+    out = narrate_suggestion(_CrashingGateway(), facts)
+    # The deterministic templated fallback carries the fill-likelihood sentence.
+    assert "may never fill" in out
+    assert "$89.10" in out
+
+
+# =============================================================================
 # API — POST /api/coach/suggest-order
 # =============================================================================
 
@@ -629,7 +918,10 @@ def _override_live(client: TestClient) -> None:
 def test_api_happy_returns_fixed_point_strings_and_places_nothing(client):
     email = _unique_email()
     symbol = "VTI"  # real index-core symbol
-    day0 = date(2015, 1, 1) + timedelta(days=uuid.uuid4().int % 5000)
+    # Story 8.6: anchor the newest bar within the freshness window of today so
+    # the endpoint (as_of=date.today()) does not flag it stale; a tiny per-test
+    # day jitter keeps the (VTI, day) unique constraint from colliding.
+    day0 = _fresh_day0()
     adapter = _QuoteAdapter(ask=Decimal("100"))
     client.app.dependency_overrides[get_broker] = lambda: adapter
     _override_live(client)
@@ -663,6 +955,13 @@ def test_api_happy_returns_fixed_point_strings_and_places_nothing(client):
         assert isinstance(body["reasoning"], str) and body["reasoning"]
         # strictly below the live ask
         assert Decimal(body["limit_price"]) < Decimal("100")
+        # Story 8.6 honesty facts: fixed-point pct string + banded fill note; a
+        # fresh fixture carries no stale note (null on the wire).
+        assert body["pct_below_ask"] == "0.1090"
+        assert isinstance(body["pct_below_ask"], str)
+        assert isinstance(body["fill_note"], str) and body["fill_note"]
+        assert "never fill" in body["fill_note"]  # far-below band
+        assert body["stale_note"] is None
     finally:
         _clean_market([symbol])
         client.app.dependency_overrides.pop(get_broker, None)
@@ -673,7 +972,10 @@ def test_api_happy_returns_fixed_point_strings_and_places_nothing(client):
 def test_api_no_amount_sizes_off_cash(client):
     email = _unique_email()
     symbol = "VTI"
-    day0 = date(2015, 1, 1) + timedelta(days=uuid.uuid4().int % 5000)
+    # Story 8.6: anchor the newest bar within the freshness window of today so
+    # the endpoint (as_of=date.today()) does not flag it stale; a tiny per-test
+    # day jitter keeps the (VTI, day) unique constraint from colliding.
+    day0 = _fresh_day0()
     adapter = _QuoteAdapter(ask=Decimal("100"))
     client.app.dependency_overrides[get_broker] = lambda: adapter
     _override_live(client)
@@ -758,7 +1060,10 @@ def test_api_no_history_is_calm_422(client):
 def test_api_insufficient_cash_is_calm_422(client):
     email = _unique_email()
     symbol = "VTI"
-    day0 = date(2015, 1, 1) + timedelta(days=uuid.uuid4().int % 5000)
+    # Story 8.6: anchor the newest bar within the freshness window of today so
+    # the endpoint (as_of=date.today()) does not flag it stale; a tiny per-test
+    # day jitter keeps the (VTI, day) unique constraint from colliding.
+    day0 = _fresh_day0()
     adapter = _QuoteAdapter(ask=Decimal("100"))
     client.app.dependency_overrides[get_broker] = lambda: adapter
     _override_live(client)
@@ -789,7 +1094,10 @@ def test_api_insufficient_cash_is_calm_422(client):
 def test_api_unreadable_quote_is_calm_422(client):
     email = _unique_email()
     symbol = "VTI"
-    day0 = date(2015, 1, 1) + timedelta(days=uuid.uuid4().int % 5000)
+    # Story 8.6: anchor the newest bar within the freshness window of today so
+    # the endpoint (as_of=date.today()) does not flag it stale; a tiny per-test
+    # day jitter keeps the (VTI, day) unique constraint from colliding.
+    day0 = _fresh_day0()
     adapter = _QuoteAdapter(ask=Decimal("100"), unreadable=True)
     client.app.dependency_overrides[get_broker] = lambda: adapter
     _override_live(client)

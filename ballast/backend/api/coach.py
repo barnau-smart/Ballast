@@ -47,6 +47,7 @@ UI (Story 4.10).
 from __future__ import annotations
 
 import logging
+from datetime import date
 from decimal import Decimal
 
 from uuid import UUID
@@ -419,6 +420,14 @@ class SuggestOrderResponse(BaseModel):
     amount: str
     shares: int
     reasoning: str
+    # Story 8.6 — backend-computed honesty facts, serialized as fixed-point
+    # strings (never float). ``pct_below_ask`` is the fraction ``(ask -
+    # limit_price)/ask`` (e.g. ``"0.0200"``); ``fill_note`` is the calm banded
+    # fill-likelihood copy; ``stale_note`` is a calm delayed-data signal (``null``
+    # when the newest bar is fresh).
+    pct_below_ask: str
+    fill_note: str
+    stale_note: str | None = None
 
 
 # --- Serialization helpers ---------------------------------------------------
@@ -471,6 +480,17 @@ def _money_str(value: Decimal) -> str:
     Delegates to the shared :func:`money.format_money` single serializer.
     """
     return format_money(value)
+
+
+def _pct_str(value: Decimal) -> str:
+    """Serialize a wire percentage/fraction as fixed-point (never binary float).
+
+    Story 8.6: ``pct_below_ask`` is a ``Decimal`` fraction (e.g.
+    ``Decimal("0.0200")``); this renders it as a plain fixed-point string
+    (``"0.0200"``) via ``format(Decimal, "f")`` so the frontend receives an exact
+    string and no ``E+`` notation, symmetric with :func:`_money_str`.
+    """
+    return format(value, "f")
 
 
 def _to_approve_response(outcome: OrderOutcome) -> ApproveResponse:
@@ -811,6 +831,9 @@ async def suggest_order(
             gateway=gateway,
             symbol=body.symbol,
             target_amount=body.amount,
+            # Inject the wall-clock reference date HERE (out of the pure pricing
+            # path) so freshness is deterministic and testable — Story 8.6.
+            as_of=date.today(),
         )
     except OrderNotSupportedError as exc:
         # Symmetric with /approve: a deferred order feature refusal → calm 422.
@@ -838,6 +861,9 @@ async def suggest_order(
         amount=_money_str(suggestion.amount),
         shares=suggestion.shares,
         reasoning=suggestion.reasoning,
+        pct_below_ask=_pct_str(suggestion.pct_below_ask),
+        fill_note=suggestion.fill_note,
+        stale_note=suggestion.stale_note,
     )
 
 
