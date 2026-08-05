@@ -28,12 +28,13 @@ test = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# Story 8.5: the suite is fast enough (whole default lane runs in ~1 minute, well
-# under the 600s timeout) that NO fast/slow split is needed today — the shared
-# session-scoped app + one-time DDL + test-only fast password hasher (see
-# tests/conftest.py) carry the win. The `slow` marker is registered so that if a
-# genuinely expensive test is ever added, it can be tagged `@pytest.mark.slow`
-# and the lanes split without churn.
+# Story 8.5: the suite is fast enough that NO fast/slow split is needed today —
+# ``tests/test_coach_api.py`` runs in ~20s (was ~13 min). The win is: forcing
+# ``LLM_ADAPTER=fake`` for the suite (the old ~13 min was REAL Anthropic API calls
+# via the demo .env — the dominant cost), the test-only fast password hasher, and
+# running startup migrations once per session (see tests/conftest.py). The `slow`
+# marker is registered so that if a genuinely expensive test is ever added, it can
+# be tagged `@pytest.mark.slow` and the lanes split without churn.
 #
 # Commands (run from ballast/backend, DB up: `docker compose up -d db`):
 #   Fast default lane (everything):      uv run pytest -q

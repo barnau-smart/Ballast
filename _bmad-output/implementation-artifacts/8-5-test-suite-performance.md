@@ -1,6 +1,6 @@
 # Story 8.5: Test-Suite Performance — Tame the Slow `test_coach_api.py` Integration Suite
 
-Status: ready-for-dev
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -92,8 +92,18 @@ Three **stacking** costs, in likely-impact order:
 
 ### Agent Model Used
 
-### Debug Log References
+Fixed hands-on (not the loop) 2026-08-05 — Claude Opus 4.8 — after two autonomous passes false-passed it (correct-course reopened it twice; see sprint-change-proposal-2026-08-05.md).
 
 ### Completion Notes List
 
+- **REAL root cause (found only by independent, un-batched, timed runs — the loop's self-report was false twice):** the ~13-min slowness AND the `test_recommend_surfaces_fr11_warning` failure were **the same cause** — the local `.env` runs the demo/live config `LLM_ADAPTER=anthropic` with a real key, and nothing in the suite forced fake, so every test hitting `/recommend` made a **real Anthropic API call** (~10 s network latency each at ~1% CPU; live replies also made the fr11 assertion flaky). The two prior autonomous passes mis-diagnosed it as fixture scoping (session-scope hang / Argon2). Fixture setup was never the bottleneck (measured 0.07–0.10 s/test).
+- **Fix (`tests/conftest.py`):** force `LLM_ADAPTER=fake` at module import (before any settings load; `get_settings()` is uncached and env vars beat `.env`) → deterministic in-process gateway. Kept the test-only fast SHA-256 hasher and added one-time session schema+migrations (`_schema_once` on a dedicated `asyncio.run` loop) with a neutered per-test lifespan (the per-test `run_startup_migrations` takes a `pg_advisory_xact_lock`; running it once removes that serialization and the earlier session-scope hang risk). `client` stays function-scoped.
+- **Measured (independently, DB up):** `test_coach_api.py` **13 m 45 s → ~19.8 s**, **108 passed**, stable twice-in-a-row (19.84 s / 19.64 s) — no hang, CPU-active. Full suite **587 passed in ~42 s**.
+- **AC #8 (independent no-hang timed gate): MET.** Verified by hand, not by the loop.
+- **Known out-of-scope, pre-existing:** 4 `.env`-artifact failures remain (`test_llm_gateway.py` ×3, `test_market_ingest.py` ×1 — "returns-fake-by-default"/"no-key-raises"). Confirmed red **before** this work (0.45 s, on the loop's approach-A commit via `git stash`) — caused by the demo `.env` (real key + `LLM_ADAPTER=anthropic`/`MARKETDATA_ADAPTER=tiingo`), not by this change and not test-speed. Tracked separately; see [[fake-mode-vs-real-coaching]].
+- **Process lesson:** the autonomous loop cannot self-verify async/timing/env-sensitive test changes — its in-run execution masked both the hang and the real-API slowness, yielding two false "done"s. This class of story needs an independent, un-batched, timed run before `done`.
+
 ### File List
+
+- `ballast/backend/tests/conftest.py` (force fake LLM; fast hasher; one-time schema/migrations + neutered per-test lifespan)
+- `ballast/backend/pyproject.toml` (honest pytest config comment; `slow`/`real_hasher` markers)

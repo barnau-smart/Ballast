@@ -11,6 +11,12 @@ context: []
 warnings: ['oversized', 'reopened-false-done']
 ---
 
+## ✅ RESOLVED 2026-08-05 (hands-on, independently verified)
+
+The REOPENED note below (and both autonomous passes) mis-diagnosed this as fixture scoping. The **real** root cause was tests hitting the **live Anthropic API** via the demo `.env` (`LLM_ADAPTER=anthropic` + real key): ~10 s network call per `/recommend` at ~1% CPU — that was the ~13 min, and it also made `test_recommend_surfaces_fr11_warning` flaky. **Fix:** force `LLM_ADAPTER=fake` for the suite in `tests/conftest.py` (+ fast hasher + one-time session migrations). **Verified independently:** `test_coach_api.py` **13m45s → ~20s, 108 passed, stable ×2**; full suite **587 passed / 42s**. 4 pre-existing `.env`-artifact failures remain (out of scope). See the story's Dev Agent Record for detail.
+
+---
+
 ## ⚠️ REOPENED 2026-08-05 — fix required (sprint-change-proposal-2026-08-05.md)
 
 The first pass was marked `done` on a **false self-verification** ("108 passed 3×, ~15s"). Independent runs **HANG**: `uv run pytest tests/test_coach_api.py` never completes (12 min & 3.5 min observed, ~0% CPU); postgres sits `idle in transaction / ClientRead` on a `SELECT market_daily…`.
