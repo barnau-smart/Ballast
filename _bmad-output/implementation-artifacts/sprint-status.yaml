@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-26
+# last_updated: 2026-08-05  # Epic 8 complete (8.1-8.6) + retrospective done; repo pushed to GitHub
 # project: ai_practice_project
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-04  # Story 8.1 (marketable limit orders) reviewed -> done (4 patches applied); Story B next
+last_updated: 2026-08-05  # Epic 8 complete (8.1-8.6) + retrospective done; repo pushed to GitHub
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -138,7 +138,7 @@ development_status:
   # 8.5 (test-suite performance) + 8.6 (suggestion honesty/fill-likelihood) captured 2026-08-04 as follow-ups.
   8-5-test-suite-performance: done  # FIXED hands-on 2026-08-05 (independently verified): real root cause was tests hitting the live Anthropic API via demo .env (LLM_ADAPTER=anthropic) — forced LLM_ADAPTER=fake in conftest → test_coach_api.py 13m45s→~20s, 108 passed, stable x2. Full suite 587 passed/42s; 4 pre-existing .env-artifact failures (test_llm_gateway/test_market_ingest "fake-by-default") remain, out of scope.
   8-6-suggestion-honesty-fill-likelihood: done  # done 2026-08-05: dev via loop (paused pre-finalize in dev-verify), independently test-verified (149 passed, suggest+coach_api ~23s) + bmad-code-review (1 low patch applied, no high/med)
-  epic-8-retrospective: optional
+  epic-8-retrospective: done  # completed 2026-08-05 (epic-8-retro-2026-08-05.md)
 
 action_items:
   - epic: 4
@@ -197,3 +197,15 @@ action_items:
     action: "Loop-liveness check (ps grep bmad-dev-auto / bmad_loop.cli run) before any hand-commit or marker-finalize when a bmad-loop 'seems dead'; if a session is alive, do not edit markers, commit, or start a second loop (race risk)."
     owner: "MasterB"
     status: done  # memory guardrail saved 2026-08-03
+  - epic: 8
+    action: "Investigate docker Postgres crashes (Exited 255) under repeated full-suite runs; bump Docker Desktop memory / container limits. Infra stability."
+    owner: "MasterB"
+    status: open
+  - epic: 8
+    action: "Tune suggestion heuristics against real data before/at go-live (1% discount, 20-day low window, 2%/5% fill-likelihood bands, 5d/30d freshness) — named constants, currently untuned placeholders."
+    owner: "MasterB"
+    status: open
+  - epic: 8
+    action: "Add an independent-verification step (or policy note) to the loop for test-performance/async/env-sensitive stories, so a false 'done' cannot slip through (per 8.5 double false-pass)."
+    owner: "MasterB"
+    status: open
