@@ -15,24 +15,34 @@ product behaviour. It does three things, all strictly test-scoped:
    from a production code path: production never imports ``tests`` and the patch
    is installed by an autouse fixture that only runs under pytest.
 
-2. **Shared, session-scoped app + TestClient.** ``create_app()`` registers every
-   router and runs the lifespan (``create_db_and_tables`` + startup migrations).
-   Rebuilding it per test was pure overhead. The ``client`` fixture below builds
-   it once per session. Because a shared app means per-test
-   ``dependency_overrides`` (e.g. the ``get_broker`` spies) could leak, an
-   autouse guard snapshots the baseline overrides and restores them after every
-   test — preserving the isolation the per-test app used to give for free.
-   Scope note: today only ``test_coach_api.py`` consumes this shared session app
-   (it was the slow file this story targets). The other endpoint test files still
-   define their own function-scoped ``client`` and rebuild ``create_app()`` per
-   test; they benefit from the fast hasher (#1) but not this shared app. Migrating
-   them onto this fixture is a safe future consolidation, deliberately out of
-   Story 8.5's scope.
+2. **Shared app + TestClient fixture (function-scoped).** ``create_app()``
+   registers every router and runs the lifespan (``create_db_and_tables`` +
+   startup migrations). The ``client`` fixture below provides it via conftest so
+   ``test_coach_api.py`` no longer defines its own. It is FUNCTION-scoped (pytest's
+   default), NOT session-scoped.
 
-3. **One-time ``ensure_tables``.** The schema-reconciliation DDL (every
+   Why not session-scoped? asyncpg connections are bound to the event loop that
+   created them, and ``db.session.engine`` is built with ``NullPool`` (see
+   ``db/session.py``) so it caches no connections across calls. A session-scoped
+   async fixture opens its connection on whatever loop is live at first use, but
+   pytest-asyncio gives each test function its OWN event loop; a later test that
+   touches the module-global engine then awaits a result future on a loop other
+   than the one that created the connection, so the await never resolves — a HANG
+   (postgres sits ``idle in transaction`` on a ``SELECT`` at ~0% CPU). The first
+   8.5 pass made ``client`` + ``ensure_tables`` ``scope="session"``; independent
+   runs of ``tests/test_coach_api.py`` never completed. Function scope keeps every
+   engine interaction on the test's own loop, so ``NullPool`` opens and closes the
+   connection within that single loop and nothing crosses loops. The dominant,
+   safe speedup is the fast hasher (#1), which is unaffected by scope and is the
+   whole win.
+
+3. **Function-scoped ``ensure_tables``.** The schema-reconciliation DDL (every
    ``CREATE/ALTER/INDEX ... IF NOT EXISTS`` statement is preserved verbatim from
-   ``test_coach_api.py``) now runs once per session instead of before every
-   test. It is idempotent, so once-per-session is equivalent.
+   ``test_coach_api.py``) runs before each test. It is idempotent and cheap
+   (``IF NOT EXISTS`` / ``checkfirst``), so per-test execution is correct and not
+   a meaningful cost. It is function-scoped for the same cross-event-loop reason
+   as ``client`` above — a session-scoped async fixture reusing the shared engine
+   stalls across per-function event loops.
 
 Per-test isolation is otherwise unchanged: tests still use unique-email users
 (``_unique_email``) and clean up their own rows against the real docker Postgres.
@@ -134,14 +144,19 @@ def _fast_password_hasher(request):
 # --- 3. one-time schema reconciliation (moved from test_coach_api.py) --------
 
 
-@pytest_asyncio.fixture(scope="session", autouse=True)
+@pytest_asyncio.fixture(autouse=True)
 async def ensure_tables():
-    """Ensure owned tables + carried-over schema reconciliation exist ONCE.
+    """Ensure owned tables + carried-over schema reconciliation exist.
 
     Every DDL statement is preserved verbatim from the original per-test
     ``ensure_tables`` in ``test_coach_api.py``; it is all ``IF NOT EXISTS`` /
-    ``checkfirst`` and therefore idempotent, so running it once per session is
-    equivalent to running it before each test — just ~100x cheaper.
+    ``checkfirst`` and therefore idempotent. FUNCTION-scoped (the default): a
+    session-scoped async fixture reusing the module-global ``engine`` across
+    pytest-asyncio's per-function event loops stalls (asyncpg connections are
+    loop-bound and the engine uses ``NullPool``, so a connection created on one
+    test's loop is awaited on another's and never resolves), which hung the suite.
+    Function scope keeps each engine interaction on the test's own event loop; the
+    DDL is idempotent and cheap so running it per test is correct and negligible.
     """
     from sqlalchemy import text
 
@@ -204,17 +219,21 @@ async def ensure_tables():
     yield
 
 
-# --- 2. shared session-scoped app + TestClient ------------------------------
+# --- 2. shared app + TestClient (function-scoped) ---------------------------
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def client(ensure_tables):
-    """A single app + TestClient shared across the whole session.
+    """A fresh app + TestClient per test.
 
-    ``TestClient`` as a context manager runs the app lifespan once
-    (``create_db_and_tables`` + ``run_startup_migrations``), so that startup
-    work is amortised over the whole suite. ``ensure_tables`` is depended on so
-    the schema reconciliation runs before the first request.
+    ``TestClient`` as a context manager runs the app lifespan
+    (``create_db_and_tables`` + ``run_startup_migrations``). FUNCTION-scoped (the
+    default): a session-scoped fixture reusing the module-global asyncpg engine
+    across pytest-asyncio's per-function event loops caused a cross-event-loop
+    stall (asyncpg connections are loop-bound; the engine uses ``NullPool``), so
+    the suite hung at ~0% CPU. A fresh app per test keeps each engine interaction
+    on the test's own loop. ``ensure_tables`` is depended on so the schema
+    reconciliation runs before the first request.
     """
     with TestClient(create_app()) as c:
         yield c
@@ -222,13 +241,13 @@ def client(ensure_tables):
 
 @pytest.fixture(autouse=True)
 def _isolate_dependency_overrides(request):
-    """Restore ``dependency_overrides`` after every test that uses the shared app.
+    """Restore ``dependency_overrides`` after every test that uses ``client``.
 
-    A session-scoped app means a test that sets ``dependency_overrides[...]``
-    (e.g. a per-test ``get_broker`` spy) and dies before popping would leak into
-    the next test. Snapshot the baseline overrides for whatever app the ``client``
-    fixture built and restore them after the test, keeping isolation identical to
-    the old per-test-app behaviour. No-op for tests that don't use ``client``.
+    With the function-scoped ``client`` fixture each test gets a fresh app, so
+    per-test ``dependency_overrides`` (e.g. a ``get_broker`` spy) cannot leak into
+    the next test — this guard is effectively a harmless no-op today. It is kept
+    as-is (cheap, still correct) so it stays a safety net if ``client`` is ever
+    shared more broadly. No-op for tests that don't use ``client``.
     """
     if "client" not in request.fixturenames:
         yield
