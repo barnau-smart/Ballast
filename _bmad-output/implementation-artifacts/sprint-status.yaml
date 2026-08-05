@@ -137,7 +137,7 @@ development_status:
   8-4-ai-suggest-populate-order: done
   # 8.5 (test-suite performance) + 8.6 (suggestion honesty/fill-likelihood) captured 2026-08-04 as follow-ups.
   8-5-test-suite-performance: done  # FIXED hands-on 2026-08-05 (independently verified): real root cause was tests hitting the live Anthropic API via demo .env (LLM_ADAPTER=anthropic) — forced LLM_ADAPTER=fake in conftest → test_coach_api.py 13m45s→~20s, 108 passed, stable x2. Full suite 587 passed/42s; 4 pre-existing .env-artifact failures (test_llm_gateway/test_market_ingest "fake-by-default") remain, out of scope.
-  8-6-suggestion-honesty-fill-likelihood: ready-for-dev
+  8-6-suggestion-honesty-fill-likelihood: done  # done 2026-08-05: dev via loop (paused pre-finalize in dev-verify), independently test-verified (149 passed, suggest+coach_api ~23s) + bmad-code-review (1 low patch applied, no high/med)
   epic-8-retrospective: optional
 
 action_items:

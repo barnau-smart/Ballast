@@ -461,12 +461,12 @@ async def suggest_resting_order(
 
     # Story 8.6 — deterministic fill-likelihood, computed by the backend and fed to
     # the LLM as a FACT (the model never derives it). Same bars+ask ⇒ same numbers.
-    # ``pct_below_ask`` is the 4dp-quantized value for the wire; the BAND is chosen
-    # from the exact unrounded fraction so display rounding can never nudge a value
-    # across a band edge (ask is guaranteed positive here — checked above).
+    # The band is chosen from the SAME guarded ``pct_below_ask`` value that goes on
+    # the wire and into the narration, so the banded copy and the displayed percent
+    # can never disagree at an edge — and there is exactly one (guarded, ask>0)
+    # division, not a second unguarded recompute.
     pct_below_ask = _pct_below_ask(limit_price, ask)
-    exact_pct_below_ask = (ask - limit_price) / ask
-    _band, fill_note = fill_likelihood(exact_pct_below_ask)
+    _band, fill_note = fill_likelihood(pct_below_ask)
 
     reasoning = narrate_suggestion(
         gateway,

@@ -183,3 +183,18 @@ Status: done
 **Residual risks.** Low. The fill-likelihood band thresholds (2%/5%) and freshness thresholds (5d/30d) are heuristics chosen without live-data tuning — named constants for one-line adjustment once real fill/staleness data exists. The near-market band is currently unreachable given the 2% floor (intentional: the floor keeps every suggestion patiently below market); it remains as coherent defensive code if the floor is ever lowered.
 
 **followup_review_recommended:** false — the review pass applied only 4 low-severity, single-file hardening patches with no behavior/API/data-shape change and no new test failures.
+
+## Independent Code Review (2026-08-05, bmad-code-review — 3 adversarial layers)
+
+Run out-of-loop because the loop wedged in `dev-verify` before its own review could finalize (see below); the work was independently test-verified green (149 passed) first, then adversarially reviewed. **No Critical/High findings** — core money-math, `min()` floor direction, determinism/purity, fixed-point serialization, calm 422 error mapping, and the real-vs-fake-LLM number identity are all verified correct.
+
+### Review Findings
+
+- [x] [Review][Patch] Band selected from an unguarded recomputed division; band vs displayed-percent could disagree at an edge [coach/suggest.py:467-469] — APPLIED: select the band from the same guarded `pct_below_ask` (removes the second, unguarded `(ask-limit)/ask` division — a latent divide-by-zero→500 if a future change weakened the ask guard — AND guarantees the banded copy and the wire/narrated percent always agree). Re-verified: `test_suggest_order.py` 41 passed.
+- [x] [Review][Defer] Near-market "may fill soon" band is unreachable under the 2% floor [coach/suggest.py:151-186] — already documented + accepted in this story's Residual Risks (coherent defensive code if the floor is lowered). Not a defect.
+- [x] [Review][Defer] Frontend drops the fill/stale note on the "answered-without-executable-order" ask branch [CoachConsult.jsx:206-224] — mirrors pre-existing 8.4 `reasoning` behavior, not a regression from 8.6.
+- [x] [Review][Dismiss] `str(facts.get("fill_note"))` → "None" if the fact were None — unreachable: the sole caller always passes a non-empty banded string.
+- [x] [Review][Dismiss] Freshness `>` boundary "off-by-one" at 5d/30d — deliberate (`older than`), pinned by tests.
+- [x] [Review][Dismiss] `pct_below_ask` wired but not rendered by the UI — intentional API surface; a client may display it.
+
+**Result:** 0 decision-needed, 1 patch (applied), 2 deferred (both pre-existing/accepted), 3 dismissed as noise.
