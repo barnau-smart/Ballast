@@ -136,7 +136,7 @@ development_status:
   # Compute-owner LOCKED: backend computes the resting-limit price deterministically, LLM only narrates.
   8-4-ai-suggest-populate-order: done
   # 8.5 (test-suite performance) + 8.6 (suggestion honesty/fill-likelihood) captured 2026-08-04 as follow-ups.
-  8-5-test-suite-performance: done
+  8-5-test-suite-performance: ready-for-dev  # REOPENED 2026-08-05: false "done" — session-scoped fixtures hang (see sprint-change-proposal-2026-08-05.md)
   8-6-suggestion-honesty-fill-likelihood: backlog
   epic-8-retrospective: optional
 

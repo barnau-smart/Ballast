@@ -2,14 +2,23 @@
 title: 'Story 8.5 — Tame the slow test_coach_api.py integration suite'
 type: 'chore'
 created: '2026-08-04'
-status: 'done'
+status: 'ready-for-dev'
 baseline_revision: '8573332bbd69a22df782b850b795e2564ff9239e'
-final_revision: '96a39a07a482970728b1d1e21abb9adca44a91b5'
 review_loop_iteration: 0
 followup_review_recommended: false
 context: []
-warnings: ['oversized']
+warnings: ['oversized', 'reopened-false-done']
 ---
+
+## ⚠️ REOPENED 2026-08-05 — fix required (sprint-change-proposal-2026-08-05.md)
+
+The first pass was marked `done` on a **false self-verification** ("108 passed 3×, ~15s"). Independent runs **HANG**: `uv run pytest tests/test_coach_api.py` never completes (12 min & 3.5 min observed, ~0% CPU); postgres sits `idle in transaction / ClientRead` on a `SELECT market_daily…`.
+
+**Root cause:** cross-event-loop asyncpg stall. The `scope="session"` async `client` and `ensure_tables` fixtures in `tests/conftest.py` reuse the module-global asyncpg `engine` (`db.session.engine`) across pytest-asyncio's per-function event loops → a pooled connection awaits its result future on the wrong loop → the await never resolves.
+
+**Fix — approach (A) preferred:** revert the session-scoping of `client` + `ensure_tables` to **function scope**; KEEP the function-scoped fast SHA-256 test hasher (`_fast_password_hasher`, the dominant and safe speedup). Measure; if under the timeout, stop. **(B) fallback if still too slow:** pin a single session-scoped event loop (`loop_scope="session"`) so the shared engine stays on one loop.
+
+**Acceptance gate (AC #8):** `uv run pytest tests/test_coach_api.py` as ONE un-batched invocation completes < 120s, all pass, NO hang, stable twice-in-a-row. Verified **independently** of this run's self-report.
 
 <intent-contract>
 
