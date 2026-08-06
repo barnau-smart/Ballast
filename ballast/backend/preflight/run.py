@@ -303,10 +303,33 @@ def main() -> int:
         )
         return 2
 
-    from brokers.factory import get_broker
+    import asyncio
+
+    from brokers.factory import (
+        OperatorTokenBindError,
+        bind_operator_token,
+        get_broker,
+    )
+    from db.session import async_session_maker
     from llm.factory import get_llm_gateway
 
     broker = get_broker()
+    # Bind the linked operator's decrypted Schwab token onto the adapter. The CLI
+    # has no HTTP request / user scope, so the per-request binder does not apply —
+    # bind_operator_token reads the single linked account directly. Without this,
+    # the bare adapter has no token and the four Schwab read seams would all fail
+    # with "no token bound", leaving only the LLM seam confirmed. A no-op for the
+    # fake adapter (a BROKER_ADAPTER=fake run needs no DB rows).
+    async def _bind() -> object:
+        async with async_session_maker() as session:
+            return await bind_operator_token(broker, session)
+
+    try:
+        broker = asyncio.run(_bind())
+    except OperatorTokenBindError as exc:
+        print(f"Pre-flight cannot bind a Schwab token: {exc}")
+        return 2
+
     gateway = get_llm_gateway()
     report = run(broker=broker, gateway=gateway, settings=settings)
     print(report.text)

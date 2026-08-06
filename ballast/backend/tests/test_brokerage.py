@@ -26,7 +26,11 @@ from brokers.fake_adapter import (
     FAKE_REFRESH_TOKEN,
     FakeBrokerAdapter,
 )
-from brokers.factory import get_broker
+from brokers.factory import (
+    OperatorTokenBindError,
+    bind_operator_token,
+    get_broker,
+)
 from brokers.port import BrokerPort, BrokerTokens
 from db.connection import get_connection
 from db.models import BrokerageToken, PortfolioBalance, PortfolioCache
@@ -828,3 +832,129 @@ def test_sole_caller_of_get_order_status_by_ref():
         "get_order_status_by_ref must be called ONLY by coach.execution (AD-7). "
         f"Unexpected callers: {offenders}"
     )
+
+
+# =============================================================================
+# Operator token binding for the read-only pre-flight harness (Story 7.6)
+#
+# bind_operator_token gives the CLI harness (no HTTP request / user scope) the
+# single linked operator's decrypted Schwab token, so the four Schwab read seams
+# actually drive live instead of failing with "no token bound". These are the
+# offline tests for that binder (2026-08-06 follow-up closing the CLI gap).
+# =============================================================================
+
+
+def _clear_all_brokerage_tokens() -> None:
+    """Empty the brokerage_token table for a deterministic global-query start.
+
+    bind_operator_token reads across ALL owners (it expects exactly one linked
+    account), so these tests control the whole table. The suite is serial and
+    every other test cleans up its own tokens, so clearing here is safe.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM brokerage_token")
+        conn.commit()
+
+
+async def _insert_token(owner: uuid.UUID, *, access: str, refresh: str) -> None:
+    from datetime import datetime, timezone
+
+    async with async_session_maker() as session:
+        repo = ScopedRepository(BrokerageToken, Scope.for_user(owner), session)
+        await repo.add(
+            provider="schwab",
+            access_token=access,
+            refresh_token=refresh,
+            expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+        await session.commit()
+
+
+@pytest.fixture
+def _schwab_creds(monkeypatch):
+    """Set SCHWAB_* so a SchwabAdapter constructs (it refuses without creds).
+
+    Scoped to the tests that request it — NOT file-wide, since other tests in
+    this module assert the missing-creds refusal.
+    """
+    monkeypatch.setenv("SCHWAB_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("SCHWAB_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1/callback")
+
+
+@pytest.mark.asyncio
+async def test_bind_operator_token_fake_adapter_passthrough():
+    # A non-Schwab adapter is returned untouched — a BROKER_ADAPTER=fake run needs
+    # no DB rows and never touches the token path.
+    fake = FakeBrokerAdapter()
+    async with async_session_maker() as session:
+        result = await bind_operator_token(fake, session)
+    assert result is fake
+
+
+@pytest.mark.asyncio
+async def test_bind_operator_token_no_linked_account_raises(_schwab_creds):
+    from brokers.schwab_adapter import SchwabAdapter
+
+    _clear_all_brokerage_tokens()
+    async with async_session_maker() as session:
+        with pytest.raises(OperatorTokenBindError, match="No linked Schwab account"):
+            await bind_operator_token(SchwabAdapter(), session)
+
+
+@pytest.mark.asyncio
+async def test_bind_operator_token_single_owner_binds_decrypted_token(
+    two_owner_ids, _schwab_creds
+):
+    from brokers.schwab_adapter import SchwabAdapter
+
+    a, _ = two_owner_ids
+    _clear_all_brokerage_tokens()
+    await _insert_token(
+        a, access=encrypt_token("live-access"), refresh=encrypt_token("live-refresh")
+    )
+
+    async with async_session_maker() as session:
+        bound = await bind_operator_token(SchwabAdapter(), session)
+
+    # A token-bound Schwab adapter whose accessor yields the reconstructed,
+    # DECRYPTED schwab-py token envelope (never ciphertext, never logged).
+    assert isinstance(bound, SchwabAdapter)
+    token = bound._token_read_func()
+    assert token["access_token"] == "live-access"
+    assert token["refresh_token"] == "live-refresh"
+    assert token["token_type"] == "Bearer"
+    assert isinstance(token["expires_at"], int)
+
+
+@pytest.mark.asyncio
+async def test_bind_operator_token_multiple_owners_raises(two_owner_ids, _schwab_creds):
+    from brokers.schwab_adapter import SchwabAdapter
+
+    a, b = two_owner_ids
+    _clear_all_brokerage_tokens()
+    await _insert_token(
+        a, access=encrypt_token("a-access"), refresh=encrypt_token("a-refresh")
+    )
+    await _insert_token(
+        b, access=encrypt_token("b-access"), refresh=encrypt_token("b-refresh")
+    )
+
+    async with async_session_maker() as session:
+        with pytest.raises(OperatorTokenBindError, match="single dedicated operator"):
+            await bind_operator_token(SchwabAdapter(), session)
+
+
+@pytest.mark.asyncio
+async def test_bind_operator_token_undecryptable_raises(two_owner_ids, _schwab_creds):
+    from brokers.schwab_adapter import SchwabAdapter
+
+    a, _ = two_owner_ids
+    _clear_all_brokerage_tokens()
+    # A row whose ciphertext cannot be decrypted (rotated key / corrupt data).
+    await _insert_token(a, access="not-valid-fernet-ciphertext", refresh="also-bad")
+
+    async with async_session_maker() as session:
+        with pytest.raises(OperatorTokenBindError, match="could not be decrypted"):
+            await bind_operator_token(SchwabAdapter(), session)

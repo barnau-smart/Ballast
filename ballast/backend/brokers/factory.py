@@ -30,6 +30,16 @@ class UnknownBrokerAdapterError(RuntimeError):
     """Raised when ``BROKER_ADAPTER`` names an adapter that does not exist."""
 
 
+class OperatorTokenBindError(RuntimeError):
+    """Raised when the operator (CLI, no request scope) cannot bind a Schwab token.
+
+    Distinct from the per-request path's ``HTTPException`` (409): the read-only
+    pre-flight harness (Story 7.6) is a CLI, so a bind failure surfaces as a plain
+    error the CLI prints — never an HTTP envelope. The message never echoes token
+    or key material.
+    """
+
+
 def get_broker() -> BrokerPort:
     """Return the configured broker adapter as a :class:`BrokerPort`.
 
@@ -157,6 +167,67 @@ def bind_freshly_exchanged_token(broker: BrokerPort, tokens) -> BrokerPort:
 
     if not isinstance(broker, SchwabAdapter):
         return broker
+    token_dict = _token_dict_from_broker_tokens(tokens)
+    return SchwabAdapter(token_read_func=lambda: token_dict)
+
+
+async def bind_operator_token(broker: BrokerPort, session: AsyncSession) -> BrokerPort:
+    """Bind the single linked operator's decrypted Schwab token onto the adapter.
+
+    For the read-only pre-flight harness (Story 7.6), which runs OUTSIDE any HTTP
+    request/user scope — so unlike :func:`_bind_user_token` (per-request, scoped to
+    the authenticated user), this reads across the whole ``brokerage_token`` table
+    and expects EXACTLY ONE linked account: the dedicated operator's. It refuses
+    loudly otherwise, so a pre-flight can never silently inspect the wrong user's
+    account. A non-Schwab adapter (the fake) passes straight through untouched, so
+    a ``BROKER_ADAPTER=fake`` run needs no DB rows. Never logs token material.
+
+    Raises :class:`OperatorTokenBindError` (a plain error, not an ``HTTPException``)
+    on: no linked account, more than one linked owner, or an undecryptable token
+    (wrong ``TOKEN_ENCRYPTION_KEY`` / corrupt ciphertext).
+    """
+    from brokers.schwab_adapter import SchwabAdapter
+
+    if not isinstance(broker, SchwabAdapter):
+        return broker
+
+    from sqlalchemy import select
+
+    from brokers.crypto import TokenEncryptionError, decrypt_token
+    from brokers.port import BrokerTokens
+    from db.models import BrokerageToken
+
+    rows = list((await session.execute(select(BrokerageToken))).scalars().all())
+    if not rows:
+        raise OperatorTokenBindError(
+            "No linked Schwab account found. Complete the 'Connect Schwab' OAuth "
+            "link once (so an encrypted token is stored) before the pre-flight run."
+        )
+    owners = {row.owner_id for row in rows}
+    if len(owners) > 1:
+        raise OperatorTokenBindError(
+            f"Found linked tokens for {len(owners)} users; the read-only pre-flight "
+            "expects a single dedicated operator account. Run it against a database "
+            "with exactly one linked Schwab account."
+        )
+    # Mirror ``_bind_user_token``: if the one-row invariant is ever violated for
+    # this owner, build from the latest-expiring (live) token, never a stale row.
+    row = max(
+        rows,
+        key=lambda r: r.expires_at or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    try:
+        tokens = BrokerTokens(
+            access_token=decrypt_token(row.access_token),
+            refresh_token=decrypt_token(row.refresh_token),
+            expires_at=row.expires_at,
+        )
+    except TokenEncryptionError as exc:
+        raise OperatorTokenBindError(
+            "The stored Schwab token could not be decrypted — TOKEN_ENCRYPTION_KEY "
+            "does not match the key used at link time (or the ciphertext is "
+            "corrupt). Re-link, or run with the correct TOKEN_ENCRYPTION_KEY."
+        ) from exc
     token_dict = _token_dict_from_broker_tokens(tokens)
     return SchwabAdapter(token_read_func=lambda: token_dict)
 

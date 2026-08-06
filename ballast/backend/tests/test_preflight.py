@@ -621,3 +621,44 @@ def test_env_only_capture_dir_still_fires_taps(monkeypatch, tmp_path):
     for seam in drift.declared_seams():
         assert (tmp_path / f"{seam}.json").exists()
     assert client.placed == []
+
+
+def test_cli_main_binds_operator_token_before_driving(monkeypatch, tmp_path):
+    """The CLI entrypoint binds the operator's Schwab token BEFORE driving seams.
+
+    Without this bind the four Schwab read seams fail with "no token bound" and
+    only the LLM seam is confirmed — the exact gap this wiring closes. Guards
+    against a future refactor silently dropping it. Fully offline (spies + a
+    stubbed orchestrator); no real broker/gateway/DB drive.
+    """
+    import brokers.factory as bf
+    import llm.factory as lf
+
+    raw_broker = object()
+    bound_broker = object()
+    gateway = object()
+    recorded: dict = {}
+
+    monkeypatch.setattr(bf, "get_broker", lambda: raw_broker)
+
+    async def _spy_bind(broker, session):
+        recorded["bound_from"] = broker
+        return bound_broker
+
+    monkeypatch.setattr(bf, "bind_operator_token", _spy_bind)
+    monkeypatch.setattr(lf, "get_llm_gateway", lambda: gateway)
+
+    def _fake_run(*, broker, gateway, settings):
+        recorded["run_broker"] = broker
+        recorded["run_gateway"] = gateway
+        return run.PreflightReport(seams=[], overall=drift.PASS, text="ok")
+
+    monkeypatch.setattr(run, "run", _fake_run)
+    monkeypatch.setenv("PREFLIGHT_CAPTURE_DIR", str(tmp_path))
+
+    rc = run.main()
+
+    assert rc == 0
+    assert recorded["bound_from"] is raw_broker  # the raw broker was bound
+    assert recorded["run_broker"] is bound_broker  # the BOUND broker was driven
+    assert recorded["run_gateway"] is gateway
