@@ -28,6 +28,7 @@ When an Anthropic key is available, set ``ANTHROPIC_API_KEY`` and
 from __future__ import annotations
 
 import json
+import threading
 
 from api.config import get_settings
 from llm.models import route_model
@@ -83,6 +84,14 @@ class AnthropicGateway(LLMGateway):
         # force the anthropic SDK import at construction and break the
         # "importing this module never loads the SDK" contract.
         self._client: object | None = None
+        # Guards the lazy one-time build of ``self._client`` (below). complete()
+        # runs synchronously and the async request path offloads it to a worker
+        # THREAD (anyio.to_thread), so two concurrent /recommend calls hitting a
+        # cold gateway could otherwise both see ``None`` and each construct a
+        # client — leaking the loser's httpx pool. Double-checked locking makes the
+        # build happen exactly once; the steady-state (client already built) never
+        # touches the lock.
+        self._client_lock = threading.Lock()
         # Fail loudly at construction if the key is missing, so the factory's
         # gating is unambiguous. The anthropic SDK is NOT imported here.
         self._require_configured()
@@ -138,12 +147,17 @@ class AnthropicGateway(LLMGateway):
         # ``timeout``/``max_retries`` so a hung call surfaces as an
         # ``APITimeoutError`` (an ``anthropic.APIError``) within the budget —
         # fenced below and degraded to the default plan — not a ~10-minute stall.
+        # Double-checked locking: the common path (client already built) reads the
+        # attribute lock-free; only the first, racing cold-start callers serialize
+        # on the lock so the httpx-pooled client is constructed exactly once.
         if self._client is None:
-            self._client = anthropic.Anthropic(
-                api_key=self._api_key,
-                timeout=self._timeout,
-                max_retries=self._max_retries,
-            )
+            with self._client_lock:
+                if self._client is None:
+                    self._client = anthropic.Anthropic(
+                        api_key=self._api_key,
+                        timeout=self._timeout,
+                        max_retries=self._max_retries,
+                    )
         client = self._client
 
         # Build kwargs — omit ``system`` when None (None-safe). Adaptive thinking

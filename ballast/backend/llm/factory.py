@@ -14,6 +14,8 @@ code change.
 
 from __future__ import annotations
 
+import threading
+
 from api.config import get_settings
 from llm.fake_adapter import FakeLLMGateway
 from llm.port import LLMGateway
@@ -33,10 +35,18 @@ class UnknownLLMAdapterError(RuntimeError):
 #: uncached so the config is always read live. The fake path is never cached.
 _ANTHROPIC_GATEWAY_CACHE: dict[str, object] = {}
 
+#: Guards the read-modify-write of the single-slot cache above. ``get_llm_gateway``
+#: is called from the async request path via a worker THREAD, so concurrent
+#: first-callers could otherwise each build an ``AnthropicGateway`` and race the
+#: single-slot swap (duplicate gateways, duplicate leaked httpx pools). The lock
+#: makes the build-and-swap happen once; the steady-state cache hit stays lock-free.
+_ANTHROPIC_GATEWAY_LOCK = threading.Lock()
+
 
 def _reset_llm_gateway_cache() -> None:
     """Clear the memoized anthropic gateway — for test isolation only."""
-    _ANTHROPIC_GATEWAY_CACHE.clear()
+    with _ANTHROPIC_GATEWAY_LOCK:
+        _ANTHROPIC_GATEWAY_CACHE.clear()
 
 
 def get_llm_gateway() -> LLMGateway:
@@ -62,6 +72,8 @@ def get_llm_gateway() -> LLMGateway:
             f"{settings.LLM_REQUEST_TIMEOUT_SECONDS}\x00"
             f"{settings.LLM_MAX_RETRIES}"
         )
+        # Lock-free fast path: an already-pooled instance for this exact transport
+        # identity serves immediately without contending on the lock.
         cached = _ANTHROPIC_GATEWAY_CACHE.get(cache_key)
         if cached is not None:
             return cached
@@ -69,13 +81,19 @@ def get_llm_gateway() -> LLMGateway:
         # Import lazily so selecting fake never loads the anthropic adapter module.
         from llm.anthropic_adapter import AnthropicGateway
 
-        # Build FIRST, then swap the single slot — so a construction that raises
-        # (e.g. a blank/undecryptable key) never evicts a healthy pooled gateway
-        # that other requests are still reusing.
-        gateway = AnthropicGateway()
-        _ANTHROPIC_GATEWAY_CACHE.clear()
-        _ANTHROPIC_GATEWAY_CACHE[cache_key] = gateway
-        return gateway
+        # Double-checked under the lock: only the first, racing cold-start callers
+        # serialize here so the gateway (and its httpx pool) is built exactly once.
+        with _ANTHROPIC_GATEWAY_LOCK:
+            cached = _ANTHROPIC_GATEWAY_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            # Build FIRST, then swap the single slot — so a construction that
+            # raises (e.g. a blank/undecryptable key) never evicts a healthy pooled
+            # gateway that other requests are still reusing.
+            gateway = AnthropicGateway()
+            _ANTHROPIC_GATEWAY_CACHE.clear()
+            _ANTHROPIC_GATEWAY_CACHE[cache_key] = gateway
+            return gateway
 
     raise UnknownLLMAdapterError(
         f"Unknown LLM_ADAPTER '{adapter}'. Expected 'fake' or 'anthropic'."

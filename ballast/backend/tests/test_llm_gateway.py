@@ -695,6 +695,56 @@ def test_factory_rebuilds_anthropic_gateway_when_key_changes(monkeypatch):
         _reset_llm_gateway_cache()
 
 
+def test_factory_builds_one_anthropic_gateway_under_concurrency(monkeypatch):
+    # Pre-unattended-prod hardening (go-live sweep 2026-08-06): concurrent
+    # cold-start callers must build the pooled anthropic gateway EXACTLY once
+    # (double-checked lock on the single-slot cache) — no duplicate gateways and
+    # thus no leaked httpx pools. get_llm_gateway() is reached from the async path
+    # via a worker thread, so the race is real.
+    import threading
+
+    from llm import anthropic_adapter as _aa
+
+    _reset_llm_gateway_cache()
+    monkeypatch.setenv("LLM_ADAPTER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "concurrent-key")
+
+    build_count = {"n": 0}
+    count_lock = threading.Lock()
+    real_ctor = _aa.AnthropicGateway
+
+    class _CountingGateway(real_ctor):
+        def __init__(self, *args, **kwargs):
+            with count_lock:
+                build_count["n"] += 1
+            super().__init__(*args, **kwargs)
+
+    # The factory imports AnthropicGateway lazily by attribute, so patching the
+    # module attribute is what the cold-start path resolves.
+    monkeypatch.setattr(_aa, "AnthropicGateway", _CountingGateway)
+
+    n_threads = 16
+    barrier = threading.Barrier(n_threads)
+    results: list[object] = [None] * n_threads
+
+    def _worker(i: int) -> None:
+        barrier.wait()  # release all threads together to maximize the cold-start race
+        results[i] = get_llm_gateway()
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_threads)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Built exactly once, and every caller got that same pooled instance.
+        assert build_count["n"] == 1
+        assert all(r is results[0] for r in results)
+        assert isinstance(results[0], real_ctor)
+    finally:
+        _reset_llm_gateway_cache()
+
+
 def test_fake_path_needs_no_new_config_and_builds_no_client(monkeypatch):
     # The fake adapter reads none of the new Settings and never constructs an SDK
     # client. Guard the SDK ctor to prove it is never touched on the fake path.

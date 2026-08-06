@@ -48,6 +48,7 @@ UTC. Callers control ``commit`` on the session (the repository only flushes).
 from __future__ import annotations
 
 import datetime
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID
@@ -65,9 +66,43 @@ from db.repository import ScopedRepository
 from db.scope import Scope
 from money import format_money
 
+logger = logging.getLogger("ballast.coach.decision_record")
+
 #: The snapshot-shape version stamped onto every proposed record (AD-5). Bump
 #: this when the persisted snapshot shape changes so replay can adapt.
 DECISION_RECORD_SCHEMA_VERSION = 1
+
+#: Column width of ``decision_record.broker_ref`` (VARCHAR(64), see ``db.models``).
+#: A broker reference is written to this queryable column at placement
+#: (:func:`persist_broker_ref`) and again at :func:`cosign`. A value longer than
+#: the column would raise a DB ``DataError`` at commit — AFTER a live order already
+#: exists — converting a successful placement into an uncaught 500 with the row
+#: stranded in ``cosigning`` and NO durable ref (the exact zombie Story 7.2
+#: eliminates). A real Schwab order id is a short integer, far under this, so the
+#: guard below never triggers in practice; it is a defensive backstop for a
+#: malformed/oversized ref from any broker.
+BROKER_REF_MAX_LEN = 64
+
+
+def _fit_broker_ref(broker_ref: str | None) -> str | None:
+    """Clamp a broker reference to the queryable column width (defensive).
+
+    Returns the ref unchanged when it fits — the only case for a real Schwab order
+    id. If it somehow exceeds :data:`BROKER_REF_MAX_LEN`, logs a warning and
+    truncates so the post-placement write can never raise a ``DataError`` after a
+    live order was placed: a truncated-but-present ref in the queryable column
+    (with the FULL ref still preserved verbatim in ``cosign_snapshot`` /
+    ``OrderOutcome``) is strictly more recoverable than a stranded row with none.
+    """
+    if broker_ref is not None and len(broker_ref) > BROKER_REF_MAX_LEN:
+        logger.warning(
+            "broker_ref length %d exceeds column width %d; truncating for the "
+            "queryable column (full ref preserved in the cosign snapshot).",
+            len(broker_ref),
+            BROKER_REF_MAX_LEN,
+        )
+        return broker_ref[:BROKER_REF_MAX_LEN]
+    return broker_ref
 
 
 def _money(value: Decimal) -> str:
@@ -283,7 +318,7 @@ async def persist_broker_ref(
             DecisionRecord.owner_id == scope.user_id,
             DecisionRecord.status == "cosigning",
         )
-        .values(broker_ref=broker_ref),
+        .values(broker_ref=_fit_broker_ref(broker_ref)),
     )
     await session.commit()
     return won
@@ -594,8 +629,10 @@ def cosign(
     # Hoist the broker reference into its queryable column (Story 6.3) in addition
     # to the snapshot JSON below, so a later explicit reconcile (Story 6.7) can
     # find the order by ``broker_ref`` directly. NULL when the broker assigned
-    # none (e.g. a no-order_id timeout surfaced as pending).
-    record.broker_ref = outcome.broker_ref
+    # none (e.g. a no-order_id timeout surfaced as pending). Clamped to the column
+    # width so an oversized ref can't DataError post-placement; the full ref is
+    # preserved verbatim in the snapshot below.
+    record.broker_ref = _fit_broker_ref(outcome.broker_ref)
     record.cosign_snapshot = {
         "order_intent": _order_intent_json(order_intent),
         "outcome": {
