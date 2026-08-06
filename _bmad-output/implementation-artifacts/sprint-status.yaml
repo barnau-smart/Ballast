@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-05  # Epic 8 complete (8.1-8.6) + retrospective done; repo pushed to GitHub
+# last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; added pre-unattended-prod hardening item. 7.7 real-money gate remains the sole open story.
 # project: ai_practice_project
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-05  # Epic 8 complete (8.1-8.6) + retrospective done; repo pushed to GitHub
+last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; added pre-unattended-prod hardening item. 7.7 real-money gate remains the sole open story.
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -168,11 +168,11 @@ action_items:
   - epic: 6
     action: "Production DB migration path (adopt Alembic or equivalent) + migrations for every Epic 6 schema addition (uq_decision_record_idempotency_key, broker_ref, portfolio_balance + uq_portfolio_balance_owner, (owner_id, co_signed_at), reconciliation_snapshot/reconciled_at). create_all never ALTERs a provisioned prod DB; the unique-index double-place backstop must provably exist on prod. HARD GO-LIVE BLOCKER."
     owner: "MasterB"
-    status: open
+    status: done  # closed by Story 7.1 (verified 2026-08-06 go-live sweep): db/migrations.py provisions EVERY listed object on a carried-over prod DB (idempotency_key+uq, broker_ref, portfolio_balance+uq_portfolio_balance_owner, (owner_id,co_signed_at) ix, reconciliation_snapshot/reconciled_at, cosigning_at), wired into startup at api/app.py:80. Residual (folded to new hardening item below): backstops created as unique INDEXES via migration vs CONSTRAINTS via create_all (uniqueness still enforced) + per-boot backfill re-run w/ no schema_migrations table — both cosmetic/low.
   - epic: 6
     action: "Generalize the atomic-claim primitive (one reusable row-lock/conditional-UPDATE helper) and apply at the reconcile endpoint (6.7), the two-table balance reconcile (6.5), and close the 6.3 post-placement stranding (persist broker_ref BEFORE cosign so a cosign/commit failure stays recoverable). Money-adjacent."
     owner: "MasterB"
-    status: open
+    status: done  # closed by Story 7.2 (verified 2026-08-06 go-live sweep, commit 53e492f): db/atomic.py conditional_claim/lock_row primitive; claim_for_cosign atomic conditional UPDATE (decision_record.py:195); persist_broker_ref runs in its own commit BEFORE cosign (api/coach.py:770); reconcile persists under SELECT..FOR UPDATE (api/coach.py:1006). NULL-idempotency-key pre-flight guard (api/coach.py:686) + adapter post-placement fence (adapter.py:491) close the stranding/double-order paths.
   - epic: 6
     action: "Live go-live spike behind existing gates with real creds: one real paid Anthropic structured-output call + one small real Schwab order (place->reconcile) + one real balance import; re-confirm guessed Schwab order/token/balance JSON shapes against live payloads. Credentials/real-money decision."
     owner: "MasterB"
@@ -180,9 +180,13 @@ action_items:
   - epic: 6
     action: "Partial-fill terminality product decision (6.7): keep 'partial' terminal, or allow re-reconciliation of a partial fill that later completes to 'filled'."
     owner: "MasterB"
-    status: open
+    status: done  # decided + implemented by Story 8.2 (verified 2026-08-06 go-live sweep): 'partial' is NO LONGER terminal (coach/decision_record.py:617 _TERMINAL_STATUSES = frozenset({"filled","rejected"})); record_reconciliation applies an advance-only monotonic guard (partial->filled allowed, never regresses shares). The 7.7 runbook's "reserved human decision" is thus already made in code.
   - epic: 6
     action: "Sweep the 40-item deferred-work ledger (21 new in Epic 6) — partition into pre-go-live-spike blockers vs. exercised-and-closed-by-the-spike."
+    owner: "MasterB"
+    status: done  # go-live subset swept 2026-08-06 (ledger now 71 entries; automated /bmad-loop-sweep is blocked: 70/71 are legacy pre-DW-format bullets that need --migrate first). Money-path subset (~24 entries) verified against code via 5 parallel agents: the atomicity/schema/reconcile/LLM/broker-seams clusters are RESOLVED by Stories 6.x/7.x/8.2. NINE residuals remain; NONE block a single attended 7.7 exercise (they need concurrency, multi-account, re-link edge cases, or unattended operation). Pre-unattended-prod residuals folded to the new hardening item below. FULL 71-entry triage + legacy --migrate still deferred (non-money-path bullets not verified).
+  - epic: 6
+    action: "Pre-UNATTENDED-PROD hardening (NOT a blocker for the single attended 7.7 exercise; from the 2026-08-06 go-live sweep). (1) HIGHEST: wire reclaim_orphaned_cosigning + prune_stale_proposed_decisions to a scheduler/cron/startup-task — reclaimer currently has NO production caller (coach/decision_record.py:471), so an orphaned 'cosigning' row carrying a live order is never auto-recovered when no human is watching; also give the reclaimer LIMIT/paging + per-row error isolation (single end-commit today, one poison row aborts the batch). (2) broker_ref VARCHAR(64) length guard: validate/truncate before persist_broker_ref/cosign write (models.py:386) so a >64-char ref can't DataError AFTER a live order places (only Schwab's short int ids prevent it today; ~5-line fix). (3) LLM singleton thread-safety: lock the lazy self._client build (anthropic_adapter.py:141) + the module-level factory cache RMW (llm/factory.py:65) — concurrent cold-start callers can build duplicate clients and leak an httpx pool. Lower/cosmetic (optional): raw-500 on unlinked/missing-token/missing-hash during dep-resolution -> calm 409 (factory.py:110); re-link projection clear gated on detected account change (api/brokerage.py:247); reconcile response built from locked/effective outcome not raw result (api/coach.py:1021)."
     owner: "MasterB"
     status: open
   - epic: 3
