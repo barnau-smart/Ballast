@@ -65,6 +65,11 @@ _Settings.model_config["env_file"] = None
 # Belt-and-suspenders: also pin fake LLM in the process env, so even a real
 # ``LLM_ADAPTER`` exported in the shell (not just via .env) can't reach a test.
 os.environ["LLM_ADAPTER"] = "fake"
+# Keep the in-process decisions-maintenance scheduler OFF for the suite: every
+# ``create_app()`` runs the lifespan (via TestClient), and a background loop
+# doing DB writes would race per-test fixtures/teardown. Tests that need it
+# exercise ``coach.maintenance`` directly (test_maintenance_scheduler.py).
+os.environ["DECISION_MAINTENANCE_ENABLED"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient

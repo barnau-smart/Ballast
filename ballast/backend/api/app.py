@@ -28,6 +28,7 @@ from api.precedent import router as precedent_router
 from api.logging_config import configure_logging
 from api.schemas import UserCreate, UserRead
 from api.users import auth_backend, fastapi_users
+from coach.maintenance import MaintenanceScheduler
 from db.connection import check_db
 from db.migrations import run_startup_migrations
 from db.models import User
@@ -78,7 +79,25 @@ def create_app() -> FastAPI:
         # AFTER create_all so any brand-new table already exists; a fresh or
         # already-migrated DB makes this a clean no-op.
         await run_startup_migrations(engine)
-        yield
+        # In-process decisions-maintenance scheduler (pre-unattended-prod
+        # hardening, 2026-08-06): periodically reclaims crash-orphaned
+        # ``cosigning`` rows (a possibly-live order that would otherwise strand
+        # forever) and prunes stale ``proposed`` rows. ON by default; the whole
+        # test suite runs with it OFF (exercised directly instead). Started after
+        # the schema is provisioned; stopped cleanly on shutdown.
+        scheduler: MaintenanceScheduler | None = None
+        if settings.DECISION_MAINTENANCE_ENABLED:
+            scheduler = MaintenanceScheduler.from_settings(settings)
+            scheduler.start()
+            logger.info(
+                "decisions_maintenance_scheduler_enabled interval_s=%d",
+                settings.DECISION_MAINTENANCE_INTERVAL_SECONDS,
+            )
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                await scheduler.stop()
 
     app = FastAPI(title="Ballast API", version="0.1.0", lifespan=lifespan)
 

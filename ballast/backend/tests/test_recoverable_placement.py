@@ -860,3 +860,94 @@ async def test_reclaim_rowcount_gated_racing_cosign_wins():
         assert reclaimed == 0
     finally:
         _delete_user(owner)
+
+
+# =============================================================================
+# Pre-unattended-prod hardening (go-live sweep 2026-08-06): paging + per-row
+# isolation so an unattended scheduler can drive the reclaimer safely.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_reclaim_limit_bounds_batch_and_overflow_waits():
+    """``limit`` caps candidates per call; the overflow is reclaimed on a later run."""
+    owner = _make_user()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        ids = [
+            _insert_cosigning(owner, cosigning_at=old, broker_ref=f"fake-order-p{i}")
+            for i in range(3)
+        ]
+        # First pass reclaims at most `limit` of the 3 orphans.
+        async with async_session_maker() as session:
+            first = await reclaim_orphaned_cosigning(
+                session=session, older_than=timedelta(hours=1), limit=2
+            )
+        assert first == 2
+        statuses = [_row(i)["status"] for i in ids]
+        assert statuses.count("cosigned") == 2
+        assert statuses.count("cosigning") == 1  # overflow left for the next tick
+
+        # A later pass drains the remaining orphan.
+        async with async_session_maker() as session:
+            second = await reclaim_orphaned_cosigning(
+                session=session, older_than=timedelta(hours=1), limit=2
+            )
+        assert second == 1
+        assert all(_row(i)["status"] == "cosigned" for i in ids)
+    finally:
+        _delete_user(owner)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_rejects_nonpositive_limit():
+    """A non-positive ``limit`` is refused rather than silently reclaiming nothing."""
+    async with async_session_maker() as session:
+        with pytest.raises(ValueError):
+            await reclaim_orphaned_cosigning(
+                session=session, older_than=timedelta(hours=1), limit=0
+            )
+
+
+@pytest.mark.asyncio
+async def test_reclaim_per_row_failure_is_isolated(monkeypatch):
+    """One poison row is rolled back + skipped; the rest of the batch still commits.
+
+    Replaces the earlier single end-commit, where one failing row lost every prior
+    reclamation. Force the FIRST gated UPDATE to raise, then delegate the rest to
+    the real primitive: exactly one orphan stays ``cosigning`` (retried next tick)
+    and the other two are recovered to ``cosigned``.
+    """
+    import coach.decision_record as _dr
+
+    owner = _make_user()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        ids = [
+            _insert_cosigning(owner, cosigning_at=old, broker_ref=f"fake-order-x{i}")
+            for i in range(3)
+        ]
+
+        real_conditional_claim = _dr.conditional_claim
+        calls = {"n": 0}
+
+        async def _flaky_conditional_claim(session, stmt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated poison row (DB error on this UPDATE)")
+            return await real_conditional_claim(session, stmt)
+
+        monkeypatch.setattr(_dr, "conditional_claim", _flaky_conditional_claim)
+
+        async with async_session_maker() as session:
+            reclaimed = await reclaim_orphaned_cosigning(
+                session=session, older_than=timedelta(hours=1)
+            )
+
+        # Two of three recovered — the poison row survived, the batch was NOT lost.
+        assert reclaimed == 2
+        statuses = [_row(i)["status"] for i in ids]
+        assert statuses.count("cosigned") == 2
+        assert statuses.count("cosigning") == 1
+    finally:
+        _delete_user(owner)

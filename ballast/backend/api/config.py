@@ -141,6 +141,28 @@ class Settings(BaseSettings):
     # than this. Cosigned (on-the-record) rows are immutable and never pruned.
     DECISION_PROPOSED_RETENTION_DAYS: int = 30
 
+    # --- Decisions maintenance scheduler (pre-unattended-prod hardening) ------
+    # An in-process background task started in the app lifespan that periodically
+    # (a) reclaims crash-orphaned ``cosigning`` rows (Story 7.2 — a row carrying a
+    # possibly-live order that would otherwise strand forever) and (b) prunes stale
+    # ``proposed`` rows (Story 6.6). Both underlying operations are idempotent and
+    # rowcount-gated, so overlapping runs across instances are safe. Wired 2026-08-06.
+    #
+    # Master switch. ON by default so a real deployment recovers orphans without
+    # extra ops wiring; tests force it OFF (the scheduler is exercised directly).
+    DECISION_MAINTENANCE_ENABLED: bool = True
+    # Seconds between maintenance ticks. The loop SLEEPS this long before its first
+    # tick, so a fresh boot never does DB work synchronously at startup.
+    DECISION_MAINTENANCE_INTERVAL_SECONDS: int = Field(default=600, gt=0)
+    # Age (seconds) a ``cosigning`` row must exceed before it is treated as a
+    # crash-orphan and reclaimed. Must be comfortably longer than a legitimate
+    # approve→place→cosign round-trip (bounded by LLM_REQUEST_TIMEOUT_SECONDS plus
+    # a broker placement, i.e. seconds) so an in-flight approve is NEVER reclaimed.
+    DECISION_COSIGNING_RECLAIM_AFTER_SECONDS: int = Field(default=900, gt=0)
+    # Max orphan candidates reclaimed per tick (bounds per-tick memory + work).
+    # Any overflow is picked up on the next tick.
+    DECISION_RECLAIM_BATCH_LIMIT: int = Field(default=100, gt=0)
+
     # --- Live pre-flight harness / Story 7.6 ---------------------------------
 
     # Directory the read-only pre-flight payload-shape harness writes redacted

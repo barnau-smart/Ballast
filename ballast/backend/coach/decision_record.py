@@ -508,6 +508,7 @@ async def reclaim_orphaned_cosigning(
     session: AsyncSession,
     older_than: datetime.timedelta,
     now: datetime.datetime | None = None,
+    limit: int | None = None,
 ) -> int:
     """Forward-recover crash-orphaned ``cosigning`` rows older than a window (7.2).
 
@@ -539,11 +540,24 @@ async def reclaim_orphaned_cosigning(
     Idempotent: a re-run finds no ``cosigning`` rows matching (the prior run moved
     them to ``cosigned``) → a full no-op. A negative ``older_than`` is refused
     (it would pull the cutoff into the FUTURE and reclaim just-claimed in-flight
-    rows). ``now`` is injectable for tests. Commits once at the end; returns the
-    count this call actually transitioned (rowcount == 1 each). SYSTEM-scope: the
-    reclaimer spans all owners by construction (a background recovery has no single
-    user), so it queries + writes without a per-user cage — but stays the sole
-    writer of the model (AD-6), every ``update(DecisionRecord)`` living here.
+    rows). ``now`` is injectable for tests. Returns the count this call actually
+    transitioned (rowcount == 1 each). SYSTEM-scope: the reclaimer spans all owners
+    by construction (a background recovery has no single user), so it queries +
+    writes without a per-user cage — but stays the sole writer of the model (AD-6),
+    every ``update(DecisionRecord)`` living here.
+
+    BOUNDED + ISOLATED for unattended scheduling (2026-08-06 hardening):
+
+    - ``limit`` caps how many candidate orphans one call loads and processes, so a
+      backlog can never load the whole table into memory. Any overflow is left for
+      the next tick. ``None`` means unbounded (the original behavior). A
+      non-positive ``limit`` is refused.
+    - Each reclamation is COMMITTED PER ROW inside its own ``try``/``except``. One
+      poison row (e.g. a DB error on its UPDATE/commit) is rolled back and skipped
+      — it never discards the reclamations already committed earlier in the batch
+      nor aborts the remaining candidates (it is simply retried next tick). This
+      replaces the earlier single end-commit, where one failure lost the whole
+      batch.
     """
     if older_than < datetime.timedelta(0):
         raise ValueError(
@@ -551,6 +565,8 @@ async def reclaim_orphaned_cosigning(
             f"(got {older_than!r}); a negative window would reclaim recent, "
             "legitimately in-flight cosigning rows."
         )
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive when provided (got {limit!r}).")
     effective_now = now or datetime.datetime.now(datetime.timezone.utc)
     if effective_now.tzinfo is None:
         # Defensive: an injected naive ``now`` would yield a naive cutoff compared
@@ -561,36 +577,57 @@ async def reclaim_orphaned_cosigning(
 
     # Enumerate candidate orphans (SYSTEM scope spans all owners). A NULL
     # ``cosigning_at`` is excluded by the ``<`` comparison — never reclaimed.
-    result = await session.execute(
-        select(DecisionRecord).where(
-            DecisionRecord.status == "cosigning",
-            DecisionRecord.cosigning_at.isnot(None),
-            DecisionRecord.cosigning_at < cutoff,
-        )
+    # ``limit`` bounds per-call memory/work; overflow waits for the next tick.
+    stmt = select(DecisionRecord).where(
+        DecisionRecord.status == "cosigning",
+        DecisionRecord.cosigning_at.isnot(None),
+        DecisionRecord.cosigning_at < cutoff,
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
     candidates = list(result.scalars().all())
 
+    # Materialize each row's recovery data (id + recovery snapshot) BEFORE the
+    # per-row commits below. Snapshot build is pure (no I/O) over already-loaded
+    # columns; doing it up front keeps the loop from touching ORM objects that a
+    # commit could expire (safe here — the app session maker sets
+    # ``expire_on_commit=False`` — but robust regardless of the caller's session).
+    planned = [(record.id, _recovery_cosign_snapshot(record)) for record in candidates]
+
     reclaimed = 0
-    for record in candidates:
-        # Rowcount-gated cosigning→cosigned: a racing live cosign wins (this
-        # no-ops). Build the recovery snapshot BEFORE the UPDATE so it reflects the
-        # persisted ``broker_ref``/proposed intent.
-        won = await conditional_claim(
-            session,
-            update(DecisionRecord)
-            .where(
-                DecisionRecord.id == record.id,
-                DecisionRecord.status == "cosigning",
+    for record_id, recovery_snapshot in planned:
+        # Rowcount-gated cosigning→cosigned committed PER ROW: a racing live cosign
+        # wins the gate (this no-ops); a per-row failure is isolated so it can
+        # neither undo the already-committed reclamations nor abort the batch.
+        try:
+            won = await conditional_claim(
+                session,
+                update(DecisionRecord)
+                .where(
+                    DecisionRecord.id == record_id,
+                    DecisionRecord.status == "cosigning",
+                )
+                .values(
+                    status="cosigned",
+                    co_signed_at=effective_now,
+                    cosign_snapshot=recovery_snapshot,
+                ),
             )
-            .values(
-                status="cosigned",
-                co_signed_at=effective_now,
-                cosign_snapshot=_recovery_cosign_snapshot(record),
-            ),
-        )
-        if won:
-            reclaimed += 1
-    await session.commit()
+            if won:
+                await session.commit()
+                reclaimed += 1
+            else:
+                # Lost the rowcount gate to a racing live cosign — discard the
+                # no-op transaction so the next row starts clean.
+                await session.rollback()
+        except Exception:
+            logger.exception(
+                "reclaim_orphaned_cosigning: failed to reclaim record id=%s; "
+                "rolled back this row and continuing (retried next run).",
+                record_id,
+            )
+            await session.rollback()
     return reclaimed
 
 
