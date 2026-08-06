@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; added pre-unattended-prod hardening item. 7.7 real-money gate remains the sole open story.
+# last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; pre-unattended-prod hardening DONE (broker_ref guard + LLM locks + decisions-maintenance scheduler, commits 4989348 + c128cf8). 7.7 real-money gate remains the sole open story.
 # project: ai_practice_project
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; added pre-unattended-prod hardening item. 7.7 real-money gate remains the sole open story.
+last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; pre-unattended-prod hardening DONE (broker_ref guard + LLM locks + decisions-maintenance scheduler, commits 4989348 + c128cf8). 7.7 real-money gate remains the sole open story.
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -186,9 +186,9 @@ action_items:
     owner: "MasterB"
     status: done  # go-live subset swept 2026-08-06 (ledger now 71 entries; automated /bmad-loop-sweep is blocked: 70/71 are legacy pre-DW-format bullets that need --migrate first). Money-path subset (~24 entries) verified against code via 5 parallel agents: the atomicity/schema/reconcile/LLM/broker-seams clusters are RESOLVED by Stories 6.x/7.x/8.2. NINE residuals remain; NONE block a single attended 7.7 exercise (they need concurrency, multi-account, re-link edge cases, or unattended operation). Pre-unattended-prod residuals folded to the new hardening item below. FULL 71-entry triage + legacy --migrate still deferred (non-money-path bullets not verified).
   - epic: 6
-    action: "Pre-UNATTENDED-PROD hardening (NOT a blocker for the single attended 7.7 exercise; from the 2026-08-06 go-live sweep). PROGRESS 2026-08-06 (commit 4989348): (2) broker_ref length guard DONE — _fit_broker_ref clamps to column width at both write sites, full ref preserved in snapshot (coach/decision_record.py); (3) LLM singleton thread-safety DONE — double-checked locks on the factory cache + lazy self._client build (llm/factory.py, llm/anthropic_adapter.py). REMAINING: (1) HIGHEST — wire reclaim_orphaned_cosigning + prune_stale_proposed_decisions to a scheduler/cron/startup-task; reclaimer has NO production caller (coach/decision_record.py:471), so an orphaned 'cosigning' row carrying a live order is never auto-recovered unattended; also give the reclaimer LIMIT/paging + per-row error isolation (single end-commit today, one poison row aborts the batch). NEEDS A MECHANISM DECISION (in-process asyncio task in the FastAPI lifespan vs external cron/management-command vs APScheduler) + a cadence — not a one-liner. Lower/cosmetic (optional): raw-500 on unlinked/missing-token/missing-hash during dep-resolution -> calm 409 (factory.py:110); re-link projection clear gated on detected account change (api/brokerage.py:247); reconcile response built from locked/effective outcome not raw result (api/coach.py:1021)."
+    action: "Pre-UNATTENDED-PROD hardening (NOT a blocker for the single attended 7.7 exercise; from the 2026-08-06 go-live sweep). The 3 substantive items are DONE: (2) broker_ref length guard (commit 4989348) — _fit_broker_ref clamps to column width at both write sites, full ref preserved in snapshot (coach/decision_record.py); (3) LLM singleton thread-safety (commit 4989348) — double-checked locks on the factory cache + lazy self._client build (llm/factory.py, llm/anthropic_adapter.py); (1) HIGHEST — decisions-maintenance scheduler wired (commit c128cf8): in-process asyncio lifespan task (coach/maintenance.py) reclaims orphaned 'cosigning' rows + prunes stale 'proposed' rows on a 600s cadence (900s reclaim window); reclaimer gained LIMIT/paging + per-row commit/error-isolation; ON by default, forced OFF in tests; 623 tests pass. Only OPTIONAL lower/cosmetic residuals left (defer unless they bite): raw-500 on unlinked/missing-token/missing-hash during dep-resolution -> calm 409 (factory.py:110); re-link projection clear gated on detected account change (api/brokerage.py:247); reconcile response built from locked/effective outcome not raw result (api/coach.py:1021)."
     owner: "MasterB"
-    status: open
+    status: done  # 3 substantive hardening items landed 2026-08-06 (commits 4989348 + c128cf8); only optional cosmetic residuals remain (tracked in the action text). NOT a 7.7-exercise blocker.
   - epic: 3
     action: "Fold the two Story 3.6 deferred items (live-path count pluralization 'in 1 similar drops'; HeadlineContextualizer rapid-chip stale-response race needing a per-request sequence token) into the existing Epic 6 deferred-work sweep — no separate work stream."
     owner: "MasterB"
