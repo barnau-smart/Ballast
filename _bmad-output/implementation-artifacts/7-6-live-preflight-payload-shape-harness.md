@@ -94,11 +94,14 @@ Seams 1–5 are the drift targets for this story. Seam 6 is declared, not confir
 ### Human runbook (the live run — NOT a loop task)
 
 Once creds exist (Schwab dev app approved + a *linked, not necessarily funded* account + a paid `ANTHROPIC_API_KEY`):
-1. Set `BROKER_ADAPTER=schwab`, `LLM_ADAPTER=anthropic`, the `SCHWAB_*` + `TOKEN_ENCRYPTION_KEY` + `ANTHROPIC_API_KEY` vars, and `PREFLIGHT_CAPTURE_DIR=<a gitignored dir>`. Link the account via the OAuth flow.
-2. Run the harness (`python -m preflight.run` / documented entrypoint). It drives the 5 read seams and writes the drift report + redacted captures.
-3. Read the report. If DRIFT: fix the named mapping(s) — **that fix is loop-runnable** as a follow-up, since you now have the real (redacted) shape. Re-run until PASS.
-4. Only then proceed to Story 7.7 (the one real order), which confirms the remaining order-status/fill seam.
+1. Set `BROKER_ADAPTER=schwab`, `LLM_ADAPTER=anthropic`, the `SCHWAB_CLIENT_ID/SECRET/CALLBACK_URL` + `TOKEN_ENCRYPTION_KEY` + `ANTHROPIC_API_KEY` vars, `DATABASE_URL` (the SAME DB used below), and `PREFLIGHT_CAPTURE_DIR=<a gitignored dir>`.
+2. **Link the account once** via the app's OAuth "Connect Schwab" flow so an encrypted token is stored in `brokerage_token`. The pre-flight expects **exactly one linked account** (a dedicated operator user); it refuses on zero or multiple.
+3. Run the harness: `cd ballast/backend && python -m preflight.run`. It binds that single linked operator's decrypted token (`bind_operator_token`, added 2026-08-06 — the CLI has no request scope), drives the 5 read seams, and writes `preflight-report.txt` + redacted `<seam>.json` captures to `PREFLIGHT_CAPTURE_DIR`. Exit 0 = PASS, 1 = DRIFT/INCOMPLETE, 2 = misconfig (dir unset / no bindable token).
+4. Read the report. If DRIFT: fix the named mapping(s) — **that fix is loop-runnable** as a follow-up, since you now have the real (redacted) shape. Re-run until PASS.
+5. Only then proceed to Story 7.7 (the one real order), which confirms the remaining order-status/fill seam.
 - Never commit the capture dir or any env value. The captures are redacted but still local-only.
+
+> **Follow-up landed 2026-08-06 (commit e0b50c7):** the CLI originally built the broker via the bare `get_broker()` (no token), so the four Schwab read seams would have failed "no token bound" and only the LLM seam would confirm live. `bind_operator_token` now binds the single linked operator's token in `main()`; the token/account/balance/quote seams drive for real. (Caveat unchanged: seam 1 checks Ballast's *reconstructed* token dict, not Schwab's raw OAuth payload — that shape is only seen at link time.)
 
 ### Project Structure Notes
 
