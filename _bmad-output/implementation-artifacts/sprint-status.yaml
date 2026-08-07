@@ -222,6 +222,6 @@ action_items:
     owner: "MasterB"
     status: done  # DONE 2026-08-07 (commit d8948e9): test_schwab_py_token_wrapper_contract_canary pins our wrap/unwrap against schwab-py's REAL TokenMetadata (accepts our wrapper, still rejects bare, wrap round-trips through our unwrap); SDK via importlib per AD-8. Full suite 635 passed."
   - epic: 7
-    action: "Verify the decisions-maintenance scheduler (reclaimer + pruner) actually runs unattended on the real deployment — it is built, committed (c128cf8), and ON by default, but has only been exercised in tests/dev; confirm in the live environment."
+    action: "Verify the decisions-maintenance scheduler (reclaimer + pruner) actually runs unattended on the real deployment — it is built, committed (c128cf8), and ON by default, but has only been exercised in tests/dev; confirm in the live environment. CHECKLIST WRITTEN 2026-08-07: docs/deploy/maintenance-scheduler-verification.md (grep for decisions_maintenance_scheduler_enabled + maintenance_scheduler_started at boot, then a maintenance_tick line ~10min later; fast path = set INTERVAL_SECONDS=60 then revert). Stays OPEN until run against a real deploy — cannot be verified without a deployment environment."
     owner: "MasterB"
     status: open
