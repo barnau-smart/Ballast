@@ -216,7 +216,7 @@ action_items:
   - epic: 7
     action: "Test-isolation guard: the full suite shares the dev Postgres and DELETEs brokerage_token for isolation, which WIPES a live brokerage link. Add a separate DB/schema for live links, or a refuse-if-live-token guard, so the suite can never destroy a real link (surfaced during the 2026-08-07 go-live: re-link needed after each suite run)."
     owner: "MasterB"
-    status: open
+    status: done  # DONE 2026-08-07 (commit e479bad): session-autouse guard (tests/brokerage_db_guard.py + conftest _guard_live_brokerage_link) refuses the run if brokerage_token has any pre-existing row at session start; override BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1 for a disposable DB. Verified: aborts with a real token present (no wipe); full suite 634 passed clean.
   - epic: 7
     action: "schwab-py token-wrapper contract canary: a test that fails loudly if a future schwab-py upgrade changes the metadata-wrapped token shape again (mirrors the LLM ValueError canary). The 2026-08-07 go-live hit this: 1.5.x wraps the token {creation_timestamp, token:{...}} on both read + write; we assumed bare both ways (fixed 424864a)."
     owner: "MasterB"
