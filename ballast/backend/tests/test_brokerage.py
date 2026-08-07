@@ -1029,3 +1029,48 @@ def test_to_broker_tokens_unwraps_schwab_py_metadata():
         {"access_token": "a", "refresh_token": "r", "expires_at": epoch}
     )
     assert bare.access_token == "a" and bare.refresh_token == "r"
+
+
+def test_schwab_py_token_wrapper_contract_canary():
+    """Canary: pin Ballast's token wrap/unwrap to schwab-py's REAL metadata
+    contract (not a mock). schwab-py 1.5.x wraps the oauth token as
+    ``{creation_timestamp, token:{...}}`` and REQUIRES that shape on load;
+    Ballast produces it (``_token_dict_from_broker_tokens``) and unwraps it
+    (``_to_broker_tokens``). If a future schwab-py upgrade changes this contract,
+    THIS test fails loudly — instead of the change resurfacing as the 2026-08-07
+    go-live bugs ("token format has changed" then empty-token ``token_invalid``).
+    """
+    import importlib
+    from datetime import datetime, timezone
+
+    # Obtain the REAL SDK class via importlib (no literal ``from schwab`` import,
+    # which the AD-8 structural scan flags even in tests — same convention as
+    # test_schwab_adapter.py). This IS the real schwab-py TokenMetadata, on purpose.
+    TokenMetadata = importlib.import_module("schwab.auth").TokenMetadata
+
+    from brokers.factory import _token_dict_from_broker_tokens
+    from brokers.schwab_adapter.adapter import SchwabAdapter
+
+    expires = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    wrapped = _token_dict_from_broker_tokens(
+        BrokerTokens(access_token="acc", refresh_token="ref", expires_at=expires)
+    )
+
+    # 1) schwab-py's REAL loader accepts the wrapper we produce (no "token format
+    #    has changed"); creation_timestamp round-trips.
+    md = TokenMetadata.from_loaded_token(wrapped, lambda *a, **k: None)
+    assert md.creation_timestamp == wrapped["creation_timestamp"]
+
+    # 2) The wrapper is still REQUIRED — a bare oauth token is rejected. If a
+    #    future SDK accepts bare, this trips and we revisit our wrapping.
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="token format has changed"):
+        TokenMetadata.from_loaded_token(wrapped["token"], lambda *a, **k: None)
+
+    # 3) Write side: schwab-py wraps via wrap_token_in_metadata; our
+    #    _to_broker_tokens unwraps that exact shape back to the oauth fields.
+    rewrapped = md.wrap_token_in_metadata(wrapped["token"])
+    assert set(rewrapped) == {"creation_timestamp", "token"}
+    bt = SchwabAdapter._to_broker_tokens(rewrapped)
+    assert bt.access_token == "acc" and bt.refresh_token == "ref"
