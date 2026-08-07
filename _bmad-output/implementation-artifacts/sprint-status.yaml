@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; pre-unattended-prod hardening DONE (broker_ref guard + LLM locks + decisions-maintenance scheduler, commits 4989348 + c128cf8). 7.7 real-money gate remains the sole open story.
+# last_updated: 2026-08-07  # 7.6 pre-flight LIVE-VERIFIED (real Schwab+Anthropic, all 6 seams PASS, zero orders); fixed 2 schwab-py 1.5.x token-wrapper bugs (commit 424864a). 7.7 gated real-money exercise is now the SOLE remaining story (all read seams confirmed; only order-status/fill unconfirmed).
 # project: ai_practice_project
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-06  # go-live sweep: closed Epic 6 action items #1 (DB migration/7.1), #2 (atomic-claim/7.2), #4 (partial-fill/8.2) + the ledger sweep; pre-unattended-prod hardening DONE (broker_ref guard + LLM locks + decisions-maintenance scheduler, commits 4989348 + c128cf8). 7.7 real-money gate remains the sole open story.
+last_updated: 2026-08-07  # 7.6 pre-flight LIVE-VERIFIED (real Schwab+Anthropic, all 6 seams PASS, zero orders); fixed 2 schwab-py 1.5.x token-wrapper bugs (commit 424864a). 7.7 gated real-money exercise is now the SOLE remaining story (all read seams confirmed; only order-status/fill unconfirmed).
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -121,7 +121,7 @@ development_status:
   7-3-calm-envelopes-provider-match-live-broker: done
   7-4-llm-live-path-latency-robustness: done
   7-5-live-read-robustness-multi-account-safety: done
-  7-6-live-preflight-payload-shape-harness: done
+  7-6-live-preflight-payload-shape-harness: done  # LIVE-VERIFIED 2026-08-07: ran against real Schwab + Anthropic, OVERALL PASS on all 6 seams (token/account_numbers/portfolio/quote/llm_message/llm_output), zero orders. Caught + fixed 2 real order-blocking bugs (commit 424864a): schwab-py 1.5.x metadata-wraps the token on BOTH read (client_from_access_functions) and write (exchange capture) sides; our code assumed the bare format both ways -> "token format has changed" then empty-token/token_invalid. Canonical Schwab callback = https://127.0.0.1/callback (must match .env SCHWAB_CALLBACK_URL exactly). OP NOTE: the test suite shares the dev DB and wipes brokerage_token (isolation DELETE) -> do NOT run the suite against the DB holding a live link; re-link right before 7.7.
   7-7-gated-live-exercise-real-money: backlog
   epic-7-retrospective: optional
 
