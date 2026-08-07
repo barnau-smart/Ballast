@@ -70,6 +70,10 @@ os.environ["LLM_ADAPTER"] = "fake"
 # doing DB writes would race per-test fixtures/teardown. Tests that need it
 # exercise ``coach.maintenance`` directly (test_maintenance_scheduler.py).
 os.environ["DECISION_MAINTENANCE_ENABLED"] = "false"
+# Same for the market-data ingest scheduler — it's work-first, so it would fire
+# an ingest on every test app startup (hitting the adapter + writing market_daily).
+# Exercised directly in test_marketdata_scheduler.py.
+os.environ["MARKETDATA_INGEST_ENABLED"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient

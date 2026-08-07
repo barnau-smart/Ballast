@@ -73,6 +73,30 @@ class Settings(BaseSettings):
     # (it never crashes at import, and the fake adapter needs no creds).
     TIINGO_API_KEY: str = ""
 
+    # --- Scheduled market-data ingest (2026-08-07) ---------------------------
+    # An in-process background task (marketdata/scheduler.py) that keeps
+    # market_daily fresh: on each tick it re-ingests a short recent window
+    # (lookback) for the configured symbols via the configured adapter — idempotent
+    # upserts, so it catches the latest EOD bars + late corrections. A full
+    # historical backfill remains the manual CLI (`python -m marketdata.ingest`);
+    # this only keeps the tail current. WORK-FIRST (refreshes on boot, then each
+    # interval) so a long daily interval + frequent restarts can't skip it.
+    #
+    # Master switch. ON by default; tests force it OFF (exercised directly).
+    MARKETDATA_INGEST_ENABLED: bool = True
+    # Seconds between refreshes (default daily). EOD data updates ~once per
+    # trading day, so a daily cadence is plenty.
+    MARKETDATA_INGEST_INTERVAL_SECONDS: int = Field(default=86_400, gt=0)
+    # How many days back each refresh re-fetches (catches recent bars + late
+    # vendor corrections; upserts are idempotent so overlap is harmless).
+    MARKETDATA_INGEST_LOOKBACK_DAYS: int = Field(default=7, gt=0)
+    # Comma-separated symbols to keep fresh — defaults to the index-core ETF
+    # universe (the funds the coach actually serves). A per-symbol fetch failure
+    # is logged and never aborts the others.
+    MARKETDATA_INGEST_SYMBOLS: str = (
+        "VTI,ITOT,SCHB,VOO,IVV,SPY,VXUS,IXUS,VEU,VT,BND,AGG,BNDX,SCHZ"
+    )
+
     # --- LLM / Story 4.1 ------------------------------------------------------
 
     # Which LLM gateway adapter the factory returns. "fake" for dev/test (no

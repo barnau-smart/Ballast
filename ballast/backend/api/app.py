@@ -29,6 +29,7 @@ from api.logging_config import configure_logging
 from api.schemas import UserCreate, UserRead
 from api.users import auth_backend, fastapi_users
 from coach.maintenance import MaintenanceScheduler
+from marketdata.scheduler import MarketDataIngestScheduler
 from db.connection import check_db
 from db.migrations import run_startup_migrations
 from db.models import User
@@ -85,19 +86,35 @@ def create_app() -> FastAPI:
         # forever) and prunes stale ``proposed`` rows. ON by default; the whole
         # test suite runs with it OFF (exercised directly instead). Started after
         # the schema is provisioned; stopped cleanly on shutdown.
-        scheduler: MaintenanceScheduler | None = None
+        # Background schedulers (started after schema is provisioned; each ON by
+        # default, both forced OFF for the test suite). Collected so shutdown
+        # stops every one that started.
+        schedulers: list[object] = []
         if settings.DECISION_MAINTENANCE_ENABLED:
-            scheduler = MaintenanceScheduler.from_settings(settings)
-            scheduler.start()
+            maintenance = MaintenanceScheduler.from_settings(settings)
+            maintenance.start()
+            schedulers.append(maintenance)
             logger.info(
                 "decisions_maintenance_scheduler_enabled interval_s=%d",
                 settings.DECISION_MAINTENANCE_INTERVAL_SECONDS,
             )
+        # In-process daily market-data ingest (2026-08-07): keeps market_daily
+        # fresh (recent-window re-ingest via the configured adapter). Work-first,
+        # so real data refreshes on boot too. Full backfill stays a manual CLI.
+        if settings.MARKETDATA_INGEST_ENABLED:
+            marketdata_ingest = MarketDataIngestScheduler.from_settings(settings)
+            marketdata_ingest.start()
+            schedulers.append(marketdata_ingest)
+            logger.info(
+                "marketdata_ingest_scheduler_enabled interval_s=%d adapter=%s",
+                settings.MARKETDATA_INGEST_INTERVAL_SECONDS,
+                settings.MARKETDATA_ADAPTER,
+            )
         try:
             yield
         finally:
-            if scheduler is not None:
-                await scheduler.stop()
+            for sched in schedulers:
+                await sched.stop()
 
     app = FastAPI(title="Ballast API", version="0.1.0", lifespan=lifespan)
 
