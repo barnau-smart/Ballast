@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-07  # GO LIVE ACHIEVED. 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via the full propose->approve->place->reconcile path; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified earlier same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a).
+# last_updated: 2026-08-07  # GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
 # project: ai_practice_project
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-07  # GO LIVE ACHIEVED. 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via the full propose->approve->place->reconcile path; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified earlier same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a).
+last_updated: 2026-08-07  # GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -123,7 +123,7 @@ development_status:
   7-5-live-read-robustness-multi-account-safety: done
   7-6-live-preflight-payload-shape-harness: done  # LIVE-VERIFIED 2026-08-07: ran against real Schwab + Anthropic, OVERALL PASS on all 6 seams (token/account_numbers/portfolio/quote/llm_message/llm_output), zero orders. Caught + fixed 2 real order-blocking bugs (commit 424864a): schwab-py 1.5.x metadata-wraps the token on BOTH read (client_from_access_functions) and write (exchange capture) sides; our code assumed the bare format both ways -> "token format has changed" then empty-token/token_invalid. Canonical Schwab callback = https://127.0.0.1/callback (must match .env SCHWAB_CALLBACK_URL exactly). OP NOTE: the test suite shares the dev DB and wipes brokerage_token (isolation DELETE) -> do NOT run the suite against the DB holding a live link; re-link right before 7.7.
   7-7-gated-live-exercise-real-money: done  # LIVE REAL-MONEY EXERCISE 2026-08-07: placed 1 real Schwab order via propose->approve->co-sign->place->reconcile. SCHB 1-share MARKET buy, filled @ $29.895, broker_ref 1007515746032. Seam 6 (_map_order: status/filledQuantity/avgFillPrice) confirmed on BOTH the /approve place-response AND the durable /decisions/{id}/reconcile cross-request path (needs_reconfirmation:false). Operator holds 1 share SCHB (real position; keep or sell in Schwab app). Full money path (real LLM + real Schwab place/read/reconcile) proven end-to-end.
-  epic-7-retrospective: optional
+  epic-7-retrospective: done  # completed 2026-08-07 (epic-7-retro-2026-08-07.md)
 
   # Epic 8: Expand the Ordering Interface (marketable limit -> resting lifecycle -> UI)
   # New pre-go-live feature (decided 2026-08-04); sequenced BEFORE the 7.7 real-money gate.
@@ -211,5 +211,17 @@ action_items:
     status: open
   - epic: 8
     action: "Add an independent-verification step (or policy note) to the loop for test-performance/async/env-sensitive stories, so a false 'done' cannot slip through (per 8.5 double false-pass)."
+    owner: "MasterB"
+    status: open
+  - epic: 7
+    action: "Test-isolation guard: the full suite shares the dev Postgres and DELETEs brokerage_token for isolation, which WIPES a live brokerage link. Add a separate DB/schema for live links, or a refuse-if-live-token guard, so the suite can never destroy a real link (surfaced during the 2026-08-07 go-live: re-link needed after each suite run)."
+    owner: "MasterB"
+    status: open
+  - epic: 7
+    action: "schwab-py token-wrapper contract canary: a test that fails loudly if a future schwab-py upgrade changes the metadata-wrapped token shape again (mirrors the LLM ValueError canary). The 2026-08-07 go-live hit this: 1.5.x wraps the token {creation_timestamp, token:{...}} on both read + write; we assumed bare both ways (fixed 424864a)."
+    owner: "MasterB"
+    status: open
+  - epic: 7
+    action: "Verify the decisions-maintenance scheduler (reclaimer + pruner) actually runs unattended on the real deployment — it is built, committed (c128cf8), and ON by default, but has only been exercised in tests/dev; confirm in the live environment."
     owner: "MasterB"
     status: open
