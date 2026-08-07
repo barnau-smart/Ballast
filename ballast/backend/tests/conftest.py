@@ -177,7 +177,37 @@ def _fast_password_hasher(request):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _schema_once():
+def _guard_live_brokerage_link():
+    """Refuse to run if the target DB already holds a brokerage link (safety).
+
+    Many tests DELETE ``brokerage_token`` for isolation; against a shared dev DB
+    that holds a real Schwab link those deletes WIPE it (this bit us repeatedly
+    during the 2026-08-07 go-live). A dedicated test DB starts empty, so a
+    non-zero count at session start means a pre-existing link to protect —
+    abort with a clear message. ``BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1`` overrides
+    for a knowingly-disposable DB (CI / scratch). Runs before ``_schema_once`` so
+    a real link is never touched.
+    """
+    from tests.brokerage_db_guard import (
+        guard_message,
+        override_enabled,
+        preexisting_brokerage_token_count,
+    )
+
+    if not override_enabled():
+        try:
+            count = preexisting_brokerage_token_count()
+        except Exception:
+            # DB unreachable / not provisioned: don't false-block on infra — let
+            # the schema/connection fixtures surface the real error instead.
+            count = 0
+        if count:
+            pytest.exit(guard_message(count), returncode=2)
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema_once(_guard_live_brokerage_link):
     """Run create_all + startup migrations exactly ONCE for the whole session.
 
     Executed on its own dedicated event loop via ``asyncio.run`` (created and
