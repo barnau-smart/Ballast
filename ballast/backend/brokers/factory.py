@@ -62,23 +62,38 @@ def get_broker() -> BrokerPort:
     )
 
 
+# Schwab access tokens live 30 minutes. Ballast does not persist the token MINT
+# time, so ``creation_timestamp`` (below) is reconstructed as ``expires_at - TTL``.
+# It only feeds schwab-py's cosmetic ``token_age()`` re-auth nudge, which Ballast
+# supersedes with its own weekly re-auth (AD-11); authlib's actual access-token
+# refresh keys off the inner token's ``expires_at`` + ``refresh_token``, never this.
+_SCHWAB_ACCESS_TOKEN_TTL_SECONDS = 1800
+
+
 def _token_dict_from_broker_tokens(tokens) -> dict:
     """Build the schwab-py token envelope from :class:`~brokers.port.BrokerTokens`.
 
-    Only the fields Ballast persists are reconstructed; the exact live round-trip
-    is a documented go-live manual check (see the story's Design Notes). Never
-    logs token material.
+    schwab-py 1.5.x (``TokenMetadata.from_loaded_token``, verified 2026-08-07 go-live
+    pre-flight) requires the token accessor to return a METADATA-WRAPPED token —
+    ``{"creation_timestamp": <int>, "token": {<oauth token>}}`` — and rejects a bare
+    oauth token with "The token format has changed since this token was created."
+    So the reconstructed oauth token is wrapped accordingly. Only the fields Ballast
+    persists are reconstructed. Never logs token material.
     """
     expires_at = tokens.expires_at
     # Normalize to tz-aware UTC before the epoch conversion (a naive
     # ``.timestamp()`` would assume server-local time and skew the token expiry).
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at_epoch = int(expires_at.timestamp())
     return {
-        "access_token": tokens.access_token,
-        "refresh_token": tokens.refresh_token,
-        "token_type": "Bearer",
-        "expires_at": int(expires_at.timestamp()),
+        "creation_timestamp": expires_at_epoch - _SCHWAB_ACCESS_TOKEN_TTL_SECONDS,
+        "token": {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "token_type": "Bearer",
+            "expires_at": expires_at_epoch,
+        },
     }
 
 

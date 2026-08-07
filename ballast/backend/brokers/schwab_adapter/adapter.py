@@ -1067,8 +1067,21 @@ class SchwabAdapter(BrokerPort):
     @staticmethod
     def _to_broker_tokens(token: dict) -> BrokerTokens:
         """Normalise schwab-py's token dict into :class:`BrokerTokens`."""
-        # Passive pre-flight tap (Story 7.6): capture the RAW token dict's shape
-        # (redacted) only when capture is enabled; a true no-op when OFF.
+        # schwab-py 1.5.x wraps the oauth token in metadata —
+        # ``{"creation_timestamp": <int>, "token": {<oauth token>}}`` — on BOTH the
+        # write side (the exchange-capture callback receives the wrapped form) and
+        # the read side. Unwrap to the raw oauth token first, or the field reads
+        # below silently yield EMPTY access/refresh tokens and Schwab rejects the
+        # call with ``token_invalid`` (go-live pre-flight, 2026-08-07). A bare
+        # oauth token (no wrapper) passes through unchanged.
+        if (
+            isinstance(token, dict)
+            and "creation_timestamp" in token
+            and isinstance(token.get("token"), dict)
+        ):
+            token = token["token"]
+        # Passive pre-flight tap (Story 7.6): capture the RAW oauth token dict's
+        # shape (redacted) only when capture is enabled; a true no-op when OFF.
         SchwabAdapter._preflight_capture("token", token)
         access = token.get("access_token", "")
         refresh = token.get("refresh_token", "")

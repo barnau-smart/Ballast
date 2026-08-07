@@ -639,10 +639,14 @@ async def test_get_execution_broker_binds_decrypted_schwab_token(monkeypatch):
 
     assert isinstance(bound, SchwabAdapter)
     token = bound._token_read_func()
-    assert token["access_token"] == "plain-enc-access"
-    assert token["refresh_token"] == "plain-enc-refresh"
-    assert token["token_type"] == "Bearer"
-    assert token["expires_at"] == int(row.expires_at.timestamp())
+    # schwab-py 1.5.x metadata-wrapped envelope: {creation_timestamp, token:{...}}.
+    assert set(token) == {"creation_timestamp", "token"}
+    inner = token["token"]
+    assert inner["access_token"] == "plain-enc-access"
+    assert inner["refresh_token"] == "plain-enc-refresh"
+    assert inner["token_type"] == "Bearer"
+    assert inner["expires_at"] == int(row.expires_at.timestamp())
+    assert isinstance(token["creation_timestamp"], int)
 
 
 # --- Story 7.3: undecryptable-token → calm 409 reconnect at the shared seam ----
@@ -922,10 +926,14 @@ async def test_bind_operator_token_single_owner_binds_decrypted_token(
     # DECRYPTED schwab-py token envelope (never ciphertext, never logged).
     assert isinstance(bound, SchwabAdapter)
     token = bound._token_read_func()
-    assert token["access_token"] == "live-access"
-    assert token["refresh_token"] == "live-refresh"
-    assert token["token_type"] == "Bearer"
-    assert isinstance(token["expires_at"], int)
+    # schwab-py 1.5.x metadata-wrapped envelope.
+    assert set(token) == {"creation_timestamp", "token"}
+    inner = token["token"]
+    assert inner["access_token"] == "live-access"
+    assert inner["refresh_token"] == "live-refresh"
+    assert inner["token_type"] == "Bearer"
+    assert isinstance(inner["expires_at"], int)
+    assert isinstance(token["creation_timestamp"], int)
 
 
 @pytest.mark.asyncio
@@ -958,3 +966,66 @@ async def test_bind_operator_token_undecryptable_raises(two_owner_ids, _schwab_c
     async with async_session_maker() as session:
         with pytest.raises(OperatorTokenBindError, match="could not be decrypted"):
             await bind_operator_token(SchwabAdapter(), session)
+
+
+def test_token_dict_is_schwab_py_metadata_wrapped():
+    """Regression: the reconstructed token must be schwab-py's metadata-wrapped
+    shape ``{creation_timestamp, token:{...}}`` (Story 7.6 go-live pre-flight
+    2026-08-07 caught schwab-py 1.5.x rejecting a bare token with "The token
+    format has changed"). A bare oauth token breaks the live trading-client build.
+    """
+    from datetime import datetime, timezone
+
+    from brokers.factory import (
+        _SCHWAB_ACCESS_TOKEN_TTL_SECONDS,
+        _token_dict_from_broker_tokens,
+    )
+
+    expires_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    wrapped = _token_dict_from_broker_tokens(
+        BrokerTokens(access_token="acc", refresh_token="ref", expires_at=expires_at)
+    )
+    # Top level is the metadata wrapper schwab-py's TokenMetadata.from_loaded_token
+    # requires — NOT a bare oauth token.
+    assert set(wrapped) == {"creation_timestamp", "token"}
+    epoch = int(expires_at.timestamp())
+    # Mint time reconstructed as expiry minus the access-token TTL.
+    assert wrapped["creation_timestamp"] == epoch - _SCHWAB_ACCESS_TOKEN_TTL_SECONDS
+    inner = wrapped["token"]
+    assert inner == {
+        "access_token": "acc",
+        "refresh_token": "ref",
+        "token_type": "Bearer",
+        "expires_at": epoch,
+    }
+
+
+def test_to_broker_tokens_unwraps_schwab_py_metadata():
+    """schwab-py 1.5.x hands ``_to_broker_tokens`` a metadata-WRAPPED token
+    ({creation_timestamp, token:{...}}) on the exchange-capture path; it must
+    unwrap, else access/refresh come back EMPTY and Schwab rejects the call as
+    ``token_invalid`` (go-live pre-flight, 2026-08-07). A bare token is unchanged.
+    """
+    from datetime import datetime, timezone
+
+    from brokers.schwab_adapter.adapter import SchwabAdapter
+
+    epoch = 1_900_000_000
+    wrapped = {
+        "creation_timestamp": epoch - 1800,
+        "token": {
+            "access_token": "acc",
+            "refresh_token": "ref",
+            "expires_at": epoch,
+        },
+    }
+    t = SchwabAdapter._to_broker_tokens(wrapped)
+    assert t.access_token == "acc"
+    assert t.refresh_token == "ref"
+    assert t.expires_at == datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+    # A bare oauth token (no wrapper) still maps directly.
+    bare = SchwabAdapter._to_broker_tokens(
+        {"access_token": "a", "refresh_token": "r", "expires_at": epoch}
+    )
+    assert bare.access_token == "a" and bare.refresh_token == "r"
