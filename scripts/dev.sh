@@ -3,12 +3,15 @@
 # scripts/dev.sh — run Ballast locally: Postgres + backend (:8000) + frontend (:5173).
 #
 # Runs fully offline by default (all adapters default to fakes — no credentials).
-# SAFETY: this script forces BROKER_ADAPTER=fake unless you override it, so a
-# casual local run can never place a real trade. Real integrations are opt-in:
+# SAFETY: this is a LOCAL PLAYGROUND. It ALWAYS runs the fake broker (no real
+# money) — a stray `export BROKER_ADAPTER=schwab` in your shell will NOT arm real
+# trades here. Real trading is opt-in ONLY via an explicit BALLAST_REAL_BROKER=1
+# (this footgun bit us on 2026-08-10: a leftover export silently ran the "test"
+# app in real-money mode).
 #
-#   ./scripts/dev.sh                         # all fakes (safe, offline)
-#   LLM_ADAPTER=anthropic ./scripts/dev.sh   # real AI coaching (needs ANTHROPIC_API_KEY in .env), still no money
-#   BROKER_ADAPTER=schwab ./scripts/dev.sh   # REAL money path — only if you mean it
+#   ./scripts/dev.sh                          # fake broker (safe, offline)
+#   LLM_ADAPTER=anthropic ./scripts/dev.sh    # real AI coaching (needs ANTHROPIC_API_KEY), still no money
+#   BALLAST_REAL_BROKER=1 ./scripts/dev.sh    # ⚠️ REAL money path — /approve places REAL orders
 #
 # LLM_ADAPTER / MARKETDATA_ADAPTER are left to ballast/backend/.env unless you
 # override them on the command line. Ctrl-C stops the backend + frontend;
@@ -20,13 +23,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKEND="$ROOT/ballast/backend"
 FRONTEND="$ROOT/ballast/frontend"
 
-# --- Safety default: never start local dev in real-money broker mode unless the
-#     caller explicitly asks for it.
-: "${BROKER_ADAPTER:=fake}"
-export BROKER_ADAPTER
-
+# --- Broker safety: force the FAKE broker unless real trading is EXPLICITLY armed.
+#     A leftover/stray BROKER_ADAPTER in the shell must never silently arm real
+#     money in this playground — only BALLAST_REAL_BROKER=1 does.
 echo "▶ Ballast local dev"
-echo "    broker adapter : ${BROKER_ADAPTER}  ('fake' = no real money; override with BROKER_ADAPTER=schwab)"
+if [ "${BALLAST_REAL_BROKER:-}" = "1" ]; then
+  export BROKER_ADAPTER=schwab
+  echo "    ⚠️  ⚠️  ⚠️  REAL-MONEY BROKER MODE — BROKER_ADAPTER=schwab  ⚠️  ⚠️  ⚠️"
+  echo "        /approve will place REAL orders against your REAL Schwab account."
+  echo "        Press Ctrl-C NOW if you did not mean to do this."
+else
+  if [ "${BROKER_ADAPTER:-fake}" != "fake" ]; then
+    echo "    note: ignoring inherited BROKER_ADAPTER='${BROKER_ADAPTER}' — this script"
+    echo "          forces the fake broker for safety. For real trades, re-run with:"
+    echo "          BALLAST_REAL_BROKER=1 ./scripts/dev.sh"
+  fi
+  export BROKER_ADAPTER=fake
+  echo "    broker adapter : fake  (no real money — real trading needs BALLAST_REAL_BROKER=1)"
+fi
 echo "    llm adapter    : ${LLM_ADAPTER:-(from .env)}"
 echo
 

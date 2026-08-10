@@ -173,8 +173,12 @@ def create_app() -> FastAPI:
     async def unhandled_exception_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
-        # Log the type only; never echo internals or secrets to the client.
-        logger.error("unhandled_exception error_type=%s", type(exc).__name__)
+        # Log the type + full traceback SERVER-SIDE for debugging (never echoed to
+        # the client — the response body below stays generic). exc_info=True is safe
+        # here: it goes to the server log only.
+        logger.error(
+            "unhandled_exception error_type=%s", type(exc).__name__, exc_info=True
+        )
         return _error_response(
             500, "internal_error", "An unexpected error occurred."
         )
