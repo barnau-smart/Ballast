@@ -60,6 +60,23 @@
   margin: 0;
 }
 
+/* Story 9.2 — the calm protected-reserve line: reassurance, not alarm. Text
+ * color only (never red/pink); the reserve is the user's own protected money. */
+.ballast-missed-growth__reserve {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+/* Story 9.2 — the disclosed money-market yield note (muted, informational). */
+.ballast-missed-growth__yield {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
 .ballast-missed-growth__source {
   font-family: var(--ballast-font-terminal);
   font-size: var(--ballast-text-xs);

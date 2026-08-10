@@ -304,3 +304,7 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/9-1-cash-state-model-reserve-parked-funds.md`
   summary: The `cash_config.parked_symbols` JSON column is not `MutableList.as_mutable`-tracked.
   evidence: `ballast/backend/db/models.py` declares `parked_symbols: Mapped[list] = mapped_column(JSON, ...)`. Safe today because the only writer, `cash/config.py:set_parked_symbols`, always REASSIGNS the whole attribute (`config.parked_symbols = normalize_symbols(...)`), which triggers ORM dirty-tracking. Latent trap: any future code that mutates the list in place (`config.parked_symbols.append(...)`) will silently not persist. Fix when touched: wrap with `MutableList.as_mutable(JSON)` or add an explicit "reassign-only" comment.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-9-2-honest-yield-aware-missed-growth.md`
+  summary: The disclosed money-market APY percentage is formatted independently on the backend (Decimal.quantize(0.1)) and the frontend (Number.toLocaleString maxFrac:1), so a future non-round tuned DEFAULT_MONEY_MARKET_APY could render two different percentages in the statement vs. the yield note.
+  evidence: Both render "4%" while the constant is 0.04, but e.g. 0.0425 → backend "4.2" (half-even on 4.25) vs frontend "4.3"; pairs with the existing Epic 8 action item to tune placeholder constants against real data. Fix by having the backend emit a single pre-formatted apy percentage string the frontend renders verbatim.

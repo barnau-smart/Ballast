@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import datetime
 import logging
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -27,7 +26,12 @@ from brokers.factory import get_reading_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import PortfolioView, get_portfolio, reconcile_portfolio
 from brokers.schwab_adapter import SchwabAccountSelectionError
-from cash.config import get_config, normalize_symbols, resolve_reserve
+from cash.config import (
+    get_config,
+    normalize_symbols,
+    parked_market_value,
+    resolve_reserve,
+)
 from db.models import CashConfig
 from db.scope import Scope
 from db.session import get_async_session
@@ -124,10 +128,9 @@ def _to_out(view: PortfolioView, config: CashConfig | None) -> PortfolioOut:
         for h in view.holdings
     ]
 
-    parked_total = sum(
-        (h.market_value for h in view.holdings if _is_parked(h.symbol)),
-        Decimal("0"),
-    )
+    # Single source of the parked-sum rule (shared with the missed-growth read)
+    # so the two endpoints can never drift. Same rule as ``_is_parked`` above.
+    parked_total = parked_market_value(view.holdings, config)
 
     return PortfolioOut(
         holdings=holdings,

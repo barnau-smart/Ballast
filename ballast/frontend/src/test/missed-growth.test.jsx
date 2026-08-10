@@ -27,6 +27,27 @@ const RISING = {
   as_of: '2026-07-27',
   sufficient: true,
   reason: null,
+  // Story 9.2 additive fields — pure-settlement default (no parked, no reserve).
+  settlement_cash: '25000.00',
+  parked: '0.00',
+  reserved: null,
+  reserve_decided: false,
+  money_market_apy: '0.04',
+  investable_base: '25000.00',
+}
+
+// Story 9.2: cash+parked with a set reserve — yield-aware, reserve-protected.
+const YIELD_AWARE = {
+  ...RISING,
+  idle_cash: '8000.00',
+  investable_base: '8000.00',
+  settlement_cash: '5000.00',
+  parked: '5000.00',
+  reserved: '2000.00',
+  reserve_decided: true,
+  forgone_growth: '1000.00',
+  statement:
+    'Over the past year, about $8,000.00 of investable cash sat out roughly $1,000.00 of growth — and your $2,000.00 reserve stayed protected, just as you set it (counting your parked money-market cash as already earning about 4% a year).',
 }
 
 const FALLING = {
@@ -60,6 +81,12 @@ const NO_CASH = {
   as_of: null,
   sufficient: true,
   reason: 'no_idle_cash',
+  settlement_cash: '0.00',
+  parked: '0.00',
+  reserved: null,
+  reserve_decided: false,
+  money_market_apy: '0.04',
+  investable_base: '0.00',
 }
 
 const INSUFFICIENT = {
@@ -76,6 +103,35 @@ const INSUFFICIENT = {
   as_of: '2016-01-01',
   sufficient: false,
   reason: 'insufficient_history',
+  settlement_cash: '25000.00',
+  parked: '0.00',
+  reserved: null,
+  reserve_decided: false,
+  money_market_apy: '0.04',
+  investable_base: '25000.00',
+}
+
+// Story 9.2: reserve covers ALL cash → the dedicated fully_reserved block.
+const FULLY_RESERVED = {
+  idle_cash: '0.00',
+  benchmark: 'VTI',
+  window_return: null,
+  window_start: null,
+  window_end: null,
+  forgone_growth: '0.00',
+  trading_days: 252,
+  statement:
+    'Your reserve covers all of your cash right now — nothing is sitting idle to invest.',
+  source: 'VTI daily close (market_daily)',
+  as_of: null,
+  sufficient: true,
+  reason: 'fully_reserved',
+  settlement_cash: '0.00',
+  parked: '1000.00',
+  reserved: '5000.00',
+  reserve_decided: true,
+  money_market_apy: '0.04',
+  investable_base: '0.00',
 }
 
 // A guard shared across states: never a nudge / FOMO / call to action.
@@ -212,5 +268,81 @@ describe('MissedGrowthMeter — calm, honest, accessible, never a nudge', () => 
     await waitFor(() =>
       expect(screen.getByTestId('missed-growth-fallback')).toBeInTheDocument(),
     )
+  })
+
+  // --- Story 9.2: reserve-protected + disclosed-yield lines ------------------
+
+  it('renders the protected-reserve line + disclosed-yield note (parked + reserve)', async () => {
+    stubEstimate(YIELD_AWARE)
+    const { container } = render(<MissedGrowthMeter />)
+
+    await waitFor(() =>
+      expect(screen.getByTestId('missed-growth-figure')).toBeInTheDocument(),
+    )
+
+    // Statement rendered VERBATIM (AD-1) — carries the reserve + yield clauses.
+    expect(screen.getByTestId('missed-growth-statement')).toHaveTextContent(
+      /\$8,000\.00 of investable cash sat out roughly \$1,000\.00 of growth/i,
+    )
+
+    // A calm, non-alarmist protected-reserve line with the real amount.
+    const reserve = screen.getByTestId('missed-growth-reserve')
+    expect(reserve).toHaveTextContent(/\$2,000\.00 stayed protected, as you set it/i)
+
+    // The disclosed money-market yield assumption (parked > 0).
+    const note = screen.getByTestId('missed-growth-yield')
+    expect(note).toHaveTextContent(/parked money-market cash as already earning about 4% a year/i)
+
+    // HARD color rule + no nudge, still.
+    expect(container.innerHTML).not.toMatch(/brand-red|accent-pink|line-red/)
+    expect(container.textContent).not.toMatch(NUDGE_RE)
+  })
+
+  it('renders the dedicated fully-reserved block (reserve covers all cash) — statement + reserve line, no figure, no yield note', async () => {
+    stubEstimate(FULLY_RESERVED)
+    const { container } = render(<MissedGrowthMeter />)
+
+    // The dedicated fully_reserved block renders (not the figure/no-cash block).
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('missed-growth-fully-reserved'),
+      ).toBeInTheDocument(),
+    )
+
+    // The engine's calm statement shows verbatim.
+    expect(
+      screen.getByTestId('missed-growth-fully-reserved'),
+    ).toHaveTextContent(
+      /reserve covers all of your cash right now — nothing is sitting idle to invest/i,
+    )
+
+    // The protected-reserve line shows the real reserved amount.
+    expect(screen.getByTestId('missed-growth-reserve')).toHaveTextContent(
+      /\$5,000\.00 stayed protected, as you set it/i,
+    )
+
+    // NO $0.00 figure and NO yield note — nothing is investable, the yield
+    // assumption is moot.
+    expect(screen.queryByTestId('missed-growth-amount')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('missed-growth-yield')).not.toBeInTheDocument()
+    // Not the plain figure block either.
+    expect(screen.queryByTestId('missed-growth-figure')).not.toBeInTheDocument()
+
+    // HARD color rule + no nudge / FOMO copy.
+    expect(container.innerHTML).not.toMatch(/brand-red|accent-pink|line-red/)
+    expect(container.textContent).not.toMatch(NUDGE_RE)
+  })
+
+  it('never fabricates a reserve line when the reserve is never-decided', async () => {
+    // RISING carries reserved=null + reserve_decided=false, parked=0.00.
+    stubEstimate(RISING)
+    render(<MissedGrowthMeter />)
+
+    await waitFor(() =>
+      expect(screen.getByTestId('missed-growth-figure')).toBeInTheDocument(),
+    )
+    // No reserve figure invented; no yield note when there is no parked money.
+    expect(screen.queryByTestId('missed-growth-reserve')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('missed-growth-yield')).not.toBeInTheDocument()
   })
 })

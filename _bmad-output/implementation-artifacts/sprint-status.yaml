@@ -148,7 +148,7 @@ development_status:
   # 3-story split: 9-1 = model + reserve/parked declaration (foundation); 9-2 = honest missed-growth; 9-3 = liquidation/deferred-buy.
   epic-9: in-progress
   9-1-cash-state-model-reserve-parked-funds: done
-  9-2-honest-yield-aware-missed-growth: backlog
+  9-2-honest-yield-aware-missed-growth: done  # dev-auto 2026-08-10: yield-aware missed-growth (base = cash+parked−reserve, reserve parked-first; parked misses window_return − disclosed 4% money-market yield); additive-only (no migration), engine backward-compatible. Adversarial review: 3 patches (1 high honesty fix — market-direction copy keyed on window_return not the dollar sign; medium fully_reserved frontend block; low parked normalization single-source), 1 deferred (APY double-render). Backend 675 / frontend 156 pass. followup_review_recommended:true.
   9-3-just-in-time-liquidation-deferred-buy: backlog
   epic-9-retrospective: optional
 

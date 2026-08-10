@@ -179,7 +179,8 @@ def test_missed_growth_returns_figure_for_idle_cash(client):
         assert r.status_code == 200, r.text
         body = r.json()
 
-        # The standalone DTO shape — NOT the AD-12 evidence contract.
+        # The standalone DTO shape — NOT the AD-12 evidence contract. Story 9.2
+        # adds the cash-state/yield-aware fields + reserve_decided (additive).
         assert set(body.keys()) == {
             "idle_cash",
             "benchmark",
@@ -193,7 +194,21 @@ def test_missed_growth_returns_figure_for_idle_cash(client):
             "as_of",
             "sufficient",
             "reason",
+            "settlement_cash",
+            "parked",
+            "reserved",
+            "reserve_decided",
+            "money_market_apy",
+            "investable_base",
         }
+        # No config → never-decided reserve surfaces as null + reserve_decided=false;
+        # no parked holdings, so the figure is the pure-settlement figure.
+        assert body["reserved"] is None
+        assert body["reserve_decided"] is False
+        assert body["parked"] == "0.00"
+        assert body["settlement_cash"] == "25000.00"
+        assert body["investable_base"] == "25000.00"
+        assert body["money_market_apy"] == "0.04"
         assert body["sufficient"] is True
         assert body["reason"] is None
         assert body["benchmark"] == EP_SYMBOL
@@ -278,3 +293,178 @@ def test_missed_growth_requires_authentication(client):
     # No figure leaks to an unauthenticated caller.
     assert "forgone_growth" not in r.text
     assert "statement" not in r.text
+
+
+# --- Story 9.2: cash-state/yield-aware endpoint ------------------------------
+
+
+def _insert_holding_row(owner: uuid.UUID, symbol: str, market_value: Decimal) -> None:
+    """Seed one portfolio_cache holding (sync psycopg) with a chosen market_value —
+    used to make a symbol PARKED (via the user's cash_config)."""
+    as_of = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO portfolio_cache "
+                "(id, owner_id, symbol, quantity, market_value, cost_basis, cash, as_of) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    str(uuid.uuid4()),
+                    str(owner),
+                    symbol,
+                    "1",
+                    str(market_value),
+                    "0.00",
+                    "0",
+                    as_of,
+                ),
+            )
+        conn.commit()
+
+
+def _put_config(client, headers, *, amount, decided, symbols):
+    r = client.put(
+        "/api/cash/config",
+        headers=headers,
+        json={
+            "reserve_amount": amount,
+            "reserve_decided": decided,
+            "parked_symbols": symbols,
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_missed_growth_parked_and_reserve_raise_figure_honestly(client):
+    """Parked money-market holdings + a set reserve produce a yield-aware figure
+    computed on cash+parked−reserve (reserve parked-first), disclose the apy, and
+    surface the resolved reserve — never the pre-reserve amount."""
+    _clean_market([EP_SYMBOL])
+    _insert_series(EP_SYMBOL, _rising_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        owner = _user_id_for(email)
+        # 5000 settlement cash + 5000 parked (SWVXX) + 2000 reserve.
+        _insert_balance_row(owner, Decimal("5000.00"))
+        _insert_holding_row(owner, "SWVXX", Decimal("5000.00"))
+        _put_config(
+            client, headers, amount="2000.00", decided=True, symbols=["swvxx"]
+        )
+
+        r = client.get(
+            f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reason"] is None
+        assert body["settlement_cash"] == "5000.00"
+        assert body["parked"] == "5000.00"
+        assert body["reserved"] == "2000.00"
+        assert body["reserve_decided"] is True
+        assert body["investable_base"] == "8000.00"
+        # parked drawn-first → parked_inv=3000, cash_inv=5000;
+        # 5000·0.14 + 3000·(0.14−0.04) = 700 + 300 = 1000.00.
+        assert body["forgone_growth"] == "1000.00"
+        # Discloses the yield assumption; surfaces the reserve in the statement.
+        assert "money-market" in body["statement"].lower()
+        assert body["money_market_apy"] == "0.04"
+        assert "$2,000.00" in body["statement"]
+    finally:
+        _clean_market([EP_SYMBOL])
+        _delete_user(email)
+
+
+def test_missed_growth_reserve_declined_resolves_zero(client):
+    """A declined reserve resolves to 0 (decided): reserved="0.00",
+    reserve_decided=true, and the figure is on the full cash."""
+    _clean_market([EP_SYMBOL])
+    _insert_series(EP_SYMBOL, _rising_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        owner = _user_id_for(email)
+        _insert_balance_row(owner, Decimal("25000.00"))
+        _put_config(client, headers, amount=None, decided=True, symbols=[])
+
+        r = client.get(
+            f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reserved"] == "0.00"
+        assert body["reserve_decided"] is True
+        # No reserve drawn → figure on the full 25000.
+        assert body["forgone_growth"] == "3500.00"
+        assert body["investable_base"] == "25000.00"
+    finally:
+        _clean_market([EP_SYMBOL])
+        _delete_user(email)
+
+
+def test_missed_growth_reserve_never_decided_surfaces_null(client):
+    """A never-decided reserve surfaces reserved=null + reserve_decided=false, is
+    treated as 0 for the calc, and stays calm (no fabricated reserve figure)."""
+    _clean_market([EP_SYMBOL])
+    _insert_series(EP_SYMBOL, _rising_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        owner = _user_id_for(email)
+        _insert_balance_row(owner, Decimal("25000.00"))
+        # No cash_config PUT at all → never-decided.
+
+        r = client.get(
+            f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reserved"] is None
+        assert body["reserve_decided"] is False
+        # Reserve treated as 0 → full figure; no reserve clause in the copy.
+        assert body["forgone_growth"] == "3500.00"
+        assert "reserve" not in body["statement"].lower()
+    finally:
+        _clean_market([EP_SYMBOL])
+        _delete_user(email)
+
+
+def test_missed_growth_fully_reserved_when_reserve_covers_all(client):
+    """A reserve larger than cash+parked → reason=fully_reserved, forgone 0.00,
+    calm reserve-aware statement."""
+    _clean_market([EP_SYMBOL])
+    _insert_series(EP_SYMBOL, _rising_closes())
+    email = _unique_email()
+    try:
+        _register(client, email)
+        token = _login(client, email)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        owner = _user_id_for(email)
+        _insert_balance_row(owner, Decimal("1000.00"))
+        _insert_holding_row(owner, "SWVXX", Decimal("1000.00"))
+        _put_config(
+            client, headers, amount="5000.00", decided=True, symbols=["swvxx"]
+        )
+
+        r = client.get(
+            f"/api/precedent/missed-growth?symbol={EP_SYMBOL}", headers=headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reason"] == "fully_reserved"
+        assert body["forgone_growth"] == "0.00"
+        assert body["investable_base"] == "0.00"
+        assert "reserve covers all" in body["statement"].lower()
+    finally:
+        _clean_market([EP_SYMBOL])
+        _delete_user(email)

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_scope
 from brokers.portfolio import get_portfolio
+from cash.config import get_config, parked_market_value, resolve_reserve
 from db.scope import Scope
 from db.session import get_async_session
 from precedent import estimate_missed_growth, find_precedent
@@ -139,11 +140,18 @@ async def contextualize(
 class MissedGrowthOut(BaseModel):
     """The standalone missed-growth DTO — NOT the AD-12 ``EvidenceRecord``.
 
-    Matches ``MissedGrowthEstimate.to_dict()`` field-for-field. It deliberately
-    does NOT reuse the shared evidence contract (which is pinned to two ``kind``
-    values Epic 4 depends on — see the story's Design Notes). All Decimals arrive
-    as strings and dates as ISO-8601; ``window_return`` / ``window_start`` /
-    ``window_end`` / ``as_of`` are ``None`` in the degraded states.
+    Matches ``MissedGrowthEstimate.to_dict()`` field-for-field, plus the
+    config-layer ``reserve_decided`` (Story 9.2) the engine does not carry. It
+    deliberately does NOT reuse the shared evidence contract (which is pinned to
+    two ``kind`` values Epic 4 depends on — see the story's Design Notes). All
+    Decimals arrive as strings and dates as ISO-8601; ``window_return`` /
+    ``window_start`` / ``window_end`` / ``as_of`` are ``None`` in the degraded
+    states. ``reserved`` is ``None`` when the reserve was never decided.
+
+    Story 9.2 additive fields: ``settlement_cash`` (ready-to-trade cash),
+    ``parked`` (money-market cash), ``reserved`` (the resolved reserve, ``None``
+    when never-decided), ``reserve_decided``, ``money_market_apy`` (the disclosed
+    yield assumption), ``investable_base`` (``cash + parked − reserve``, ≥ 0).
     """
 
     idle_cash: str
@@ -158,6 +166,12 @@ class MissedGrowthOut(BaseModel):
     as_of: str | None
     sufficient: bool
     reason: str | None
+    settlement_cash: str
+    parked: str
+    reserved: str | None
+    reserve_decided: bool
+    money_market_apy: str
+    investable_base: str
 
 
 @router.get("/missed-growth", response_model=MissedGrowthOut)
@@ -166,19 +180,53 @@ async def missed_growth(
     scope: Scope = Depends(get_scope),
     session: AsyncSession = Depends(get_async_session),
 ) -> MissedGrowthOut:
-    """Return the forgone-growth estimate for the user's idle cash (READ-ONLY).
+    """Return the forgone-growth estimate for the user's investable cash (READ-ONLY).
 
-    Reads the authenticated user's idle cash from the Epic-2 portfolio cache via
-    the sanctioned scoped read (``get_portfolio`` → ``PortfolioView.cash``; 0 when
-    the user has no cache rows), then delegates the market math to the deterministic
-    engine (AD-1/AD-3) — the API layer computes no figure. Never a dead end: no idle
-    cash and insufficient history each return a calm informational body, and the
-    ``scope`` dependency is the auth gate (401 for an unauthenticated request).
+    Cash-state-aware + yield-aware (Story 9.2). Reads the authenticated user's
+    settlement cash + holdings from the Epic-2 portfolio projection via the
+    sanctioned scoped read (``get_portfolio``), and their scoped ``CashConfig``
+    READ-ONLY (``get_config`` — never create-on-GET, AD-11). Derives the parked
+    (money-market) total via ``parked_market_value`` and the resolved reserve via
+    ``resolve_reserve``, then delegates ALL market math to the deterministic engine
+    (AD-1/AD-3) — the API layer computes no figure.
+
+    Reserve honesty: a never-decided reserve (``resolve_reserve`` → ``None``) is
+    passed to the engine as ``0`` for the calc, but the response surfaces
+    ``reserved=null`` + ``reserve_decided=false`` (never a fabricated figure). A
+    declined reserve resolves to ``0`` (decided).
+
+    Never a dead end: no investable cash, a fully-covering reserve, and
+    insufficient history each return a calm informational body; the ``scope``
+    dependency is the auth gate (401 for an unauthenticated request).
 
     ``symbol`` defaults to the benchmark (``VTI``); it is a bounded global-reference
-    lookup (mirrors ``/recovery``), applied to the caller's own idle cash — the
-    frontend always uses the default.
+    lookup (mirrors ``/recovery``), applied to the caller's own cash — the frontend
+    always uses the default.
     """
     view = await get_portfolio(scope, session)
-    estimate = await estimate_missed_growth(session, idle_cash=view.cash, symbol=symbol)
-    return MissedGrowthOut(**estimate.to_dict())
+    config = await get_config(scope, session)
+
+    parked_total = parked_market_value(view.holdings, config)
+    resolved_reserve = resolve_reserve(config) if config is not None else None
+    reserve_decided = config.reserve_decided if config is not None else False
+
+    estimate = await estimate_missed_growth(
+        session,
+        idle_cash=view.cash,
+        symbol=symbol,
+        parked=parked_total,
+        # A never-decided reserve is treated as 0 for the CALC (honest: an unset
+        # reserve is legitimately 0); the response still says reserved=null below.
+        reserved=resolved_reserve if resolved_reserve is not None else Decimal("0"),
+    )
+
+    payload = estimate.to_dict()
+    # Surface the config-layer reserve facts the engine can't know: a never-decided
+    # reserve reads as null (NEVER a silent 0 — the honesty crux), and the explicit
+    # decision flag drives the calm one-time set-or-decline prompt. The engine was
+    # handed 0 for a never-decided reserve (for the calc), so overwrite its "0.00"
+    # with null here — the ONLY place the null lives.
+    if resolved_reserve is None:
+        payload["reserved"] = None
+    payload["reserve_decided"] = reserve_decided
+    return MissedGrowthOut(**payload)

@@ -41,6 +41,21 @@ logger = logging.getLogger("ballast.precedent.missed_growth")
 #: story does NOT re-solve or duplicate that entry.
 LOOKBACK_TRADING_DAYS = 252
 
+#: Named, DISCLOSED placeholder for the money-market yield used to offset parked
+#: cash in the yield-aware missed-growth math (Story 9.2). Money-market yields are
+#: NOT in the market-data set (Tiingo carries only the 14 index ETFs) and 9-1
+#: stores no per-fund yield, so a single disclosed default is the honest v1 source:
+#: every statement that uses it states the assumption out loud ("counting your
+#: parked money-market cash as already earning about 4% a year"). It is a TUNABLE
+#: placeholder — tune it against real money-market data later, and consider a
+#: user-editable yield as a later refinement; do NOT hardcode this rate anywhere
+#: else (this constant is the single source).
+DEFAULT_MONEY_MARKET_APY = Decimal("0.04")
+
+#: Trading days per year — the denominator that prorates an annual APY down to the
+#: lookback window (``yield_over_window = apy × lookback_days / 252``).
+_TRADING_DAYS_PER_YEAR = Decimal("252")
+
 #: Cent quantization for dollar figures (idle cash, forgone growth).
 _CENTS_Q = Decimal("0.01")
 
@@ -72,6 +87,17 @@ class MissedGrowthEstimate:
     of ``"no_idle_cash"`` | ``"insufficient_history"``.
 
     Frozen so a computed estimate cannot mutate after the fact.
+
+    Story 9.2 adds cash-state/yield-aware fields (all ADDITIVE; the pre-9.2
+    fields keep their meaning): ``settlement_cash`` (ready-to-trade cash),
+    ``parked`` (money-market cash), ``reserved`` (the RESOLVED reserve used in
+    the calc — ``None`` only when the caller passed it as absent),
+    ``money_market_apy`` (the disclosed yield assumption), and
+    ``investable_base`` (``cash + parked − reserve``, clamped ≥ 0). ``idle_cash``
+    is set to ``investable_base`` so the figure is always computed on genuinely
+    investable money. ``reserve_decided`` is NOT on the engine DTO — it is a
+    config-layer fact the endpoint adds. ``reason`` gains ``"fully_reserved"``
+    (reserve covers all cash → base clamps to 0).
     """
 
     idle_cash: Decimal
@@ -86,6 +112,11 @@ class MissedGrowthEstimate:
     as_of: date | None
     sufficient: bool
     reason: str | None
+    settlement_cash: Decimal
+    parked: Decimal
+    reserved: Decimal | None
+    money_market_apy: Decimal
+    investable_base: Decimal
 
     def to_dict(self) -> dict:
         """Return a JSON-safe dict (Decimal→fixed-point str, date→ISO, None preserved).
@@ -114,6 +145,13 @@ class MissedGrowthEstimate:
             "as_of": self.as_of.isoformat() if self.as_of is not None else None,
             "sufficient": self.sufficient,
             "reason": self.reason,
+            "settlement_cash": format_money(self.settlement_cash),
+            "parked": format_money(self.parked),
+            "reserved": (
+                format_money(self.reserved) if self.reserved is not None else None
+            ),
+            "money_market_apy": format_money(self.money_market_apy),
+            "investable_base": format_money(self.investable_base),
         }
 
 
@@ -128,26 +166,79 @@ async def estimate_missed_growth(
     symbol: str = DEFAULT_BENCHMARK,
     lookback_days: int = LOOKBACK_TRADING_DAYS,
     as_of: date | None = None,
+    parked: Decimal = Decimal("0"),
+    reserved: Decimal = Decimal("0"),
+    money_market_apy: Decimal = DEFAULT_MONEY_MARKET_APY,
 ) -> MissedGrowthEstimate:
-    """Estimate the growth ``idle_cash`` forgone over a trailing window (AD-1/AD-3).
+    """Estimate the growth investable cash forgone over a trailing window (AD-1/AD-3).
 
-    Deterministic and honest in both directions:
+    Cash-state-aware and yield-aware (Story 9.2), deterministic and honest in both
+    directions. ``idle_cash`` is the ready-to-trade **settlement cash**; ``parked``
+    is money-market cash (earning yield); ``reserved`` is the user's declared
+    reserve. The figure is computed on the **investable base** only:
 
-    - ``idle_cash <= 0`` → a calm ``no_idle_cash`` state, ``forgone_growth`` 0.00.
-    - Fewer than ``lookback_days + 1`` bars for ``symbol`` → ``sufficient=False``,
-      ``insufficient_history``, ``window_return=None``, ``forgone_growth`` 0.00.
-    - Otherwise: ``end`` = last bar at/before ``as_of`` (default: latest bar),
-      ``start`` = the bar ``lookback_days`` rows earlier;
-      ``window_return = (end_close - start_close) / start_close`` (quantized 4-dp);
-      ``forgone_growth = idle_cash × window_return`` (quantized to cents). A rising
-      window yields a positive figure (growth missed, green ▲); a falling window a
-      negative figure (loss AVOIDED, sky-blue ▼) — never framed as a cost.
+    - Reserve is drawn PARKED-FIRST: ``parked_investable = max(parked − reserved, 0)``,
+      then any leftover reserve reduces settlement cash
+      (``cash_investable = max(settlement_cash − max(reserved − parked, 0), 0)``).
+    - Settlement cash misses the **full** window return; parked money misses only
+      ``window_return − yield_over_window`` (it already earns money-market yield),
+      where ``yield_over_window = money_market_apy × lookback_days / 252``. The
+      parked term stays SIGNED — if the market underperformed the money-market
+      yield over the window, parked reduces the figure (that is honest).
+    - ``forgone_growth = cash_investable × window_return + parked_investable ×
+      (window_return − yield_over_window)`` (quantized to cents).
+
+    Backward-compatible: when ``parked == 0`` and ``reserved == 0`` the investable
+    base is just the settlement cash and the yield term vanishes, so a caller
+    passing only ``idle_cash`` behaves EXACTLY as pre-9.2.
+
+    Degraded states (never a dead end): investable base ≤ 0 → ``no_idle_cash`` (or
+    ``fully_reserved`` when a reserve is what zeroed it); fewer than
+    ``lookback_days + 1`` bars → ``insufficient_history``. A rising window yields a
+    positive figure (growth missed, green ▲); a falling window a negative figure
+    (loss AVOIDED, sky-blue ▼) — never framed as a cost.
     """
     source = _source_str(symbol)
-    idle_cash_q = _cents(idle_cash)
+    settlement_cash_q = _cents(idle_cash)
+    parked_q = _cents(parked)
+    reserved_q = _cents(reserved)
 
-    # --- No idle cash → calm informational state (never a dead end) ----------
-    if idle_cash_q <= 0:
+    # Reserve drawn PARKED-FIRST, keeping ~0%-yield settlement cash liquid for
+    # trading (money-market still earns yield + is liquid enough for emergencies).
+    parked_investable = max(parked_q - reserved_q, Decimal("0"))
+    reserve_left = max(reserved_q - parked_q, Decimal("0"))
+    cash_investable = max(settlement_cash_q - reserve_left, Decimal("0"))
+    investable_base = cash_investable + parked_investable  # == max(cash+parked-reserve, 0)
+
+    # Common tail of the additive cash-state fields for every return below. The
+    # engine surfaces the RESOLVED reserve it was handed (the endpoint maps a
+    # never-decided config to None → 0 for the calc but reports reserved=null).
+    _states = dict(
+        settlement_cash=settlement_cash_q,
+        parked=parked_q,
+        reserved=reserved_q,
+        money_market_apy=money_market_apy,
+        investable_base=_cents(investable_base),
+    )
+
+    # --- No investable cash → calm informational state (never a dead end) ----
+    if investable_base <= 0:
+        # Distinguish "there was cash but the reserve protects all of it" from
+        # "there is simply nothing idle" — the former is a reassurance, not a
+        # non-event. A reserve is decisive only when there IS cash to protect.
+        fully_reserved = (settlement_cash_q + parked_q) > 0 and reserved_q > 0
+        if fully_reserved:
+            statement = (
+                "Your reserve covers all of your cash right now — nothing is "
+                "sitting idle to invest."
+            )
+            reason = "fully_reserved"
+        else:
+            statement = (
+                "You have no idle cash sitting out of the market right now, so "
+                "there is no forgone growth to show."
+            )
+            reason = "no_idle_cash"
         return MissedGrowthEstimate(
             idle_cash=_cents(Decimal("0")),
             benchmark=symbol,
@@ -156,14 +247,12 @@ async def estimate_missed_growth(
             window_end=None,
             forgone_growth=_cents(Decimal("0")),
             trading_days=lookback_days,
-            statement=(
-                "You have no idle cash sitting out of the market right now, so "
-                "there is no forgone growth to show."
-            ),
+            statement=statement,
             source=source,
             as_of=None,
             sufficient=True,
-            reason="no_idle_cash",
+            reason=reason,
+            **_states,
         )
 
     series = await _load_series(session, symbol)
@@ -185,7 +274,7 @@ async def estimate_missed_growth(
             lookback_days + 1,
         )
         return MissedGrowthEstimate(
-            idle_cash=idle_cash_q,
+            idle_cash=_cents(investable_base),
             benchmark=symbol,
             window_return=None,
             window_start=None,
@@ -197,6 +286,7 @@ async def estimate_missed_growth(
             as_of=resolved_as_of,
             sufficient=False,
             reason="insufficient_history",
+            **_states,
         )
 
     start_day, start_close = window[-(lookback_days + 1)]
@@ -211,7 +301,7 @@ async def estimate_missed_growth(
             start_close,
         )
         return MissedGrowthEstimate(
-            idle_cash=idle_cash_q,
+            idle_cash=_cents(investable_base),
             benchmark=symbol,
             window_return=None,
             window_start=None,
@@ -223,34 +313,89 @@ async def estimate_missed_growth(
             as_of=end_day,
             sufficient=False,
             reason="insufficient_history",
+            **_states,
         )
 
     window_return = _q((end_close - start_close) / start_close)
-    forgone_growth = _cents(idle_cash_q * window_return)
 
-    cash_phrase = _format_usd(idle_cash_q)
+    # Prorate the annual money-market APY down to the lookback window (4-dp, the
+    # same quantum as window_return). Parked money misses only the SIGNED
+    # difference window_return − yield_over_window.
+    yield_over_window = _q(
+        money_market_apy * Decimal(lookback_days) / _TRADING_DAYS_PER_YEAR
+    )
+    forgone_growth = _cents(
+        cash_investable * window_return
+        + parked_investable * (window_return - yield_over_window)
+    )
+
+    base_phrase = _format_usd(_cents(investable_base))
     amount_phrase = _format_usd(forgone_growth)
-    # Frame on the DOLLAR figure's sign so a flat window (or a sub-cent move that
-    # rounds to $0.00) reads honestly as "nothing missed" — never a green ▲ +$0.00
-    # "growth missed" that overstates a non-event.
+
+    # A calm reserve clause, appended only when a positive reserve actually
+    # protected money (drawn parked-first). Never fabricated.
+    reserve_clause = ""
+    if reserved_q > 0:
+        reserve_clause = (
+            f" — and your {_format_usd(reserved_q)} reserve stayed protected, "
+            f"just as you set it"
+        )
+
+    # DISCLOSE the yield assumption whenever parked money was in the calc, so the
+    # number is never a lie by omission.
+    yield_clause = ""
+    if parked_investable > 0:
+        apy_pct = (money_market_apy * Decimal("100")).quantize(Decimal("0.1"))
+        yield_clause = (
+            f" (counting your parked money-market cash as already earning about "
+            f"{apy_pct.normalize():f}% a year)"
+        )
+
+    # Any market-DIRECTION wording keys on ``window_return`` (what the market
+    # actually did), while the DOLLAR outcome keys on ``forgone_growth``. These
+    # can disagree once parked money earns yield: in a modestly rising market
+    # (0 < window_return < yield_over_window) parked cash can OUTPACE the market,
+    # making forgone_growth negative even though the market rose — so we must
+    # never say "the market fell" off the dollar sign alone (that would lie).
+    market_fell = window_return < 0
     if forgone_growth > 0:
+        # Idle cash missed growth (the market outran any parked yield).
         statement = (
-            f"Your ~{cash_phrase} in idle cash has sat out ~{amount_phrase} of "
-            f"growth over the past year."
+            f"Over the past year, about {base_phrase} of investable cash sat out "
+            f"roughly {amount_phrase} of growth{reserve_clause}{yield_clause}."
         )
     elif forgone_growth < 0:
+        if market_fell:
+            statement = (
+                f"Over the past year the market fell, so your {base_phrase} of "
+                f"investable cash avoided roughly {amount_phrase} of loss"
+                f"{reserve_clause}{yield_clause}."
+            )
+        else:
+            # Market rose (or was flat) but parked money-market yield outpaced it,
+            # so investable cash came out ahead — NEVER claim the market fell.
+            statement = (
+                f"Over the past year your parked cash kept pace with a modestly "
+                f"rising market, so your {base_phrase} of investable cash came out "
+                f"about {amount_phrase} ahead{reserve_clause}{yield_clause}."
+            )
+    elif market_fell or window_return > 0:
+        # A real market move that netted to $0.00 for investable cash (e.g. parked
+        # yield exactly offset a small move) — honestly "kept pace", not "flat".
         statement = (
-            f"Over the past year the market fell, so your ~{cash_phrase} in idle "
-            f"cash avoided ~{amount_phrase} of loss."
+            f"Over the past year your {base_phrase} of investable cash roughly "
+            f"kept pace with the market — no measurable growth missed"
+            f"{reserve_clause}{yield_clause}."
         )
     else:
         statement = (
             f"Over the past year the market was roughly flat, so your "
-            f"~{cash_phrase} in idle cash has not missed measurable growth."
+            f"{base_phrase} of investable cash has not missed measurable growth"
+            f"{reserve_clause}{yield_clause}."
         )
 
     return MissedGrowthEstimate(
-        idle_cash=idle_cash_q,
+        idle_cash=_cents(investable_base),
         benchmark=symbol,
         window_return=window_return,
         window_start=start_day,
@@ -262,4 +407,5 @@ async def estimate_missed_growth(
         as_of=end_day,
         sufficient=True,
         reason=None,
+        **_states,
     )

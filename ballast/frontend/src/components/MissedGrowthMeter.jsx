@@ -5,8 +5,10 @@ import { apiFetch } from '../lib/session.js'
 import {
   amountLabel,
   directionAndMagnitude,
+  reserveLine,
   sourceLine,
   windowLine,
+  yieldNote,
 } from '../lib/missedGrowth.js'
 import './MissedGrowthMeter.css'
 
@@ -119,6 +121,34 @@ export function MissedGrowthMeter() {
     )
   }
 
+  // Reserve covers all of the user's cash (Story 9.2) — a reassurance, not a
+  // non-event. Its own calm block (no "Idle cash…" eyebrow, no $0.00 figure, no
+  // yield disclosure — nothing is investable, so the yield assumption is moot).
+  // The protected-reserve line reinforces the engine's statement.
+  if (estimate?.reason === 'fully_reserved') {
+    const reserve = reserveLine(estimate)
+    return (
+      <div
+        className="ballast-missed-growth"
+        data-testid="missed-growth-fully-reserved"
+      >
+        <p className="ballast-missed-growth__headline">Your reserve has you covered.</p>
+        <p className="ballast-missed-growth__body">{estimate?.statement}</p>
+        {reserve ? (
+          <p
+            className="ballast-missed-growth__reserve"
+            data-testid="missed-growth-reserve"
+          >
+            {reserve}
+          </p>
+        ) : null}
+        <p className="ballast-missed-growth__source" data-testid="missed-growth-source">
+          {sourceLine(estimate)}
+        </p>
+      </div>
+    )
+  }
+
   // Figure present (sufficient && reason == null) — honest both directions.
   return (
     <MissedGrowthFigure estimate={estimate} reduced={reduced} />
@@ -134,6 +164,14 @@ function MissedGrowthFigure({ estimate, reduced }) {
   const isFlat = !Number.isFinite(value) || value === 0
   const figure = isFlat ? null : directionAndMagnitude(estimate?.forgone_growth)
   const label = isFlat ? null : amountLabel(estimate)
+
+  // Calm supporting lines (Story 9.2). Both are null unless the honest condition
+  // holds — a protected reserve figure is NEVER fabricated when the user has not
+  // decided one (reserved==null), and the yield assumption is disclosed ONLY when
+  // parked money is actually in the calc. The engine's statement already carries
+  // these clauses verbatim; these lines make them individually legible.
+  const reserve = reserveLine(estimate)
+  const yieldDisclosure = yieldNote(estimate)
 
   return (
     <div
@@ -163,6 +201,24 @@ function MissedGrowthFigure({ estimate, reduced }) {
       <p className="ballast-missed-growth__window" data-testid="missed-growth-window">
         {windowLine(estimate)}
       </p>
+
+      {reserve ? (
+        <p
+          className="ballast-missed-growth__reserve"
+          data-testid="missed-growth-reserve"
+        >
+          {reserve}
+        </p>
+      ) : null}
+
+      {yieldDisclosure ? (
+        <p
+          className="ballast-missed-growth__yield"
+          data-testid="missed-growth-yield"
+        >
+          {yieldDisclosure}
+        </p>
+      ) : null}
 
       <p className="ballast-missed-growth__source" data-testid="missed-growth-source">
         {sourceLine(estimate)}

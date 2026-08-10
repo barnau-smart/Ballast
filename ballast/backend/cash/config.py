@@ -51,6 +51,34 @@ def normalize_symbols(symbols: list[str]) -> list[str]:
     return out
 
 
+def parked_market_value(holdings, config: CashConfig | None) -> Decimal:
+    """Return Σ ``market_value`` of the holdings the user has parked (money-market).
+
+    The SINGLE source of the parked-sum rule so the read-path can't drift between
+    endpoints (``GET /api/portfolio`` and the missed-growth read both call this).
+    A holding is parked when its normalized symbol is in ``config.parked_symbols``
+    (reuse :func:`normalize_symbols` so the compare rule matches how symbols were
+    stored). ``config is None`` (a user who never set one — the calm never-decided
+    default) or no parked symbols → ``Decimal("0")``. Never writes; derives purely
+    from the passed-in holdings + config (AD-14: parked is derived at read time,
+    never stored on the pure broker projection).
+    """
+    if config is None:
+        return Decimal("0")
+    parked_set = set(normalize_symbols(config.parked_symbols))
+    if not parked_set:
+        return Decimal("0")
+    return sum(
+        (
+            h.market_value
+            for h in holdings
+            if h.symbol
+            and any(sym in parked_set for sym in normalize_symbols([h.symbol]))
+        ),
+        Decimal("0"),
+    )
+
+
 def resolve_reserve(config: CashConfig) -> Decimal | None:
     """Return the RESOLVED reserve for calculation/display (the honesty crux).
 

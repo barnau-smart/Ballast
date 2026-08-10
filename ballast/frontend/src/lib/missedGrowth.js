@@ -58,6 +58,36 @@ export function amountLabel(estimate) {
   return rose ? `${amount} of growth not captured` : `${amount} of loss avoided`
 }
 
+/**
+ * The calm protected-reserve line (Story 9.2), e.g.
+ * "$2,000.00 stayed protected, as you set it". Returns `null` when the user has
+ * NOT decided a reserve (`reserved == null`) or it resolves to $0 — we NEVER
+ * fabricate a reserve figure for a never-decided reserve. Non-alarmist,
+ * information not pressure; the protected amount reassures, it does not nudge.
+ */
+export function reserveLine(estimate) {
+  if (estimate?.reserved == null) return null
+  const amount = formatUsd(estimate.reserved)
+  if (amount == null || Number(estimate.reserved) <= 0) return null
+  return `${amount} stayed protected, as you set it.`
+}
+
+/**
+ * The disclosed money-market yield note (Story 9.2), shown ONLY when parked
+ * money is actually in the calc (`parked > 0`). States the assumption out loud
+ * so the figure is never a lie by omission — e.g. "Counting your parked
+ * money-market cash as already earning about 4% a year." Returns `null` when
+ * there is no parked money or no apy to disclose.
+ */
+export function yieldNote(estimate) {
+  const parked = Number(estimate?.parked)
+  if (!Number.isFinite(parked) || parked <= 0) return null
+  const apy = Number(estimate?.money_market_apy)
+  if (!Number.isFinite(apy)) return null
+  const pct = (apy * 100).toLocaleString('en-US', { maximumFractionDigits: 1 })
+  return `Counting your parked money-market cash as already earning about ${pct}% a year.`
+}
+
 /** The window-context line, e.g. "Benchmark: VTI · +14.0% over ~252 trading days". */
 export function windowLine(estimate) {
   const parts = []
