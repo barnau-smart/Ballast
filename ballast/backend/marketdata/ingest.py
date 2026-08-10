@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+
+import anyio.to_thread
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
@@ -92,7 +94,13 @@ async def ingest_market_daily(
 
     for symbol in symbols:
         try:
-            bars = source.fetch_eod(symbol, start, end)
+            # Offload the vendor fetch (a BLOCKING network call, e.g. Tiingo) to a
+            # worker thread so it never freezes the asyncio event loop. The
+            # in-process ingest scheduler shares the loop with request handlers, so
+            # a direct blocking fetch of N symbols would stall every request for the
+            # duration (a 14-symbol boot tick froze the UI for ~10-20s, 2026-08-10).
+            # Same offload pattern as brokers/portfolio.py::reconcile_portfolio.
+            bars = await anyio.to_thread.run_sync(source.fetch_eod, symbol, start, end)
             written = 0
             for bar in bars:
                 stmt = (
