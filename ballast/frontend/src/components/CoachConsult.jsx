@@ -8,6 +8,7 @@ import {
   validateOrderMatrix,
 } from '../lib/orderOptions.js'
 import { CoachCard } from './CoachCard.jsx'
+import { LiquidationCard } from './LiquidationCard.jsx'
 import './CoachConsult.css'
 import './OrderOptions.css'
 
@@ -104,6 +105,13 @@ export function CoachConsult() {
   const [pendingSuggestion, setPendingSuggestion] = useState(null)
   const suggestingRef = useRef(false) // synchronous double-click guard
 
+  // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
+  // ready-to-trade cash is short, we fetch a pre-filled money-market SELL plan
+  // (`/api/cash/liquidation-plan`) and render `LiquidationCard` in place of a
+  // hard failure. `liquidationPlan` holds the fetched plan; when set (and it
+  // `needs_liquidation`), the approve control is replaced by the sell card.
+  const [liquidationPlan, setLiquidationPlan] = useState(null)
+
   const mounted = useRef(true)
   const placingRef = useRef(false) // synchronous double-submit guard
   useEffect(() => {
@@ -124,6 +132,49 @@ export function CoachConsult() {
     ? recommendation.order_intent ?? submitted?.order ?? null
     : null
 
+  // Story 9.3 — at the BUY approve step, check whether ready-to-trade cash covers
+  // the buy. If it's short, fetch a pre-filled money-market SELL plan and render
+  // `LiquidationCard` instead of a hard failure. Runs only when a co-signable BUY
+  // is ready; the sufficient-cash path is unchanged (plan.needs_liquidation is
+  // false → no card, the normal approve control shows). Pull-only, presentation:
+  // it computes no money number — the backend owns the shortfall + sell.
+  useEffect(() => {
+    if (phase !== 'ready') return
+    if (!recommendation?.decision_id || !orderIntent) return
+    if (orderIntent.side !== 'buy') return
+    const buyAmount = Number(orderIntent.amount)
+    if (!Number.isFinite(buyAmount) || buyAmount <= 0) return
+    let active = true
+    ;(async () => {
+      try {
+        const pres = await apiFetch('/api/portfolio')
+        if (!active || !pres.ok) return
+        const portfolio = await pres.json()
+        const readyToTrade = Number(portfolio?.cash_states?.ready_to_trade)
+        if (!Number.isFinite(readyToTrade)) return
+        if (readyToTrade >= buyAmount) return // sufficient cash — unchanged path
+        const lres = await apiFetch('/api/cash/liquidation-plan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbol: orderIntent.symbol,
+            amount: orderIntent.amount,
+          }),
+        })
+        if (!active || !lres.ok) return
+        const plan = await lres.json()
+        if (!active) return
+        if (plan?.needs_liquidation) setLiquidationPlan(plan)
+      } catch {
+        // Fail quiet: on any error, fall back to the normal approve control.
+      }
+    })()
+    return () => {
+      active = false
+    }
+    // Re-check when the co-signable order changes (a new recommendation/decision).
+  }, [phase, recommendation?.decision_id, orderIntent?.symbol, orderIntent?.amount, orderIntent?.side])
+
   function resetResult() {
     setRecommendation(null)
     setSubmitted(null)
@@ -140,6 +191,8 @@ export function CoachConsult() {
     setSuggestReasoning('')
     setSuggestFillNote('')
     setSuggestStaleNote('')
+    // Story 9.3 — clear any just-in-time liquidation plan on a fresh ask/decline.
+    setLiquidationPlan(null)
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -620,7 +673,20 @@ export function CoachConsult() {
             </p>
           ) : null}
 
-          {showCosign ? (
+          {/* Story 9.3 — when the BUY exceeds ready-to-trade cash, render the
+              just-in-time liquidation card IN PLACE OF the approve control. The
+              durable pending buy is already recorded, so the buy resumes later;
+              the human submits the pre-filled sell here (nothing auto-places). */}
+          {showCosign && liquidationPlan ? (
+            <div
+              className="ballast-consult__cosign"
+              data-testid="coach-cosign-liquidation"
+            >
+              <LiquidationCard plan={liquidationPlan} />
+            </div>
+          ) : null}
+
+          {showCosign && !liquidationPlan ? (
             <div className="ballast-consult__cosign" data-testid="coach-cosign">
               <div
                 className="ballast-order-options"

@@ -54,11 +54,13 @@ from typing import TYPE_CHECKING
 
 from brokers.port import BrokerPort, OrderOutcome, OrderStatus
 from brokers.session import BrokerageSession
-from coach.recommendation import Duration, OrderIntent, OrderType, Session
+from coach.recommendation import Duration, OrderIntent, OrderSide, OrderType, Session
 from strategy.index_core import is_index_core
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (decision_record imports us)
     from db.models import DecisionRecord
+    from db.scope import Scope
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 # An indeterminate placement is one whose true state is not yet known from the
 # placement call itself — it MUST be reconciled by reading authoritative state
@@ -236,12 +238,39 @@ def validate_order_intent(intent: OrderIntent) -> None:
         )
 
 
+async def _scope_user_parked_symbols(
+    scope: "Scope | None", session: "AsyncSession | None"
+) -> set[str]:
+    """Load the scope user's declared ``parked_symbols`` (read-only), normalized.
+
+    The MINIMAL read the widened SELL scope gate (Story 9.3) needs: the money-market
+    symbols the user has declared as parked cash-equivalents. Returns the empty set
+    when no scope/session is supplied (e.g. a direct engine call with no user
+    context), when the scope is system (no single owner), or when the user has no
+    config — so the gate stays fail-closed (falls back to index-core-only) on any
+    doubt. Reads ONLY the caller's own row through the fail-closed helper (AD-10).
+    """
+    if scope is None or session is None or scope.is_system:
+        return set()
+    # Imported here (not at module load) to avoid an import cycle at startup:
+    # ``cash.config`` imports models/repo that are heavy at import time, and the
+    # execution owner is imported very early (decision_record imports it).
+    from cash.config import get_config, normalize_symbols
+
+    config = await get_config(scope, session)
+    if config is None:
+        return set()
+    return set(normalize_symbols(config.parked_symbols))
+
+
 async def execute_approved_order(
     order_intent: OrderIntent,
     *,
     broker: BrokerPort,
     broker_session: BrokerageSession,
     idempotency_key: str | None = None,
+    scope: "Scope | None" = None,
+    session: "AsyncSession | None" = None,
 ) -> OrderOutcome:
     """Assert session integrity, validate v1 scope, place, then reconcile.
 
@@ -252,13 +281,25 @@ async def execute_approved_order(
     ``broker``'s ``provider``, raising :class:`SessionIntegrityError` on either
     failure BEFORE the scope gate, key mint, or any broker call — so the broker is
     NEVER touched on an integrity failure (integrity runs before scope). It then
-    validates the v1 order scope (:func:`~strategy.index_core.is_index_core` on
-    the symbol and ``amount > 0``; ``side`` is guaranteed buy/sell by
-    :class:`~coach.recommendation.OrderSide`), raising :class:`OrderScopeError`
-    on any violation BEFORE the broker is called. On a passing intent it mints an
-    idempotency key (unless one is supplied), awaits a single ``place_order``,
-    then reconciles the placement via :func:`_reconcile` and returns the true
-    :class:`OrderOutcome`. Pure orchestration + gate: no persistence (Story 4.9).
+    validates the v1 order scope, raising :class:`OrderScopeError` on any violation
+    BEFORE the broker is called.
+
+    v1 ORDER SCOPE (widened for SELL, Story 9.3): a **BUY** stays index-core-only
+    (:func:`~strategy.index_core.is_index_core`). A **SELL** is in-scope when the
+    symbol is index-core **OR** it is one of the scope user's declared
+    ``parked_symbols`` — so a beginner can sell their own money-market
+    cash-equivalent to fund an in-scope buy (the just-in-time liquidation path),
+    while the gate still stops beginners *buying* random securities. The
+    parked-symbol widening applies ONLY when a USER ``scope`` + ``session`` are
+    supplied (the ``/approve`` path always supplies them); a scope-less direct
+    engine call keeps the strict index-core-only behavior (fail-closed). All other
+    hardening — the ``amount > 0`` gate, ``validate_order_intent``, session
+    integrity, key minting, atomic reconcile — is UNCHANGED.
+
+    On a passing intent it mints an idempotency key (unless one is supplied),
+    awaits a single ``place_order``, then reconciles the placement via
+    :func:`_reconcile` and returns the true :class:`OrderOutcome`. Pure
+    orchestration + gate: no persistence (Story 4.9).
 
     The symbol is canonicalized (strip + upper) ONCE here so the scope check and
     the order actually placed operate on the same string — otherwise a symbol
@@ -274,7 +315,14 @@ async def execute_approved_order(
     _assert_session_integrity(broker, broker_session)
 
     normalized_symbol = (order_intent.symbol or "").strip().upper()
-    if not is_index_core(normalized_symbol):
+    in_scope = is_index_core(normalized_symbol)
+    if not in_scope and order_intent.side == OrderSide.SELL:
+        # SELL widening (Story 9.3): a declared parked money-market symbol is a
+        # legitimate sell even when it is not index-core. Read-only, scoped —
+        # loaded ONLY when a user scope+session are supplied (the /approve path).
+        parked = await _scope_user_parked_symbols(scope, session)
+        in_scope = normalized_symbol in parked
+    if not in_scope:
         raise OrderScopeError(
             "This order is outside the v1 scope. Ballast v1 can only place "
             "orders in broad index funds and ETFs."

@@ -46,6 +46,7 @@ _EPIC6_INDEXES = (
     "ix_decision_record_broker_ref",
     "ix_decision_record_owner_co_signed_at",
     "uq_portfolio_balance_owner",
+    "ix_pending_buy_owner_status",  # Story 9.3 pending_buy list index
 )
 
 
@@ -92,6 +93,45 @@ async def _index_exists(name: str) -> bool:
             {"name": name},
         )
         return result.first() is not None
+
+
+async def _table_exists(table: str) -> bool:
+    """True if a base table named ``table`` exists (via ``information_schema``)."""
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = :table"
+            ),
+            {"table": table},
+        )
+        return result.first() is not None
+
+
+@pytest.mark.asyncio
+async def test_migration_provisions_pending_buy_table_and_index():
+    """A carried-over DB missing ``pending_buy`` is provisioned by the migration (9.3).
+
+    Drops the whole ``pending_buy`` table (its index goes with it) to model a DB
+    provisioned before Epic 9, then runs the migration and asserts the table, its
+    columns, and its ``(owner_id, status)`` index all exist — created idempotently
+    via ``CREATE TABLE IF NOT EXISTS`` (never an ALTER of an existing table).
+    """
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP TABLE IF EXISTS pending_buy CASCADE"))
+    assert not await _table_exists("pending_buy")
+
+    await run_startup_migrations(engine)
+
+    assert await _table_exists("pending_buy")
+    for column in ("id", "buy_intent", "amount", "status", "sell_decision_id",
+                   "created_at", "resumed_at", "cancelled_at", "owner_id"):
+        assert await _column_exists("pending_buy", column), column
+    assert await _index_exists("ix_pending_buy_owner_status")
+
+    # Idempotent: a second run is a clean no-op with the schema intact.
+    await run_startup_migrations(engine)
+    assert await _table_exists("pending_buy")
 
 
 # --- (a) provisions-missing-schema -------------------------------------------

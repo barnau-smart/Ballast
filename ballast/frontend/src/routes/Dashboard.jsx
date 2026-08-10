@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { PortfolioPanel } from '../components/PortfolioPanel.jsx'
 import { MissedGrowthMeter } from '../components/MissedGrowthMeter.jsx'
+import { PendingBuyCard } from '../components/PendingBuyCard.jsx'
 import { apiFetch } from '../lib/session.js'
 import './screen.css'
 
@@ -92,6 +93,10 @@ export function Dashboard() {
           </div>
         </div>
       ) : null}
+
+      {/* Durable pending buys surface on visit (pull-only, Story 9.3) — a buy
+          set aside for settled cash resumes here even after a missed note. */}
+      <PendingBuyCard />
 
       <PortfolioPanel status={status} portfolio={portfolio} />
       <MissedGrowthMeter />

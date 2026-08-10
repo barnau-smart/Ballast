@@ -1,0 +1,100 @@
+/*
+ * Durable pending-buy surface (Story 9.3). Calm, low-contrast — NEVER red/pink.
+ * A buy set aside until cash settles is a normal, patient state, not a failure;
+ * no brand-red / accent-pink / line-red is used here, and there is no nudge/FOMO.
+ */
+
+.ballast-pending-buys {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-pending-buys__eyebrow {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-pending-buy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  padding-top: var(--ballast-space-8);
+}
+
+.ballast-pending-buy__line {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-pending-buy__asof {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-pending-buy__waiting,
+.ballast-pending-buy__ready {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-pending-buy__actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  align-items: flex-start;
+}
+
+.ballast-pending-buy__resume {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-bg);
+  background-color: var(--ballast-color-accent);
+  border: none;
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-16);
+  cursor: pointer;
+}
+
+.ballast-pending-buy__resume:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ballast-pending-buy__cancel {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.ballast-pending-buy__msg {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-pending-buy__link {
+  color: var(--ballast-color-accent);
+}

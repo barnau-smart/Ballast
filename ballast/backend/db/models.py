@@ -455,6 +455,77 @@ class DigestPreference(OwnedEntityMixin, Base):
     )
 
 
+class PendingBuy(OwnedEntityMixin, Base):
+    """A durable, deferred buy waiting for settled cash (table: ``pending_buy``, Epic 9).
+
+    Story 9.3 (Just-in-time liquidation + deferred/resumed buy): a per-user owned
+    entity (AD-10) — reachable ONLY through the fail-closed ``ScopedRepository`` —
+    that DURABLY records a decided buy whose amount exceeded the user's
+    instantly-spendable ``ready_to_trade`` cash at the buy step. The intent must
+    survive restarts and a missed/unseen web notification, so it lives in its own
+    table (not in memory, not on the pure ``portfolio_cache`` projection). It
+    persists until the user resumes it (once ``ready_to_trade`` covers it) or
+    cancels it — pull-only, no background settlement poller.
+
+    ``buy_intent`` is the original :class:`~coach.recommendation.OrderIntent`
+    snapshot (JSON, money as fixed-point strings — the SAME shape the decision
+    snapshots use) so the resumed buy is pre-filled EXACTLY as the user first
+    stated it. ``amount`` is HOISTED out of that JSON into its own ``Numeric(20,2)``
+    column so ``funds_ready`` (``ready_to_trade >= amount``) is a direct decimal
+    compare, never a JSON parse. ``sell_decision_id`` links back to the proposed
+    money-market SELL decision (``decision_record``) when the shortfall was
+    coverable (``None`` when there was nothing to liquidate).
+
+    ``status`` is one of ``'awaiting_funds'`` (the live, resumable state),
+    ``'resumed'`` (the user resumed it — a proposed buy decision was minted), or
+    ``'cancelled'``. The ``(owner_id, status)`` index backs the scoped
+    ``awaiting_funds`` list read.
+
+    Money is ``Numeric`` (Python ``Decimal``) — NEVER binary float. Timestamps are
+    timezone-aware UTC.
+    """
+
+    __tablename__ = "pending_buy"
+    __table_args__ = (
+        Index("ix_pending_buy_owner_status", "owner_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # The original OrderIntent snapshot (money as fixed-point strings), so the
+    # resumed buy is pre-filled exactly as the user first stated it.
+    buy_intent: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    # The buy amount hoisted out of ``buy_intent`` for a direct ``funds_ready``
+    # decimal compare (``ready_to_trade >= amount``). Decimal, never float.
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(precision=20, scale=2), nullable=False
+    )
+
+    # 'awaiting_funds' at insert; transitions ONCE to 'resumed' (on resume) or
+    # 'cancelled' (on cancel).
+    status: Mapped[str] = mapped_column(
+        String(length=16), nullable=False, default="awaiting_funds"
+    )
+
+    # Links back to the proposed money-market SELL decision when the shortfall was
+    # coverable; NULL when there was nothing to liquidate.
+    sell_decision_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True
+    )
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # When the user resumed / cancelled this pending buy (NULL until it happens).
+    resumed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class CashConfig(OwnedEntityMixin, Base):
     """A user's honest cash configuration (table: ``cash_config``, Epic 9).
 

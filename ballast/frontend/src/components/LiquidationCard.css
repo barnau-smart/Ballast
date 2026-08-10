@@ -1,0 +1,102 @@
+/*
+ * Just-in-time liquidation card (Story 9.3). Calm, low-contrast — NEVER
+ * red/pink for the user's own money. No brand-red / accent-pink / line-red is
+ * used here; the sell of one's own money-market cash is a normal, unhurried step.
+ */
+
+.ballast-liquidation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-12);
+  background-color: var(--ballast-color-surface-2);
+  border-style: solid;
+  border-width: var(--ballast-space-4);
+  border-color: var(--ballast-color-line);
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-20);
+}
+
+.ballast-liquidation__eyebrow {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--ballast-space-4);
+  margin: 0;
+}
+
+.ballast-liquidation__reasoning {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  line-height: var(--ballast-line-height-body);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-liquidation__plan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+}
+
+.ballast-liquidation__line {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-base);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-liquidation__partial,
+.ballast-liquidation__nothing {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+/* Protected-reserve line: reassurance, text color only (never red/pink). */
+.ballast-liquidation__reserve {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-liquidation__asof {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-xs);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-liquidation__actions {
+  display: flex;
+  gap: var(--ballast-space-12);
+}
+
+.ballast-liquidation__approve {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-bg);
+  background-color: var(--ballast-color-accent);
+  border: none;
+  border-radius: var(--ballast-radius-base);
+  padding: var(--ballast-space-8) var(--ballast-space-16);
+  cursor: pointer;
+}
+
+.ballast-liquidation__approve:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ballast-liquidation__msg {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-liquidation__link {
+  color: var(--ballast-color-accent);
+}

@@ -49,6 +49,36 @@ logger = logging.getLogger("ballast.db.migrations")
 # every ``IF NOT EXISTS`` statement as a no-op. Auto-released on commit/rollback.
 _MIGRATION_LOCK_KEY = 71001  # Story 7.1 startup migration
 
+# (0) Whole tables introduced AFTER a carried-over DB was first provisioned.
+# ``create_all`` builds a brand-new table on a fresh DB, but a DB provisioned
+# before Epic 9 will never see ``pending_buy`` from ``create_all`` if ANOTHER
+# missing table caused an earlier partial create — and, more importantly, running
+# a plain ``CREATE TABLE IF NOT EXISTS`` here makes the provisioning explicit and
+# idempotent for carried-over DBs (Story 9.3). Types + identifier names match the
+# ORM (``db.models.PendingBuy``) EXACTLY — ``UUID`` / ``JSON`` / ``NUMERIC(20,2)``
+# / ``VARCHAR(16)`` / ``TIMESTAMPTZ``, the FK to ``"user"(id) ON DELETE CASCADE``,
+# and the ``(owner_id, status)`` index — so no divergent object is ever created
+# and a fresh DB (already built by ``create_all``) sees a clean no-op. Additive
+# only: never ALTERs or DROPs an existing table.
+TABLE_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "create_pending_buy",
+        "CREATE TABLE IF NOT EXISTS pending_buy ("
+        " id UUID NOT NULL,"
+        " buy_intent JSON NOT NULL,"
+        " amount NUMERIC(20, 2) NOT NULL,"
+        " status VARCHAR(16) NOT NULL DEFAULT 'awaiting_funds',"
+        " sell_decision_id UUID,"
+        " created_at TIMESTAMPTZ NOT NULL,"
+        " resumed_at TIMESTAMPTZ,"
+        " cancelled_at TIMESTAMPTZ,"
+        " owner_id UUID NOT NULL,"
+        " PRIMARY KEY (id),"
+        ' FOREIGN KEY(owner_id) REFERENCES "user" (id) ON DELETE CASCADE'
+        ")",
+    ),
+]
+
 # (1) Additive columns on the pre-existing ``decision_record`` table. Types match
 # the ORM exactly (VARCHAR(64) / JSON / TIMESTAMPTZ). ``IF NOT EXISTS`` makes each
 # a no-op once the column is present.
@@ -139,6 +169,14 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_balance_owner "
         "ON portfolio_balance (owner_id)",
     ),
+    (
+        # Story 9.3: the scoped ``awaiting_funds`` list read's ``(owner_id,
+        # status)`` index on ``pending_buy``. Built via ``create_all`` on a fresh
+        # DB; created here for a carried-over DB (after the table exists above).
+        "ix_pending_buy_owner_status",
+        "CREATE INDEX IF NOT EXISTS ix_pending_buy_owner_status "
+        "ON pending_buy (owner_id, status)",
+    ),
 ]
 
 
@@ -161,6 +199,7 @@ async def run_startup_migrations(engine: AsyncEngine) -> None:
             {"key": _MIGRATION_LOCK_KEY},
         )
         for phase, statements in (
+            ("table", TABLE_STATEMENTS),
             ("column", COLUMN_STATEMENTS),
             ("backfill", BACKFILL_STATEMENTS),
             ("index", INDEX_STATEMENTS),
@@ -176,4 +215,5 @@ async def run_startup_migrations(engine: AsyncEngine) -> None:
                     )
                     raise
     logger.info("Startup migrations applied (idempotent, %d steps).",
-                len(COLUMN_STATEMENTS) + len(BACKFILL_STATEMENTS) + len(INDEX_STATEMENTS))
+                len(TABLE_STATEMENTS) + len(COLUMN_STATEMENTS)
+                + len(BACKFILL_STATEMENTS) + len(INDEX_STATEMENTS))

@@ -710,6 +710,11 @@ async def approve(
             broker=broker,
             broker_session=broker_session,
             idempotency_key=key,
+            # Story 9.3: pass the user scope + session so the SELL scope gate can
+            # (read-only) widen to the user's declared parked money-market symbols
+            # (a BUY stays index-core-only). Fail-closed when absent.
+            scope=scope,
+            session=session,
         )
     except SessionIntegrityError as exc:
         # Session lapsed or provider mismatched at placement time; release the
