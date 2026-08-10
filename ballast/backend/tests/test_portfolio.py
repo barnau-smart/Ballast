@@ -175,7 +175,7 @@ def client() -> TestClient:
 def test_portfolio_out_serializes_money_fixed_point_no_exponent():
     """`cash` + holding `quantity`/`market_value` render fixed-point (no E+/E-)
     for extreme-large and tiny-fractional values, and round-trip via Decimal(str)."""
-    from api.portfolio import HoldingOut, PortfolioOut
+    from api.portfolio import CashStatesOut, HoldingOut, PortfolioOut
 
     big = Decimal("1E29") / Decimal("100")  # str() → "1E+27"
     tiny = Decimal("1E-8")  # str() → "1E-8"
@@ -190,6 +190,12 @@ def test_portfolio_out_serializes_money_fixed_point_no_exponent():
         ],
         cash=big,
         as_of=None,
+        cash_states=CashStatesOut(
+            ready_to_trade=big,
+            parked=Decimal("0"),
+            reserved=None,
+            reserve_decided=False,
+        ),
     )
     dumped = out.model_dump(mode="json")
     holding = dumped["holdings"][0]
@@ -480,6 +486,121 @@ def test_read_maps_core_vs_non_core(client):
         assert r.status_code == 200, r.text
         by_symbol = {h["symbol"]: h["is_core"] for h in r.json()["holdings"]}
         assert by_symbol == {"VTI": True, "AAPL": False}
+    finally:
+        _delete_user(email)
+
+
+# --- Cash states: the additive three-state summary (Story 9.1) ---------------
+
+
+def test_read_exposes_default_cash_states_without_breaking_shape(client):
+    """A fresh user's `GET /api/portfolio` carries the additive `cash_states`
+    block (reserve never-decided → `reserved` null) while the original
+    `holdings`/`cash`/`as_of` fields are unchanged."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+
+        r = client.get("/api/portfolio", headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Original fixed shape intact.
+        assert body["holdings"] == []
+        assert body["as_of"] is None
+        assert Decimal(str(body["cash"])) == Decimal("0")
+        # Additive cash-state summary present, honest defaults.
+        states = body["cash_states"]
+        assert Decimal(str(states["ready_to_trade"])) == Decimal("0")
+        assert Decimal(str(states["parked"])) == Decimal("0")
+        assert states["reserved"] is None  # never-decided → absent, NOT 0
+        assert states["reserve_decided"] is False
+    finally:
+        _delete_user(email)
+
+
+def test_portfolio_read_does_not_create_cash_config_row(client):
+    """`GET /api/portfolio` is read-only (AD-11) — it must NOT write a cash_config
+    row for a first-time caller (that would be a write-on-read + a race)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+
+        r = client.get("/api/portfolio", headers=headers)
+        assert r.status_code == 200, r.text
+        # Read still exposes the calm default cash-state summary...
+        assert r.json()["cash_states"]["reserve_decided"] is False
+
+        # ...but no config row was persisted by the read.
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM cash_config WHERE owner_id = %s", (str(uid),)
+                )
+                (count,) = cur.fetchone()
+        assert count == 0
+    finally:
+        _delete_user(email)
+
+
+def test_read_flags_parked_holdings_and_sums_parked_value(client):
+    """A user-tagged money-market holding is flagged `is_parked` and its market
+    value rolls up into `cash_states.parked` (derived at read time)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+
+        uid = _user_id_for(email)
+        _insert_holding_sync(uid, "VTI")  # genuine holding (market_value 100.00)
+        _insert_holding_sync(uid, "SWVXX")  # money-market fund (market_value 100.00)
+
+        # Tag SWVXX (lower-case on the wire — normalization must handle it).
+        r = client.put(
+            "/api/cash/config",
+            headers=headers,
+            json={"reserve_amount": None, "reserve_decided": False, "parked_symbols": ["swvxx"]},
+        )
+        assert r.status_code == 200, r.text
+
+        body = client.get("/api/portfolio", headers=headers).json()
+        by_symbol = {h["symbol"]: h["is_parked"] for h in body["holdings"]}
+        assert by_symbol == {"VTI": False, "SWVXX": True}
+        # Parked value = the tagged holding's market value.
+        assert Decimal(str(body["cash_states"]["parked"])) == Decimal("100.00")
+    finally:
+        _delete_user(email)
+
+
+def test_read_resolves_reserved_for_set_and_declined(client):
+    """`cash_states.reserved` is the amount when set, and 0 when declined."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+
+        # Set an explicit reserve.
+        client.put(
+            "/api/cash/config",
+            headers=headers,
+            json={"reserve_amount": "250.00", "reserve_decided": True, "parked_symbols": []},
+        )
+        states = client.get("/api/portfolio", headers=headers).json()["cash_states"]
+        assert Decimal(str(states["reserved"])) == Decimal("250.00")
+        assert states["reserve_decided"] is True
+
+        # Decline — resolves to 0 (decided, no amount).
+        client.put(
+            "/api/cash/config",
+            headers=headers,
+            json={"reserve_amount": None, "reserve_decided": True, "parked_symbols": []},
+        )
+        states = client.get("/api/portfolio", headers=headers).json()["cash_states"]
+        assert states["reserved"] is not None
+        assert Decimal(str(states["reserved"])) == Decimal("0")
+        assert states["reserve_decided"] is True
     finally:
         _delete_user(email)
 

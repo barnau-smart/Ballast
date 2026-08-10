@@ -1,6 +1,9 @@
+---
+baseline_commit: d27e6ae2a6aa51a67e6ae8d56c1d028e5fc72e6e
+---
 # Story 9.1: Cash-state model & user-declared reserve + parked funds
 
-Status: ready-for-dev
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -74,27 +77,42 @@ Source of truth for the whole epic: `_bmad-output/brainstorming/brainstorm-cash-
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — New per-user `CashConfig` model (AC: 1, 2)**
-  - [ ] Add `CashConfig(OwnedEntityMixin, Base)` in `ballast/backend/db/models.py` (table `cash_config`) mirroring `DigestPreference`: `id` UUID pk; `reserve_amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)`; `reserve_decided: Mapped[bool] = mapped_column(nullable=False, default=False)`; `parked_symbols: Mapped[list] = mapped_column(JSON, nullable=False, default=list)`; `created_at` / `updated_at` tz-aware UTC; `__table_args__ = (UniqueConstraint("owner_id", name="uq_cash_config_owner"),)`.
-  - [ ] Confirm no `db/migrations.py` entry is required (new table → `create_all` builds it in full). OPTIONAL parity add: a `CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_config_owner ON cash_config (owner_id)` step (low priority; only for carried-over-DB belt-and-suspenders, matching `uq_portfolio_balance_owner`).
-- [ ] **Task 2 — Config helpers, scoped + fail-closed (AC: 1, 2, 3)**
-  - [ ] New module `ballast/backend/cash/config.py` (new `cash/` package with `__init__.py`) mirroring `digest/preferences.py`: `get_or_create_config(scope, session)` (create-on-first-read with `IntegrityError` lost-race handling, commit on create); `set_reserve(scope, session, *, amount: Decimal | None, decided: bool)` (validates `amount is None or amount >= 0`, else raise a caught ValueError → 422; sets `reserve_decided=True` when the user acts); `set_parked_symbols(scope, session, symbols: list[str])` (normalize upper/trim/dedupe). All via `ScopedRepository(CashConfig, scope, session)`.
-- [ ] **Task 3 — Config API (AC: 1, 2, 3, 7)**
-  - [ ] New `ballast/backend/api/cash.py` router (`prefix="/api/cash"`) mirroring `api/digest.py`: `GET /api/cash/config` → `{ reserve_amount: WireMoney | None, reserve_decided: bool, parked_symbols: list[str] }`; `PUT /api/cash/config` accepting `{ reserve_amount: Decimal | None, reserve_decided: bool, parked_symbols: list[str] }` (money in as Decimal, out as fixed-point string via `WireMoney`). Auth via `get_scope`; session via `get_async_session`. Reject `reserve_amount < 0` with a calm 422.
-  - [ ] Register the router in `ballast/backend/api/app.py` (`app.include_router(cash_router)`), alongside `digest_router`.
-- [ ] **Task 4 — Augment the portfolio read with the three states (AC: 4, 5)**
-  - [ ] In `ballast/backend/api/portfolio.py`: load the caller's `CashConfig` (scoped), add `is_parked: bool` to `HoldingOut` (derived from the parked-symbol set, case-insensitive — mirror how `is_core=is_index_core(...)` is derived), and add a `CashStatesOut` block to `PortfolioOut`: `ready_to_trade` (= `view.cash`), `parked` (Σ parked holdings' `market_value`), `reserved` (amount if set, `Decimal("0")` if declined, `None` if never-decided), `reserve_decided`. Keep `holdings` / `cash` / `as_of` **byte-identical** (do NOT touch `PortfolioView` or `brokers/portfolio.py`). All money via `WireMoney`.
-  - [ ] Do NOT modify `precedent/missed_growth.py` or `api/precedent.py` (9-2 owns the calc).
-- [ ] **Task 5 — Frontend: parked display + three-state stats (AC: 5, 7)**
-  - [ ] `ballast/frontend/src/lib/holdings.js`: add a `partitionByCash(holdings)` (or extend `partitionByCore`) that splits parked (`is_parked`) out first, then core/rest for the remainder; ensure `gainDirection` is never shown for parked holdings.
-  - [ ] `ballast/frontend/src/components/PortfolioPanel.jsx`: render a new **"Parked cash (money market)"** group (cash-equivalent copy, NO `MarketIndicator`), and show the three-state summary (ready-to-trade / parked / reserved) using the new API fields; relabel "Cash ready to invest" to reflect *ready-to-trade* settlement cash. Preserve the core/"the rest" groups for real holdings.
-- [ ] **Task 6 — Frontend: Settings cash card + set-or-decline prompt (AC: 3, 6, 7)**
-  - [ ] `ballast/frontend/src/routes/Settings.jsx`: add a "Cash setup" card (mirror the digest card): a reserve amount input + a "set" / "I don't keep one" (decline) control, and a way to tag which held symbols are parked (a checkbox list of the user's current holdings is the simplest honest UI). Wire to `GET`/`PUT /api/cash/config` via `apiFetch`; optimistic + fail-quiet like the digest toggle.
-  - [ ] Surface a calm, non-blocking **set-or-decline prompt** when `reserve_decided === false` (recommended: a dismissible card on the Dashboard near the cash summary, or a banner) that links to / inlines the set-or-decline action; it disappears once decided.
-- [ ] **Task 7 — Tests (AC: 8, 7) — full suite must stay green**
-  - [ ] Backend `ballast/backend/tests/test_cash_config.py`: default-on-first-read; set reserve (incl. exactly `0`); decline; negative → 422; parked-symbol normalize/dedupe; **scoped isolation** (user A cannot read/modify user B); GET/PUT round-trip with money as fixed-point strings.
-  - [ ] Backend `test_portfolio.py` (extend): portfolio read now returns `is_parked` + the cash-state summary; `reserved` is `null` when never-decided, `0` when declined, the amount when set; `holdings`/`cash`/`as_of` unchanged.
-  - [ ] Frontend `ballast/frontend/src/test/`: a `cash-config` settings test (get/put, set + decline) and a Dashboard test (parked group renders with no up/down indicator; three-state stats show; set-or-decline prompt appears only when undecided). Assert calm copy (reuse the digest FORBIDDEN-word discipline).
+- [x] **Task 1 — New per-user `CashConfig` model (AC: 1, 2)**
+  - [x] Add `CashConfig(OwnedEntityMixin, Base)` in `ballast/backend/db/models.py` (table `cash_config`) mirroring `DigestPreference`: `id` UUID pk; `reserve_amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)`; `reserve_decided: Mapped[bool] = mapped_column(nullable=False, default=False)`; `parked_symbols: Mapped[list] = mapped_column(JSON, nullable=False, default=list)`; `created_at` / `updated_at` tz-aware UTC; `__table_args__ = (UniqueConstraint("owner_id", name="uq_cash_config_owner"),)`.
+  - [x] Confirm no `db/migrations.py` entry is required (new table → `create_all` builds it in full). Verified: the full suite ran green against a fresh `ballast_test` DB where `cash_config` was never hand-created — `create_all` built it (incl. the `UniqueConstraint`). Skipped the OPTIONAL belt-and-suspenders index step (low priority; not needed for a brand-new table).
+- [x] **Task 2 — Config helpers, scoped + fail-closed (AC: 1, 2, 3)**
+  - [x] New module `ballast/backend/cash/config.py` (new `cash/` package with `__init__.py`) mirroring `digest/preferences.py`: `get_or_create_config` (create-on-first-read with `IntegrityError` lost-race handling, commit on create); `set_reserve(..., *, amount, decided)` (validates `amount is None or amount >= 0`, else raise a caught ValueError → 422; sets `reserve_decided=True` when the user acts); `set_parked_symbols(..., symbols)` (normalize upper/trim/dedupe). Added `resolve_reserve(config)` + `normalize_symbols(...)` as the single source of the honest resolution. All via `ScopedRepository(CashConfig, scope, session)`.
+- [x] **Task 3 — Config API (AC: 1, 2, 3, 7)**
+  - [x] New `ballast/backend/api/cash.py` router (`prefix="/api/cash"`) mirroring `api/digest.py`: `GET /api/cash/config`; `PUT /api/cash/config` (money in as Decimal, out as fixed-point string via `WireMoney`). Auth via `get_scope`; session via `get_async_session`. Rejects `reserve_amount < 0` with a calm 422.
+  - [x] Registered the router in `ballast/backend/api/app.py` (`app.include_router(cash_router)`), alongside `digest_router`.
+- [x] **Task 4 — Augment the portfolio read with the three states (AC: 4, 5)**
+  - [x] In `ballast/backend/api/portfolio.py`: load the caller's `CashConfig` (scoped), added `is_parked: bool` to `HoldingOut` (derived at read time from the parked set, case-insensitive — mirrors `is_core`), and added a `CashStatesOut` block to `PortfolioOut`: `ready_to_trade` (= `view.cash`), `parked` (Σ parked holdings' `market_value`), `reserved` (amount if set, `Decimal("0")` if declined, `None` if never-decided), `reserve_decided`. `holdings`/`cash`/`as_of` unchanged; `PortfolioView` and `brokers/portfolio.py` untouched. All money via `WireMoney`.
+  - [x] Did NOT modify `precedent/missed_growth.py` or `api/precedent.py` (9-2 owns the calc).
+- [x] **Task 5 — Frontend: parked display + three-state stats (AC: 5, 7)**
+  - [x] `ballast/frontend/src/lib/holdings.js`: added `partitionByCash(holdings)` (parked split first, then core/rest) + `PARKED_EXPLAINER`; `gainDirection` now returns `null` for parked holdings (belt-and-suspenders — a parked fund never shows an up/down indicator).
+  - [x] `ballast/frontend/src/components/PortfolioPanel.jsx`: renders a new **"Parked cash (money market)"** group (cash-equivalent copy, NO `MarketIndicator`), and the three-state summary (ready-to-trade / parked / reserved) from the new API fields; relabeled "Cash ready to invest" → **"Ready to trade"**. Core/"the rest" groups preserved. Falls back gracefully when `cash_states` is absent.
+- [x] **Task 6 — Frontend: Settings cash card + set-or-decline prompt (AC: 3, 6, 7)**
+  - [x] `ballast/frontend/src/routes/Settings.jsx`: added a "Cash setup" card — reserve amount input + "Save reserve" / "I don't keep one" (decline) controls, and a checkbox list of the user's held symbols to tag as parked. Wired to `GET`/`PUT /api/cash/config` (and `GET /api/portfolio` for the held-symbol list) via `apiFetch`; optimistic + fail-quiet like the digest toggle. Added calm styling in `Settings.css`.
+  - [x] `ballast/frontend/src/routes/Dashboard.jsx`: a calm, non-blocking, dismissible set-or-decline prompt appears near the top when `cash_states.reserve_decided === false`, linking to Settings; it disappears once decided (or dismissed).
+- [x] **Task 7 — Tests (AC: 8, 7) — full suite stays green**
+  - [x] Backend `ballast/backend/tests/test_cash_config.py`: default never-decided-on-first-read; set reserve (incl. exactly `0`); decline; negative → 422 (and nothing persisted); parked-symbol normalize/dedupe; scoped isolation (A cannot read B); auth-required; GET/PUT round-trip with money as fixed-point strings.
+  - [x] Backend `test_portfolio.py` (extended): the read returns `is_parked` + the cash-state summary; `reserved` is `null` when never-decided, `0` when declined, the amount when set; `holdings`/`cash`/`as_of` unchanged (and the two direct-construction serializer tests updated for the required `cash_states`).
+  - [x] Frontend: `src/test/cash-config.test.jsx` (calm copy, never-decided default, held-symbol checkboxes, set / decline / tag PUTs) and extended `src/test/dashboard.test.jsx` (parked group renders with no up/down indicator; three-state stats show; prompt appears only when undecided and is dismissible). Calm-copy FORBIDDEN-word discipline reused.
+
+### Review Findings
+
+_Code review 2026-08-10 (adversarial: Blind Hunter + Edge Case Hunter + Acceptance Auditor). AC1–AC8 and all out-of-scope boundaries verified satisfied; findings below are hardening._
+
+- [x] [Review][Decision] Dashboard set-or-decline prompt dismissal is per-session — AC6 says "surfaces once." **Resolved (MasterB): persist "Maybe later" in `localStorage`** so it surfaces once and doesn't return on reload. Implemented in `ballast/frontend/src/routes/Dashboard.jsx`.
+- [x] [Review][Patch] Make the config PUT atomic — one `get_or_create` + set reserve & parked + a single commit (currently two independent commits → a partial write is possible if the second fails) [ballast/backend/api/cash.py:102-108, ballast/backend/cash/config.py]
+- [x] [Review][Patch] Reject non-finite / over-`Numeric(20,2)`-range / over-2-decimal reserve with a calm 422 (NaN/Infinity bypass the `< 0` guard and reach `WireMoney`; a huge value or a driver error surfaces as a raw 500; extra decimals are silently rounded) [ballast/backend/cash/config.py:set_reserve]
+- [x] [Review][Patch] Server-side coherence: if `reserve_amount` is provided, force `reserve_decided=True` so an amount can never persist as "never-decided" (`resolve_reserve` would report `None` despite a stored amount) [ballast/backend/cash/config.py / ballast/backend/api/cash.py]
+- [x] [Review][Patch] `GET /api/portfolio` must not write — read the config read-only (in-memory never-decided default when absent) instead of create-on-GET via `get_or_create_config` (violates the "read-only" contract; a GET can now 500 on a write failure; opens a first-read write race) [ballast/backend/api/portfolio.py]
+- [x] [Review][Patch] Reuse `normalize_symbols` for the read-path parked matching so the comparison rule can't drift from the stored canonical form [ballast/backend/api/portfolio.py:_to_out]
+- [x] [Review][Patch] Frontend: disable "Save reserve" when the amount box is empty and drive the state line off server-confirmed state — an empty-box Save currently PUTs an explicit $0 while the label reads "you don't keep a reserve" (conflates set-$0 with declined) [ballast/frontend/src/routes/Settings.jsx:handleSetReserve]
+- [x] [Review][Patch] Frontend: toggling a parked checkbox must persist the server-confirmed reserve, not the live unsaved input box (a parked toggle silently commits whatever is typed but not yet saved) [ballast/frontend/src/routes/Settings.jsx:handleToggleParked]
+- [x] [Review][Patch] Frontend: fetch cash-config and portfolio with independent fail-quiet catches so a config hiccup doesn't discard a successfully-loaded holdings list [ballast/frontend/src/routes/Settings.jsx]
+- [x] [Review][Defer] `parked_symbols` JSON column is not `MutableList`-tracked [ballast/backend/db/models.py] — deferred: safe today (the helper always reassigns the whole list); latent trap only if future code mutates it in place.
 
 ## Dev Notes
 
@@ -164,8 +182,46 @@ This mirrors the intent's "explicit set OR decline; after that an unset reserve 
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Claude Opus 4.8, 1M context) — via `/bmad-dev-story 9-1`.
+
 ### Debug Log References
+
+- **Live-link safety (go-live gotcha honored):** the dev DB `ballast` holds MasterB's real Schwab `brokerage_token` (1 row). The conftest guard (`_guard_live_brokerage_link`) correctly refuses to run the suite against it, and several fixtures DELETE `brokerage_token` for isolation. To avoid wiping the live link, I created a disposable **`ballast_test`** database in the same container and ran the entire backend suite against it with `DATABASE_URL=…/ballast_test BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1`. The live `ballast` DB was never written to. `ballast_test` is left in place as a reusable isolated test target.
+- No linter is configured in this repo (`ruff` not installed; no `npm run lint` script) — the quality gate is pytest + vitest, both green.
 
 ### Completion Notes List
 
+- **Foundation only — no market math changed.** `precedent/missed_growth.py` and `api/precedent.py` were deliberately left untouched (9-2 owns the yield-aware recalc). The read now *exposes* `parked` + `reserved` so 9-2 can compute `cash + parked − reserve`.
+- **The honesty crux (AC2)** lives in two columns (`reserve_decided` + `reserve_amount`) and one resolver, `cash.config.resolve_reserve`: never-decided → `None` (never silently `0`), declined → `Decimal("0")`, set → the amount (`0` is a legitimate explicit set). The `never-decided` state is what drives the one-time Dashboard prompt (AC6).
+- **`PortfolioView` / `brokers/portfolio.py` / `PortfolioCache` untouched** (AD-14). `is_parked` and the cash states are DERIVED at read time from the user's `CashConfig` exactly as `is_core` is derived — never stored on the pure projection. `holdings`/`cash`/`as_of` are byte-identical.
+- **`PortfolioOut.cash_states` is required** (not optional) — the two pre-existing direct-construction serializer tests in `test_portfolio.py` were updated to pass it. The frontend degrades gracefully when a payload predates `cash_states` (empty/degraded state), so no runtime break.
+- **Calm voice (AC7)** enforced by tests: the Settings card, the Dashboard prompt, and the parked group all assert the digest FORBIDDEN-word discipline and no red/pink treatment.
+- **AC8 / migrations:** the full suite ran green against a brand-new `ballast_test` DB where `cash_config` was never hand-created — proving `create_all` builds the new table (with its `UniqueConstraint`) with no `ALTER` migration.
+- **Tests:** backend `654 passed` (was 631 pre-story family; +23 incl. 7 new cash-config + 3 new portfolio cash-state); frontend `153 passed` (16 new/extended across `cash-config.test.jsx` + `dashboard.test.jsx`).
+
 ### File List
+
+**New:**
+- `ballast/backend/cash/__init__.py`
+- `ballast/backend/cash/config.py`
+- `ballast/backend/api/cash.py`
+- `ballast/backend/tests/test_cash_config.py`
+- `ballast/frontend/src/test/cash-config.test.jsx`
+
+**Modified:**
+- `ballast/backend/db/models.py` (add `CashConfig`)
+- `ballast/backend/api/app.py` (import + register `cash_router`)
+- `ballast/backend/api/portfolio.py` (add `is_parked` + `CashStatesOut`; load scoped `CashConfig`)
+- `ballast/backend/tests/test_portfolio.py` (cash-state read tests + serializer-test fixups)
+- `ballast/frontend/src/lib/holdings.js` (`partitionByCash`, `PARKED_EXPLAINER`, parked-aware `gainDirection`)
+- `ballast/frontend/src/components/PortfolioPanel.jsx` (parked group + three-state summary)
+- `ballast/frontend/src/routes/Settings.jsx` (Cash setup card)
+- `ballast/frontend/src/routes/Settings.css` (calm cash-card styles)
+- `ballast/frontend/src/routes/Dashboard.jsx` (set-or-decline prompt)
+- `_bmad-output/implementation-artifacts/9-1-cash-state-model-reserve-parked-funds.md` (this file)
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` (status → in-progress → review)
+
+## Change Log
+
+- 2026-08-10 — Implemented Story 9.1 (Cash-state model & user-declared reserve + parked funds). New `cash_config` owned table + `cash/config.py` helpers + `GET/PUT /api/cash/config`; augmented `GET /api/portfolio` with additive `is_parked` + `cash_states` (ready-to-trade / parked / reserved). Frontend: parked-cash group, three-state summary, Settings "Cash setup" card, and a calm Dashboard set-or-decline prompt. All 8 ACs satisfied; backend 654 passed, frontend 153 passed. Status → review.
+- 2026-08-10 — Adversarial code review (Blind Hunter + Edge Case Hunter + Acceptance Auditor): AC1–AC8 confirmed satisfied. 1 decision + 8 patches applied, 1 deferred, 6 dismissed. Fixes: atomic single-commit PUT; reserve input validation (non-finite / range / >2dp → calm 422, + canonical scale-2); coherence guard (an amount forces `reserve_decided=True`); `GET /api/portfolio` made read-only (no create-on-read); read-path reuses `normalize_symbols`; frontend — empty-box Save disabled (no more set-$0-labeled-as-decline), parked toggle persists server-confirmed reserve, independent fail-quiet fetches, and prompt dismissal persisted in `localStorage` (AC6 "surfaces once"). Backend 662 passed, frontend 153 passed. Status → done.

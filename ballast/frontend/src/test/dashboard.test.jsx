@@ -1,11 +1,18 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { Dashboard } from '../routes/Dashboard.jsx'
 import { describeHolding } from '../lib/holdings.js'
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // The set-or-decline prompt persists "Maybe later" in localStorage — clear it
+  // so each test starts from a clean, undismissed slate.
+  try {
+    window.localStorage.clear()
+  } catch {
+    // ignore — jsdom always provides localStorage
+  }
 })
 
 function stubPortfolio(payload, { ok = true } = {}) {
@@ -146,5 +153,92 @@ describe('Dashboard — plain-English portfolio', () => {
     await waitFor(() =>
       expect(screen.getByTestId('portfolio-empty')).toBeInTheDocument(),
     )
+  })
+})
+
+// --- Story 9.1: parked cash, three-state summary, set-or-decline prompt ------
+
+const WITH_PARKED = {
+  holdings: [
+    { symbol: 'VTI', quantity: '10', market_value: '2500.00', cost_basis: '2000.00', is_core: true, is_parked: false },
+    { symbol: 'SWVXX', quantity: '500', market_value: '500.00', cost_basis: null, is_core: false, is_parked: true },
+  ],
+  cash: '300.00',
+  as_of: '2026-08-10T12:00:00Z',
+  cash_states: {
+    ready_to_trade: '300.00',
+    parked: '500.00',
+    reserved: '1000.00',
+    reserve_decided: true,
+  },
+}
+
+describe('Dashboard — cash intelligence (Story 9.1)', () => {
+  it('renders parked money-market funds as cash — no up/down indicator', async () => {
+    stubPortfolio(WITH_PARKED)
+    const { container } = renderDashboard()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('portfolio-group-parked')).toBeInTheDocument(),
+    )
+    const parked = screen.getByTestId('portfolio-group-parked')
+    // SWVXX lives in the parked group, described as cash-equivalent.
+    expect(within(parked).getByTestId('holding-SWVXX')).toBeInTheDocument()
+    expect(parked.textContent.toLowerCase()).toContain('money-market')
+    // A parked fund is cash, not a bet — NO up/down "since you bought" indicator.
+    expect(within(parked).queryByText(/since you bought/i)).toBeNull()
+    // VTI (a genuine holding) stays in the core group, not parked.
+    const core = screen.getByTestId('portfolio-group-core')
+    expect(within(core).getByTestId('holding-VTI')).toBeInTheDocument()
+    // Never a red/pink treatment.
+    expect(container.innerHTML).not.toMatch(/brand-red|accent-pink|line-red/)
+  })
+
+  it('shows the honest three-state cash summary (ready-to-trade / parked / reserved)', async () => {
+    stubPortfolio(WITH_PARKED)
+    renderDashboard()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('portfolio-cash')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('portfolio-cash')).toHaveTextContent('$300.00')
+    expect(screen.getByTestId('portfolio-parked')).toHaveTextContent('$500.00')
+    expect(screen.getByTestId('portfolio-reserved')).toHaveTextContent('$1,000.00')
+  })
+
+  it('shows the calm set-or-decline prompt ONLY when the reserve is undecided', async () => {
+    stubPortfolio({
+      holdings: [
+        { symbol: 'VTI', quantity: '10', market_value: '2500.00', cost_basis: '2000.00', is_core: true, is_parked: false },
+      ],
+      cash: '100.00',
+      as_of: '2026-08-10T12:00:00Z',
+      cash_states: { ready_to_trade: '100.00', parked: '0', reserved: null, reserve_decided: false },
+    })
+    renderDashboard()
+
+    const prompt = await screen.findByTestId('reserve-prompt')
+    // Calm, optional framing that points to Settings — never alarmist.
+    expect(prompt.textContent.toLowerCase()).toContain('reserve')
+    expect(screen.getByTestId('reserve-prompt-link')).toBeInTheDocument()
+    expect(prompt.textContent).not.toMatch(
+      /miss out|hurry|urgent|act now|last chance|don'?t miss|fear|warning/i,
+    )
+
+    // Dismissing it hides it (non-blocking).
+    fireEvent.click(screen.getByTestId('reserve-prompt-dismiss'))
+    await waitFor(() =>
+      expect(screen.queryByTestId('reserve-prompt')).not.toBeInTheDocument(),
+    )
+  })
+
+  it('hides the prompt once the reserve has been decided', async () => {
+    stubPortfolio(WITH_PARKED) // reserve_decided: true
+    renderDashboard()
+
+    await waitFor(() =>
+      expect(screen.getByTestId('portfolio-panel')).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('reserve-prompt')).not.toBeInTheDocument()
   })
 })

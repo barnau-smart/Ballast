@@ -82,6 +82,29 @@ export function partitionByCore(holdings) {
   return { core, rest }
 }
 
+/**
+ * Split holdings into user-tagged parked (money-market) cash-equivalents vs.
+ * genuine investment holdings, then partition the genuine holdings into the
+ * index core vs. the rest (Story 9.1, Epic 9). Parked is pulled out FIRST so a
+ * money-market fund never renders as a stock-like "mover" — it's cash, not a bet.
+ * Presentation-only — the backend `is_parked`/`is_core` flags own the
+ * classification (AD-1).
+ */
+export function partitionByCash(holdings) {
+  const parked = []
+  const invested = []
+  for (const holding of holdings) {
+    ;(holding.is_parked ? parked : invested).push(holding)
+  }
+  const { core, rest } = partitionByCore(invested)
+  return { parked, core, rest }
+}
+
+/** Plain-English explainer of what "parked cash" means (NFR6, no jargon). */
+export const PARKED_EXPLAINER =
+  'Money-market funds you’ve told us to treat as cash — money set aside, not ' +
+  'invested in the market. We show it as cash, not as a stock that moves up or down.'
+
 /** Plain-English explainer of what "your index core" means (NFR6). */
 export const CORE_EXPLAINER =
   'Your index core is the steady base of your portfolio — broad, low-cost funds ' +
@@ -99,6 +122,9 @@ export const NON_CORE_EXPLAINER =
  * NOTE: a 'down' holding is shown sky-blue ▼ — NEVER red/pink (hard color rule).
  */
 export function gainDirection(holding) {
+  // Parked money-market funds are cash, not a bet — never show an up/down
+  // "since you bought" indicator for them, regardless of cost basis (Story 9.1).
+  if (holding.is_parked) return null
   if (holding.cost_basis == null) return null
   const marketValue = Number(holding.market_value)
   const costBasis = Number(holding.cost_basis)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -26,6 +27,8 @@ from brokers.factory import get_reading_broker
 from brokers.port import BrokerPort
 from brokers.portfolio import PortfolioView, get_portfolio, reconcile_portfolio
 from brokers.schwab_adapter import SchwabAccountSelectionError
+from cash.config import get_config, normalize_symbols, resolve_reserve
+from db.models import CashConfig
 from db.scope import Scope
 from db.session import get_async_session
 from money import WireMoney
@@ -54,6 +57,29 @@ class HoldingOut(BaseModel):
     market_value: WireMoney
     cost_basis: WireMoney | None = None
     is_core: bool = False
+    is_parked: bool = False
+
+
+class CashStatesOut(BaseModel):
+    """The honest three-state split of the user's cash (Story 9.1, Epic 9).
+
+    Additive to :class:`PortfolioOut` — the existing ``cash`` field is unchanged.
+    All three states are DERIVED at read time from the user's :class:`CashConfig`
+    (never stored on the pure ``portfolio_cache`` projection, AD-14):
+
+    - ``ready_to_trade`` — settlement cash (== ``PortfolioOut.cash``, the
+      authoritative ``portfolio_balance`` figure).
+    - ``parked`` — Σ market value of the user's parked (money-market) holdings.
+    - ``reserved`` — the RESOLVED reserve: the amount if set, ``0`` if declined,
+      ``null`` if never-decided (never silently 0 — that is the honesty crux).
+    - ``reserve_decided`` — whether the user has made an explicit reserve decision
+      (drives the calm one-time set-or-decline prompt when ``False``).
+    """
+
+    ready_to_trade: WireMoney
+    parked: WireMoney
+    reserved: WireMoney | None = None
+    reserve_decided: bool
 
 
 class PortfolioOut(BaseModel):
@@ -61,27 +87,58 @@ class PortfolioOut(BaseModel):
 
     ``as_of`` is the broker snapshot timestamp the cache was reconciled from,
     or ``None`` if the portfolio has never been imported for this user.
+
+    ``cash_states`` (Story 9.1) is an ADDITIVE honest three-state view of cash;
+    the original ``holdings``/``cash``/``as_of`` fields are unchanged (reconcile +
+    missed-growth depend on them).
     """
 
     holdings: list[HoldingOut]
     cash: WireMoney
     as_of: datetime.datetime | None
+    cash_states: CashStatesOut
 
 
-def _to_out(view: PortfolioView) -> PortfolioOut:
+def _to_out(view: PortfolioView, config: CashConfig | None) -> PortfolioOut:
+    # Parked classification is DERIVED at read time from the user's config
+    # (case-insensitive), exactly as ``is_core`` is derived — never stored on the
+    # pure broker projection (AD-14). An unheld tagged symbol simply matches
+    # nothing here. ``config`` is ``None`` for a user who has never set one — a
+    # calm never-decided default, and the read path never writes one (AD-11:
+    # ``GET`` stays read-only). Reuse ``normalize_symbols`` so the read-path
+    # compare rule can't drift from how the symbols were stored.
+    parked_set = set(normalize_symbols(config.parked_symbols)) if config else set()
+
+    def _is_parked(symbol: str) -> bool:
+        return bool(symbol) and symbol.strip().upper() in parked_set
+
+    holdings = [
+        HoldingOut(
+            symbol=h.symbol,
+            quantity=h.quantity,
+            market_value=h.market_value,
+            cost_basis=h.cost_basis,
+            is_core=is_index_core(h.symbol),
+            is_parked=_is_parked(h.symbol),
+        )
+        for h in view.holdings
+    ]
+
+    parked_total = sum(
+        (h.market_value for h in view.holdings if _is_parked(h.symbol)),
+        Decimal("0"),
+    )
+
     return PortfolioOut(
-        holdings=[
-            HoldingOut(
-                symbol=h.symbol,
-                quantity=h.quantity,
-                market_value=h.market_value,
-                cost_basis=h.cost_basis,
-                is_core=is_index_core(h.symbol),
-            )
-            for h in view.holdings
-        ],
+        holdings=holdings,
         cash=view.cash,
         as_of=view.as_of,
+        cash_states=CashStatesOut(
+            ready_to_trade=view.cash,
+            parked=parked_total,
+            reserved=resolve_reserve(config) if config is not None else None,
+            reserve_decided=config.reserve_decided if config is not None else False,
+        ),
     )
 
 
@@ -99,7 +156,8 @@ async def read_portfolio(
     on a live session (degraded mode keeps reads working — AD-11).
     """
     view = await get_portfolio(scope, session)
-    return _to_out(view)
+    config = await get_config(scope, session)
+    return _to_out(view, config)
 
 
 @router.post("/refresh", response_model=PortfolioOut)
@@ -123,4 +181,5 @@ async def refresh_portfolio(
         # calmly (never a raw 500), symmetric with the approve path's refusal
         # (NFR8 calm/honest voice). No cache was written.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return _to_out(view)
+    config = await get_config(scope, session)
+    return _to_out(view, config)

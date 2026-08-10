@@ -453,3 +453,64 @@ class DigestPreference(OwnedEntityMixin, Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class CashConfig(OwnedEntityMixin, Base):
+    """A user's honest cash configuration (table: ``cash_config``, Epic 9).
+
+    Story 9.1 (Cash Intelligence): a per-user owned entity (AD-10) — reachable
+    ONLY through the fail-closed ``ScopedRepository``, exactly one row per user
+    (``UniqueConstraint`` on ``owner_id``) — that records how the user actually
+    keeps their money, so every later cash nudge (9-2/9-3) is honest and only
+    ever about money they'd genuinely invest.
+
+    Two columns disambiguate the THREE reserve states cleanly (the honesty crux,
+    AC2) — a "never-decided" reserve is NEVER silently treated as ``0``:
+
+    - **never-decided:** ``reserve_decided = False`` (the default for a brand-new
+      user). This is what triggers the calm one-time set-or-decline prompt (AC6);
+      it must not be read as ``0``.
+    - **declined:** ``reserve_decided = True``, ``reserve_amount = NULL`` — the
+      user explicitly keeps no reserve; resolves to ``Decimal("0")``.
+    - **set:** ``reserve_decided = True``, ``reserve_amount = X`` (``X >= 0``;
+      exactly ``0`` is a legitimate explicit set).
+
+    ``parked_symbols`` is the user-specified set of holding symbols to treat as
+    money-market "parked" cash-equivalents (e.g. ``SWVXX``) — NEVER auto-classified
+    (v1 is user-specified: simpler and honest). Stored normalized (trimmed,
+    upper-cased, de-duplicated). It only affects display/classification for
+    symbols the user actually holds; an unknown/unheld symbol is stored but simply
+    matches nothing.
+
+    Money is ``Numeric`` (Python ``Decimal``) — NEVER binary float.
+    ``created_at``/``updated_at`` are tz-aware UTC.
+    """
+
+    __tablename__ = "cash_config"
+    __table_args__ = (
+        UniqueConstraint("owner_id", name="uq_cash_config_owner"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # The user's declared reserve — cash they never want touched. NULL means
+    # either "never decided" or "declined" (disambiguated by ``reserve_decided``);
+    # a non-NULL value is an explicit set (>= 0). Decimal, never float.
+    reserve_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=20, scale=2), nullable=True
+    )
+
+    # Has the user made an explicit reserve decision (set OR declined)? False
+    # until they act — the "never-decided" state that must NOT be read as 0.
+    reserve_decided: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    # User-tagged money-market/parked symbols (normalized upper-case list). A
+    # brand-new user has none.
+    parked_symbols: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

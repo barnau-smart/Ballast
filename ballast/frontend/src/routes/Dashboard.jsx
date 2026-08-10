@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { PortfolioPanel } from '../components/PortfolioPanel.jsx'
 import { MissedGrowthMeter } from '../components/MissedGrowthMeter.jsx'
 import { apiFetch } from '../lib/session.js'
@@ -14,6 +15,26 @@ import './screen.css'
 export function Dashboard() {
   const [status, setStatus] = useState('loading')
   const [portfolio, setPortfolio] = useState(null)
+  // "Maybe later" persists across reloads (localStorage) so the prompt truly
+  // surfaces once, not every visit (AC6) — it only ever reappears if the user
+  // clears storage. A real decision hides it regardless (it's gated on
+  // reserve_decided === false below).
+  const [reservePromptDismissed, setReservePromptDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem('ballast.reservePromptDismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+
+  function dismissReservePrompt() {
+    setReservePromptDismissed(true)
+    try {
+      window.localStorage.setItem('ballast.reservePromptDismissed', '1')
+    } catch {
+      // Memory-only dismissal is fine if storage is unavailable.
+    }
+  }
 
   useEffect(() => {
     let active = true
@@ -46,6 +67,31 @@ export function Dashboard() {
       <p className="ballast-screen__prose">
         Your calm home base — here’s everything you hold, in plain English.
       </p>
+
+      {status === 'ready' &&
+      portfolio?.cash_states?.reserve_decided === false &&
+      !reservePromptDismissed ? (
+        <div className="ballast-card" data-testid="reserve-prompt">
+          <p className="ballast-screen__prose">
+            One optional thing: tell Ballast how much cash you’d like to keep as a
+            reserve — money you never want it to suggest investing — or let us know
+            you don’t keep one. It helps every suggestion stay honest. No rush; you
+            can decide any time.
+          </p>
+          <div className="ballast-reserve-prompt__actions">
+            <Link to="/settings" data-testid="reserve-prompt-link">
+              Set this up in Settings
+            </Link>
+            <button
+              type="button"
+              onClick={dismissReservePrompt}
+              data-testid="reserve-prompt-dismiss"
+            >
+              Maybe later
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <PortfolioPanel status={status} portfolio={portfolio} />
       <MissedGrowthMeter />

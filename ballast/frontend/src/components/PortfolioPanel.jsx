@@ -3,11 +3,12 @@ import { MarketIndicator } from './MarketIndicator.jsx'
 import {
   CORE_EXPLAINER,
   NON_CORE_EXPLAINER,
+  PARKED_EXPLAINER,
   describeHolding,
   formatCurrency,
   gainDirection,
   holdingsValue,
-  partitionByCore,
+  partitionByCash,
   totalValue,
 } from '../lib/holdings.js'
 import './PortfolioPanel.css'
@@ -59,7 +60,15 @@ export function PortfolioPanel({ status, portfolio }) {
   }
 
   const total = totalValue(holdings, portfolio.cash)
-  const { core, rest } = partitionByCore(holdings)
+  const { parked, core, rest } = partitionByCash(holdings)
+
+  // The honest three-state cash split (Story 9.1). Fall back gracefully when the
+  // payload predates the additive `cash_states` block (degraded / empty state).
+  const cashStates = portfolio.cash_states ?? {}
+  const readyToTrade = cashStates.ready_to_trade ?? portfolio.cash
+  const parkedValue = holdingsValue(parked)
+  const reserveDecided = Boolean(cashStates.reserve_decided)
+  const reserved = cashStates.reserved
 
   return (
     <div data-testid="portfolio-panel">
@@ -71,12 +80,37 @@ export function PortfolioPanel({ status, portfolio }) {
           </span>
         </div>
         <div className="ballast-portfolio__stat">
-          <span className="ballast-portfolio__stat-label">Cash ready to invest</span>
+          <span className="ballast-portfolio__stat-label">Ready to trade</span>
           <span className="ballast-portfolio__stat-value" data-testid="portfolio-cash">
-            {formatCurrency(portfolio.cash)}
+            {formatCurrency(readyToTrade)}
           </span>
         </div>
+        {parked.length > 0 ? (
+          <div className="ballast-portfolio__stat">
+            <span className="ballast-portfolio__stat-label">Parked cash</span>
+            <span className="ballast-portfolio__stat-value" data-testid="portfolio-parked">
+              {formatCurrency(parkedValue)}
+            </span>
+          </div>
+        ) : null}
+        {reserveDecided && reserved != null ? (
+          <div className="ballast-portfolio__stat">
+            <span className="ballast-portfolio__stat-label">Set aside (reserve)</span>
+            <span className="ballast-portfolio__stat-value" data-testid="portfolio-reserved">
+              {formatCurrency(reserved)}
+            </span>
+          </div>
+        ) : null}
       </div>
+
+      {parked.length > 0 ? (
+        <HoldingGroup
+          testid="portfolio-group-parked"
+          title="Parked cash (money market)"
+          explainer={PARKED_EXPLAINER}
+          holdings={parked}
+        />
+      ) : null}
 
       {core.length > 0 ? (
         <HoldingGroup

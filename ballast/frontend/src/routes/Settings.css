@@ -40,3 +40,52 @@
   cursor: pointer;
   white-space: nowrap;
 }
+
+/* Story 9.1 — Cash setup card (reserve + parked money-market tagging). Calm,
+   neutral styling: never a red/alarm treatment. */
+.ballast-cash__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
+  margin-top: var(--ballast-space-16);
+}
+
+.ballast-cash__subtitle {
+  font-family: var(--ballast-font-terminal);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+  margin: 0;
+}
+
+.ballast-cash__reserve-row {
+  display: flex;
+  flex-flow: row wrap;
+  align-items: center;
+  gap: var(--ballast-space-8);
+}
+
+.ballast-cash__label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--ballast-space-8);
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-text);
+}
+
+.ballast-cash__state {
+  font-family: var(--ballast-font-body);
+  font-size: var(--ballast-text-sm);
+  color: var(--ballast-color-muted);
+  margin: 0;
+}
+
+.ballast-cash__symbol-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-4);
+}

@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.brokerage import router as brokerage_router
+from api.cash import router as cash_router
 from api.coach import router as coach_router
 from api.config import get_settings
 from api.digest import router as digest_router
@@ -224,6 +225,11 @@ def create_app() -> FastAPI:
     # authenticated GET/PUT preference endpoints plus the unauthenticated
     # one-click unsubscribe link. Email is the only channel; nothing sends here.
     app.include_router(digest_router)
+
+    # Cash configuration (Story 9.1, Epic 9): the Settings "Cash setup" card's
+    # authenticated GET/PUT config endpoints — user-declared reserve + parked
+    # money-market symbols, funneled through the fail-closed scope (AD-10).
+    app.include_router(cash_router)
 
     # --- Routes --------------------------------------------------------------
 
