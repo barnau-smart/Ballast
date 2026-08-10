@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-07  # GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
+last_updated: 2026-08-10  # Epic 9 (Cash Intelligence) opened; story 9-1 created ready-for-dev. Earlier: GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -139,6 +139,18 @@ development_status:
   8-5-test-suite-performance: done  # FIXED hands-on 2026-08-05 (independently verified): real root cause was tests hitting the live Anthropic API via demo .env (LLM_ADAPTER=anthropic) — forced LLM_ADAPTER=fake in conftest → test_coach_api.py 13m45s→~20s, 108 passed, stable x2. Full suite 587 passed/42s; 4 pre-existing .env-artifact failures (test_llm_gateway/test_market_ingest "fake-by-default") remain, out of scope.
   8-6-suggestion-honesty-fill-likelihood: done  # done 2026-08-05: dev via loop (paused pre-finalize in dev-verify), independently test-verified (149 passed, suggest+coach_api ~23s) + bmad-code-review (1 low patch applied, no high/med)
   epic-8-retrospective: done  # completed 2026-08-05 (epic-8-retro-2026-08-05.md)
+
+  # Epic 9: Cash Intelligence (honest idle-cash)
+  # New feature (2026-08-10). From a Facilitator brainstorm → intent doc:
+  # _bmad-output/brainstorming/brainstorm-cash-readiness-idle-cash-2026-08-10/brainstorm-intent.md
+  # Distinguish 3 cash states (ready-to-trade settlement cash / parked money-market / user-declared reserve);
+  # honest yield-aware missed-growth; just-in-time liquidation + deferred buy (propose-and-approve like 8.4).
+  # 3-story split: 9-1 = model + reserve/parked declaration (foundation); 9-2 = honest missed-growth; 9-3 = liquidation/deferred-buy.
+  epic-9: in-progress
+  9-1-cash-state-model-reserve-parked-funds: ready-for-dev
+  9-2-honest-yield-aware-missed-growth: backlog
+  9-3-just-in-time-liquidation-deferred-buy: backlog
+  epic-9-retrospective: optional
 
 action_items:
   - epic: 4
