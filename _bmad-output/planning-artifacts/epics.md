@@ -642,3 +642,64 @@ So that the guessed live payload shapes are confirmed against reality before any
 **Given** real credentials, a linked funded Schwab account, and all of 7.1–7.5 landed,
 **When** the live path is exercised once behind the existing gates,
 **Then** a real paid Anthropic structured-output `/recommend` returns a blessed recommendation (or degrades honestly), one small real in-scope Schwab order is placed → reconciled → co-signed with a truthful `OrderOutcome`, and one real `/refresh` imports true cash + positions (confirming the cash-only mapping and missed-growth honesty); the guessed Schwab order/token/balance JSON field mappings are re-confirmed against the live payloads and any drift is fixed; and the partial-fill terminality question (6.7) is decided and encoded — after which "the Coach works against a live LLM and a live broker" is a proven fact, not a deferred cliff.
+
+---
+
+> **Note:** Epics 8 (Order Interface) and 9 (Cash Intelligence) were inserted after this doc was last regenerated and are tracked in `sprint-status.yaml` + their story/spec files, not here. Epic 10 below is appended in the same lightweight way.
+
+## Epic 10: Allocation Coach — Deploy My Cash (prescriptive portfolio analysis)
+
+**Value:** Turn Ballast from a discipline tool into a **prescriptive value-engine** that answers the beginner's real freeze — *"I have $2,000 sitting there, what do I actually do with it?"* — by x-raying the account against a chosen **target** and handing back concrete, pre-filled moves a human co-signs. Source of truth: `_bmad-output/brainstorming/brainstorm-allocation-coach-deploy-my-cash-2026-08-11/brainstorm-intent.md`.
+
+**Reuses existing work:** Epic 9 cash states/reserve (investable cash = ready-to-trade − reserve, excl. parked); the 9-3 liquidation machinery (trim/de-speculate → redeploy); the propose→approve→co-sign spine (populate controls, human submits); the Precedent-Engine + evidence-record + validation-gate architecture (never-invent-a-fact).
+
+**Load-bearing guardrails (locked in the brainstorm):**
+- The AI opines on the **user's situation + settled principles**, and **NEVER forecasts the market**.
+- The AI **never invents a fact** — deterministic code computes every number; the AI only narrates; a validator rejects any figure not handed to it.
+- **"Nothing to do right now" is a valid, honest output** (churn-safety) — never manufacture a trade.
+- **Rebalance toward target, never chase performance.** Diversification keys on genuinely different asset classes (US vs international vs bonds), NOT two flavors of large-US (SCHB ≈ an S&P-500 fund).
+- **Parked for later (NOT this epic):** aware-but-don't-act, praise-the-healthy, tax-awareness, the whole teaching layer (graduated autonomy, backtests, micro-lessons, strategy personas).
+
+### Story 10.1: Target-allocation model — pick a model portfolio
+
+As a beginner using Ballast,
+I want to pick one simple named target mix (e.g. Conservative / Balanced / Growth) once,
+So that the app has a "where my money should be" to measure against, and I never have to invent an allocation myself.
+
+**Acceptance Criteria:**
+- A small set of **named model portfolios** is defined as code reference data (like `index_core`): each is fixed target weights across **asset classes** (US equity / international equity / bonds), mapped to concrete index-core funds. Not user-editable weights in v1.
+- A **per-user target selection** persists in a new owned config reached only through the fail-closed `ScopedRepository` (AD-10), editable; default = **undecided** → a calm, non-nagging prompt to pick (mirror the Epic 9 set-or-decline pattern).
+- `GET`/`PUT` endpoints for the selection; the **resolved target weights** are exposed for downstream analysis. Calm/no-FOMO voice. Full suite stays green.
+
+### Story 10.2: Gap-to-target deploy-my-cash engine → action items (populate, don't submit)
+
+As a beginner with idle cash,
+I want the app to tell me exactly what to buy and how much to move toward my target, with the order pre-filled for me to approve,
+So that "I have $2k, what do I do?" has a concrete, honest answer.
+
+**Acceptance Criteria:**
+- A **deterministic engine** computes current allocation (holdings grouped by asset class) vs. the selected target, and investable cash (Epic 9 `ready_to_trade` − reserve, excl. parked).
+- It generates the primary **action item**: deploy investable cash to close the largest gaps → concrete buys (fund + amount) **toward target** (rebalance-toward, never chase). Order controls populated; human co-signs via the existing approve spine; **never auto-submits**.
+- **"Nothing to do"** is a valid output (already at target / no investable cash) — no manufactured trade. All money `Decimal`/`WireMoney`; per-user scoped; suite green.
+
+### Story 10.3: Fiduciary-advisor narration + never-invent-a-fact + the 5 good-lesson tests
+
+As a beginner,
+I want the app's expert to explain in plain English what to do and why — prioritizing what matters — without ever inventing a number or predicting the market,
+So that I trust it and learn the *why*.
+
+**Acceptance Criteria:**
+- The **advisor persona narrates** the deterministic action items: the why, the tradeoff, and prioritization (situational opinion). **No market forecasts.**
+- **Never-invent-a-fact:** every number the AI states was computed by the engine and handed to it; a validator rejects any figure not in the provided set (reuse the Precedent-Engine/evidence-record/validation-gate pattern).
+- Each narrated move passes the **5 good-lesson tests** (principle-not-pick; why-generalizes; recognized best practice; teaches the tradeoff; facts-not-forecast). Calm/no-FOMO; the fake-LLM fallback is deterministic templated copy (never a dead-end). Suite green.
+
+### Story 10.4: Additional analysis buckets — concentration/single-stock + cost/fees
+
+As a beginner,
+I want the app to also flag when I'm over-concentrated in one thing or paying too much in fees, and offer the fix,
+So that the analysis is a real portfolio review, not just cash deployment.
+
+**Acceptance Criteria:**
+- **Concentration / single-stock:** flag a position over a threshold or a non-index single stock → action item to trim/de-speculate into the index core (reuse the 9-3 liquidation machinery), populate-don't-submit.
+- **Cost / fees:** flag a holding whose expense ratio materially exceeds a near-identical cheaper index fund → action item to switch. (Requires a small expense-ratio reference table for the known funds; the tax consequence of switching is noted honestly but NOT computed — tax is deferred.)
+- Each item is narrated by the advisor and passes the 10.3 safeguards. Suite green.

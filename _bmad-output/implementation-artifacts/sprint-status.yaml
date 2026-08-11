@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-11  # EPIC 9 (Cash Intelligence) COMPLETE + retro done (epic-9-retro-2026-08-11.md): 9-1/9-2/9-3 all done, independently reviewed/hardened (8 fixes on loop-built 9-2/9-3), merged to main a43004e + pushed. 5 Epic 9 action items recorded (top: mandatory independent review before merging loop money-path work; gate real-money liquidation on settled-cash + APY tuning). Earlier: GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
+last_updated: 2026-08-11  # EPIC 10 (Allocation Coach — Deploy My Cash) OPENED from the allocation-coach brainstorm (4-story MVP, all backlog; 10-1 next via create-story). EPIC 9 (Cash Intelligence) COMPLETE + retro done (epic-9-retro-2026-08-11.md): 9-1/9-2/9-3 all done, independently reviewed/hardened (8 fixes on loop-built 9-2/9-3), merged to main a43004e + pushed. 5 Epic 9 action items recorded (top: mandatory independent review before merging loop money-path work; gate real-money liquidation on settled-cash + APY tuning). Earlier: GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -151,6 +151,19 @@ development_status:
   9-2-honest-yield-aware-missed-growth: done  # dev-auto 2026-08-10: yield-aware missed-growth (base = cash+parked−reserve, reserve parked-first; parked misses window_return − disclosed 4% money-market yield); additive-only (no migration), engine backward-compatible. Adversarial review: 3 patches (1 high honesty fix — market-direction copy keyed on window_return not the dollar sign; medium fully_reserved frontend block; low parked normalization single-source), 1 deferred (APY double-render). Backend 675 / frontend 156 pass. followup_review_recommended:true.
   9-3-just-in-time-liquidation-deferred-buy: done
   epic-9-retrospective: done  # completed 2026-08-11 (epic-9-retro-2026-08-11.md)
+
+  # Epic 10: Allocation Coach — Deploy My Cash (prescriptive portfolio analysis)
+  # Opened 2026-08-11 from the allocation-coach brainstorm (intent doc:
+  # _bmad-output/brainstorming/brainstorm-allocation-coach-deploy-my-cash-2026-08-11/brainstorm-intent.md).
+  # MVP = target model (pick a model portfolio) -> gap-to-target deploy-cash engine -> advisor narration + never-invent safeguard -> extra buckets.
+  # Guardrails: opinion-not-forecast; never invent a fact; "nothing to do" is valid; rebalance-toward not chase.
+  # Parked: aware-but-don't-act, praise-the-healthy, tax, the whole teaching layer.
+  epic-10: in-progress
+  10-1-target-allocation-model-pick-a-model-portfolio: ready-for-dev
+  10-2-gap-to-target-deploy-cash-engine: backlog
+  10-3-fiduciary-advisor-narration-never-invent-safeguard: backlog
+  10-4-analysis-buckets-concentration-cost: backlog
+  epic-10-retrospective: optional
 
 action_items:
   - epic: 4
