@@ -26,7 +26,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.atomic import conditional_claim
 
 from api.deps import get_scope
 from brokers.portfolio import get_portfolio
@@ -601,9 +604,33 @@ async def resume_pending_buy(
         order_intent=intent,
         as_of=view.as_of,
     )
+    # Atomically claim the awaiting_funds → resumed transition BEFORE minting the
+    # proposal, so two concurrent resumes can't each mint a co-signable BUY, and a
+    # resume racing a cancel can't leave a cancelled row with a live proposal
+    # (mirrors decision_record.claim_for_cosign). The flip + the proposal commit
+    # together; a lost race stages nothing and rolls back.
+    won = await conditional_claim(
+        session,
+        update(PendingBuy)
+        .where(
+            PendingBuy.id == pending_buy_id,
+            PendingBuy.owner_id == scope.user_id,
+            PendingBuy.status == "awaiting_funds",
+        )
+        .values(
+            status="resumed",
+            resumed_at=datetime.datetime.now(datetime.timezone.utc),
+        ),
+    )
+    if not won:
+        # Another request transitioned it (resumed or cancelled) between our read
+        # and here — nothing minted, nothing placed.
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="This pending buy is no longer waiting to be resumed.",
+        )
     record = await record_proposal(blessed, scope=scope, session=session)
-    pending.status = "resumed"
-    pending.resumed_at = datetime.datetime.now(datetime.timezone.utc)
     await session.commit()
 
     return ResumeResponse(
@@ -641,9 +668,32 @@ async def cancel_pending_buy(
             status_code=409,
             detail="This pending buy has already been resumed and can't be cancelled.",
         )
-    pending.status = "cancelled"
-    pending.cancelled_at = datetime.datetime.now(datetime.timezone.utc)
-    await session.commit()
-    return CancelPendingBuyResponse(
-        pending_buy_id=str(pending.id), status=pending.status
+    # Atomic awaiting_funds → cancelled, so a cancel racing a resume can't both
+    # win. A lost race re-reads the settled state: already-cancelled → idempotent
+    # success; resumed → the same calm 409 as the pre-check.
+    won = await conditional_claim(
+        session,
+        update(PendingBuy)
+        .where(
+            PendingBuy.id == pending_buy_id,
+            PendingBuy.owner_id == scope.user_id,
+            PendingBuy.status == "awaiting_funds",
+        )
+        .values(
+            status="cancelled",
+            cancelled_at=datetime.datetime.now(datetime.timezone.utc),
+        ),
     )
+    if not won:
+        await session.rollback()
+        refreshed = await repo.get(pending_buy_id)
+        if refreshed is not None and refreshed.status == "cancelled":
+            return CancelPendingBuyResponse(
+                pending_buy_id=str(refreshed.id), status=refreshed.status
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="This pending buy has already been resumed and can't be cancelled.",
+        )
+    await session.commit()
+    return CancelPendingBuyResponse(pending_buy_id=str(pending.id), status="cancelled")

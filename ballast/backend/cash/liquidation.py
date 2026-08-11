@@ -116,7 +116,7 @@ class LiquidationPlan:
     reasoning: str
 
 
-def _largest_parked_holding(holdings, parked_set: set[str]):
+def _largest_parked_holding(holdings, parked_set: set[str], *, exclude_symbol: str = ""):
     """Return the single largest-``market_value`` parked holding, or ``None``.
 
     PURE: selects deterministically over the passed-in holdings — a holding is
@@ -125,11 +125,17 @@ def _largest_parked_holding(holdings, parked_set: set[str]):
     were stored). Ties break on symbol (ascending) so the choice is reproducible.
     A holding with a non-positive/non-finite ``market_value`` or ``quantity`` is
     skipped (it can't be sensibly priced/sold). ``None`` when nothing qualifies.
+
+    ``exclude_symbol`` (already normalized upper) is never selected — so the
+    planner never proposes selling the very fund the user is trying to buy (a user
+    can tag their buy target as parked; the index-core BUY gate only runs later at
+    /approve, not here).
     """
     candidates = [
         h
         for h in holdings
         if h.symbol
+        and (h.symbol or "").strip().upper() != exclude_symbol
         and any(sym in parked_set for sym in normalize_symbols([h.symbol]))
         and h.market_value is not None
         and h.market_value.is_finite()
@@ -348,7 +354,9 @@ async def plan_liquidation(
     parked_set = (
         set(normalize_symbols(config.parked_symbols)) if config is not None else set()
     )
-    holding = _largest_parked_holding(view.holdings, parked_set)
+    holding = _largest_parked_holding(
+        view.holdings, parked_set, exclude_symbol=normalized_buy_symbol
+    )
 
     # v1 sells the SINGLE largest parked holding only (never chains funds). The
     # honest sellable capacity is THAT one holding capped by the reserve-aware

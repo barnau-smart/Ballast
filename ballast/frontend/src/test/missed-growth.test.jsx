@@ -59,6 +59,22 @@ const FALLING = {
     'Over the past year the market fell, so your ~$10,000.00 in idle cash avoided ~$1,000.00 of loss.',
 }
 
+// Story 9.2 hardening: the market ROSE modestly but parked money-market yield
+// outpaced it, so forgone_growth is NEGATIVE (came out ahead) while window_return
+// is POSITIVE. The label must NOT say "loss avoided" (no loss — the market rose).
+const PARKED_OUTPACED = {
+  ...RISING,
+  window_return: '0.0200', // market rose +2%
+  forgone_growth: '-100.00', // came out ahead after ~4% parked yield
+  idle_cash: '5000.00',
+  settlement_cash: '0.00',
+  parked: '5000.00',
+  reserved: null,
+  reserve_decided: false,
+  statement:
+    'Over the past year the market rose modestly, and your parked money-market cash came out ahead of it after yield.',
+}
+
 const FLAT = {
   ...RISING,
   window_return: '0.0000',
@@ -194,6 +210,24 @@ describe('MissedGrowthMeter — calm, honest, accessible, never a nudge', () => 
     expect(container.textContent).not.toMatch(NUDGE_RE)
   })
 
+  it('never says "loss avoided" when the market ROSE but parked yield outpaced it', async () => {
+    stubEstimate(PARKED_OUTPACED)
+    const { container } = render(<MissedGrowthMeter />)
+
+    await waitFor(() =>
+      expect(screen.getByTestId('missed-growth-figure')).toBeInTheDocument(),
+    )
+
+    const amount = screen.getByTestId('missed-growth-amount')
+    // Honest framing: came out AHEAD after yield — the market rose, so there was
+    // no loss to avoid. The label must not contradict the statement.
+    expect(within(amount).getByText(/\$100\.00 ahead, after yield/i)).toBeInTheDocument()
+    expect(amount.textContent).not.toMatch(/loss avoided/i)
+    // Still never a red/pink treatment, still no nudge.
+    expect(container.innerHTML).not.toMatch(/brand-red|accent-pink|line-red/)
+    expect(container.textContent).not.toMatch(NUDGE_RE)
+  })
+
   it('renders a flat window as a neutral note with no ▲/▼ figure (never a phantom +$0.00 gain)', async () => {
     stubEstimate(FLAT)
     const { container } = render(<MissedGrowthMeter />)
@@ -316,10 +350,15 @@ describe('MissedGrowthMeter — calm, honest, accessible, never a nudge', () => 
       /reserve covers all of your cash right now — nothing is sitting idle to invest/i,
     )
 
-    // The protected-reserve line shows the real reserved amount.
+    // The protected-reserve line NEVER claims to protect more than existed:
+    // reserve is $5,000 but only $1,000 (settlement 0 + parked 1000) was ever
+    // there, so it honestly reads $1,000.00, not $5,000.00 (Story 9.2 hardening).
     expect(screen.getByTestId('missed-growth-reserve')).toHaveTextContent(
-      /\$5,000\.00 stayed protected, as you set it/i,
+      /\$1,000\.00 stayed protected, as you set it/i,
     )
+    expect(
+      screen.getByTestId('missed-growth-reserve').textContent,
+    ).not.toMatch(/\$5,000\.00/)
 
     // NO $0.00 figure and NO yield note — nothing is investable, the yield
     // assumption is moot.

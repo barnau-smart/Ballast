@@ -111,6 +111,10 @@ export function CoachConsult() {
   // hard failure. `liquidationPlan` holds the fetched plan; when set (and it
   // `needs_liquidation`), the approve control is replaced by the sell card.
   const [liquidationPlan, setLiquidationPlan] = useState(null)
+  // One-shot guard: the /liquidation-plan POST durably inserts a PendingBuy +
+  // proposed SELL, so it must fire at most once per co-signable decision (a
+  // re-render must never insert a second pending buy). Mirrors PendingBuyCard.
+  const planPostedFor = useRef(null)
 
   const mounted = useRef(true)
   const placingRef = useRef(false) // synchronous double-submit guard
@@ -151,8 +155,14 @@ export function CoachConsult() {
         if (!active || !pres.ok) return
         const portfolio = await pres.json()
         const readyToTrade = Number(portfolio?.cash_states?.ready_to_trade)
-        if (!Number.isFinite(readyToTrade)) return
-        if (readyToTrade >= buyAmount) return // sufficient cash — unchanged path
+        // Only short-circuit when we KNOW cash covers the buy. If ready-to-trade
+        // is unknown (an older/degraded payload with no cash_states), DON'T
+        // dead-end the buy — ask the backend, which authoritatively computes
+        // needs_liquidation (returns false when cash is actually sufficient).
+        if (Number.isFinite(readyToTrade) && readyToTrade >= buyAmount) return
+        // Fire the durable plan POST at most once per decision.
+        if (planPostedFor.current === recommendation.decision_id) return
+        planPostedFor.current = recommendation.decision_id
         const lres = await apiFetch('/api/cash/liquidation-plan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

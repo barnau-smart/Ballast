@@ -48,14 +48,28 @@ export function formatUsd(decimalStr) {
 }
 
 /** The short label for the forgone-growth `MarketIndicator` (unsigned amount).
- * Keyed on the dollar figure's sign so it stays consistent with the glyph the
- * component derives from the same figure. Only used for a NON-zero figure (the
- * component suppresses the indicator entirely when the figure is $0.00). */
+ * The "loss avoided" framing keys on the MARKET direction (`window_return`), not
+ * the figure's sign — otherwise a rising market where parked yield outpaced it
+ * (`forgone_growth < 0`, `window_return > 0`) would falsely read "loss avoided"
+ * beneath an honest "the market rose, you came out ahead" statement (the exact
+ * contradiction the backend statement was fixed to avoid). Only used for a
+ * NON-zero figure (the component suppresses the indicator when it's $0.00). */
 export function amountLabel(estimate) {
   const amount = formatUsd(estimate?.forgone_growth)
   if (amount == null) return null
-  const rose = Number(estimate?.forgone_growth) >= 0
-  return rose ? `${amount} of growth not captured` : `${amount} of loss avoided`
+  const forgone = Number(estimate?.forgone_growth)
+  if (forgone >= 0) {
+    // Idle cash sat out gains it could have captured.
+    return `${amount} of growth not captured`
+  }
+  // Idle cash came out ahead. Call it "loss avoided" ONLY when the market
+  // actually fell; if the market rose (or we can't tell), your parked yield
+  // simply outpaced it — never claim a loss that didn't happen.
+  const windowReturn = Number(estimate?.window_return)
+  const marketFell = Number.isFinite(windowReturn) && windowReturn < 0
+  return marketFell
+    ? `${amount} of loss avoided`
+    : `${amount} ahead, after yield`
 }
 
 /**
@@ -67,8 +81,17 @@ export function amountLabel(estimate) {
  */
 export function reserveLine(estimate) {
   if (estimate?.reserved == null) return null
-  const amount = formatUsd(estimate.reserved)
-  if (amount == null || Number(estimate.reserved) <= 0) return null
+  const reserved = Number(estimate.reserved)
+  if (!Number.isFinite(reserved) || reserved <= 0) return null
+  // Never claim to protect more money than actually existed: cap the displayed
+  // figure at the user's real cash (settlement + parked). A reserve set larger
+  // than the account (fully-reserved) shouldn't read "$5,000 stayed protected"
+  // when only $1,000 was ever there.
+  const held = Number(estimate.settlement_cash) + Number(estimate.parked)
+  const protectedAmt = Number.isFinite(held) ? Math.min(reserved, held) : reserved
+  if (!(protectedAmt > 0)) return null
+  const amount = formatUsd(String(protectedAmt))
+  if (amount == null) return null
   return `${amount} stayed protected, as you set it.`
 }
 

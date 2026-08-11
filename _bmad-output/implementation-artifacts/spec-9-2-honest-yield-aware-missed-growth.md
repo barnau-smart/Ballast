@@ -49,7 +49,7 @@ warnings:
 | Cash + parked, reserve set, market rose | cash=5000, parked=5000, reserve=2000, window +14%, apy 4% | base=8000; parked drawn-first so parked_investable=3000, cash_investable=5000; forgone = 5000·0.14 + 3000·(0.14−0.04); `reserved`=2000 surfaced; statement discloses the 4% assumption | No error |
 | Reserve covers all cash | cash=1000, parked=1000, reserve=5000 | base clamped to 0; calm reserve-aware statement ("your reserve covers all your cash right now — nothing is sitting idle"); `reason="fully_reserved"`; forgone=0.00 | No error |
 | Reserve never-decided | cash=5000, parked=0, reserve never-decided | reserve treated as 0 for the calc; `reserved`=null + `reserve_decided`=false surfaced; figure computed on 5000; statement stays calm, no FOMO | No error |
-| Parked only, no settlement cash | cash=0, parked=4000, reserve=0, window +10%, apy 4% | forgone = 4000·(0.10−0.04) = 2400.00; discloses yield assumption | No error |
+| Parked only, no settlement cash | cash=0, parked=4000, reserve=0, window +10%, apy 4% | forgone = 4000·(0.10−0.04) = 240.00; discloses yield assumption | No error |
 | Market fell over window | cash=5000, parked=0, window −10% | forgone negative → "avoided loss" framing (never "cost"); sky-blue not red | No error |
 | No cash anywhere | cash=0, parked=0, reserve=0 | `reason="no_idle_cash"`, forgone=0.00, calm statement, source cited | No error |
 | Insufficient market history | < lookback+1 bars | `sufficient=false`, `reason="insufficient_history"`, forgone=0.00, calm statement | No error |

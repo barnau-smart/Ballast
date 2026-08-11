@@ -218,6 +218,51 @@ async def test_partial_coverage_parked_below_shortfall():
 
 
 @pytest.mark.asyncio
+async def test_buy_symbol_excluded_from_sell_candidates():
+    """If the user tags their BUY target as parked, the planner must not propose
+    selling the very fund they're buying (Story 9.3 hardening) — it picks the next
+    parked holding instead of the (larger) buy target."""
+    uid = _make_user()
+    try:
+        _seed_balance(uid, "200.00")  # ready-to-trade
+        _seed_holding(uid, "SWVXX", "5000", "5000.00")  # parked + the buy target
+        _seed_holding(uid, "VMFXX", "400", "400.00")  # another parked fund
+        _seed_config(
+            uid,
+            reserve_amount="0",
+            reserve_decided=True,
+            parked_symbols=["SWVXX", "VMFXX"],
+        )
+        # Buying SWVXX: it must be excluded from sell candidates even though it's
+        # the largest parked holding — VMFXX is chosen instead of "sell SWVXX to
+        # buy SWVXX".
+        plan = await _plan(uid, symbol="SWVXX", amount="700.00")
+        assert plan.needs_liquidation is True
+        assert plan.sell_symbol == "VMFXX"
+    finally:
+        _delete_user(uid)
+
+
+@pytest.mark.asyncio
+async def test_buy_symbol_only_parked_holding_nothing_sellable():
+    """When the buy target is the ONLY parked holding, excluding it leaves nothing
+    sellable — honestly coverable=False with no sell."""
+    uid = _make_user()
+    try:
+        _seed_balance(uid, "200.00")
+        _seed_holding(uid, "SWVXX", "5000", "5000.00")
+        _seed_config(
+            uid, reserve_amount="0", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        plan = await _plan(uid, symbol="SWVXX", amount="700.00")
+        assert plan.needs_liquidation is True
+        assert plan.coverable is False
+        assert plan.sell_symbol is None
+    finally:
+        _delete_user(uid)
+
+
+@pytest.mark.asyncio
 async def test_no_parked_nothing_to_liquidate():
     uid = _make_user()
     try:

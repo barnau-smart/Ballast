@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from uuid import UUID
 
@@ -493,6 +493,30 @@ def _pct_str(value: Decimal) -> str:
     return format(value, "f")
 
 
+def _placed_order_matches_proposal(order_intent, snap_intent: dict) -> bool:
+    """True iff the submitted order matches the co-signed proposal (Story 9.3).
+
+    Compares the GUARDRAIL-critical fields only — symbol (normalized), side, and
+    amount (by Decimal value, so ``"500"`` == ``"500.00"``). The human-entered
+    order-shape controls (order_type/limit_price/session/duration, Story 8.1) are
+    intentionally NOT compared. A missing/malformed snapshot amount fails closed
+    (returns ``False`` → the caller refuses). Only called when the proposal
+    carried a concrete ``order_intent`` (the deterministic 8.4/9.3 flows); the
+    human-supplied coach flow snapshots ``None`` and never reaches here.
+    """
+    submitted_side = getattr(order_intent.side, "value", order_intent.side)
+    if (order_intent.symbol or "").strip().upper() != (
+        snap_intent.get("symbol") or ""
+    ).strip().upper():
+        return False
+    if submitted_side != snap_intent.get("side"):
+        return False
+    try:
+        return order_intent.amount == Decimal(str(snap_intent.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
 def _to_approve_response(outcome: OrderOutcome) -> ApproveResponse:
     return ApproveResponse(
         status=outcome.status.value,
@@ -689,6 +713,30 @@ async def approve(
             status_code=422,
             detail=(
                 "This decision is missing its safety key and can't be placed. "
+                "Please start a new recommendation."
+            ),
+        )
+    # Story 9.3 hardening: when the PROPOSED decision carried a concrete order
+    # (the deterministic 8.4-suggest / 9.3-liquidation flows snapshot one; the
+    # human-supplied coach flow snapshots ``None``), the placed order MUST match
+    # that co-signed proposal on the guardrail-critical fields — symbol, side,
+    # amount — so a co-signed decision can't be repurposed to place a DIFFERENT
+    # order (e.g. an arbitrary-amount SELL of a different symbol, bypassing the
+    # index-core scope gate the SELL widening relaxed). The order-shape controls
+    # (order_type/limit_price/session/duration) are human-entered at /approve
+    # (Story 8.1) and are intentionally NOT reconciled. When the proposal carried
+    # no order_intent, the pre-existing human-supplied contract is unchanged.
+    _snap_intent = (record.recommendation_snapshot or {}).get("order_intent")
+    if _snap_intent is not None and not _placed_order_matches_proposal(
+        body.order_intent, _snap_intent
+    ):
+        # Release the claim (cosigning→proposed) so nothing is stranded, then
+        # refuse calmly BEFORE any broker call — symmetric with the scope arm.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This order doesn't match the recommendation you co-signed. "
                 "Please start a new recommendation."
             ),
         )

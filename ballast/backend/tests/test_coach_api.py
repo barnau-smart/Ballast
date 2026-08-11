@@ -4506,3 +4506,43 @@ def test_cancel_config_fault_is_calm_409_persists_nothing(client):
     finally:
         client.app.dependency_overrides.pop(get_broker, None)
         _delete_user(email)
+
+
+# --- Story 9.3 hardening: /approve reconciles order_intent to the proposal -----
+
+
+def test_placed_order_matches_proposal_guardrail():
+    """The pure reconciler binds symbol/side/amount to the co-signed proposal and
+    ignores the human-entered order-shape controls (Story 9.3)."""
+    from types import SimpleNamespace
+
+    from api.coach import _placed_order_matches_proposal
+
+    snap = {"symbol": "SWVXX", "side": "sell", "amount": "500.00"}
+
+    def intent(symbol, side, amount):
+        return SimpleNamespace(symbol=symbol, side=side, amount=Decimal(amount))
+
+    # Exact match (side as an enum, amount scale-insensitive).
+    assert _placed_order_matches_proposal(
+        intent("SWVXX", OrderSide.SELL, "500"), snap
+    )
+    assert _placed_order_matches_proposal(
+        intent(" swvxx ", OrderSide.SELL, "500.00"), snap
+    )
+    # A different symbol → refused (the core guardrail-bypass this closes).
+    assert not _placed_order_matches_proposal(
+        intent("TSLA", OrderSide.SELL, "500.00"), snap
+    )
+    # A different amount → refused.
+    assert not _placed_order_matches_proposal(
+        intent("SWVXX", OrderSide.SELL, "50000.00"), snap
+    )
+    # A flipped side → refused.
+    assert not _placed_order_matches_proposal(
+        intent("SWVXX", OrderSide.BUY, "500.00"), snap
+    )
+    # A malformed snapshot amount fails closed.
+    assert not _placed_order_matches_proposal(
+        intent("SWVXX", OrderSide.SELL, "500.00"), {"symbol": "SWVXX", "side": "sell", "amount": None}
+    )
