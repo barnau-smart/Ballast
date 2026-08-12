@@ -115,13 +115,18 @@ class Plan:
 
     ``status`` is one of the five honest states. ``action_items`` /
     ``primary_order`` are populated only for ``deploy``. ``current`` reports each
-    class's market value + its share of the classified sleeve. ``reason`` is calm
-    plain-English for the no-action statuses (empty for ``deploy``)."""
+    class's market value + its share of the classified sleeve. ``target_weights``
+    is the caller's RESOLVED per-class target mix (the user's own model, populated
+    only for ``deploy``; empty for the no-action statuses) — exposed so a downstream
+    narrator can cite the true target without re-resolving it (never a cross-model
+    guess). ``reason`` is calm plain-English for the no-action statuses (empty for
+    ``deploy``)."""
 
     status: str
     action_items: list[ActionItem] = field(default_factory=list)
     primary_order: ActionItem | None = None
     current: dict[str, dict[str, Decimal]] = field(default_factory=dict)
+    target_weights: dict[str, Decimal] = field(default_factory=dict)
     unclassified_value: Decimal = _ZERO
     unclassified_symbols: list[str] = field(default_factory=list)
     investable_cash: Decimal = _ZERO
@@ -414,6 +419,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         action_items=deployment.action_items,
         primary_order=primary,
         current=current,
+        target_weights=dict(target_weights),
         unclassified_value=classification.unclassified_value,
         unclassified_symbols=classification.unclassified_symbols,
         investable_cash=investable,

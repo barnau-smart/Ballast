@@ -24,19 +24,21 @@ function expectCalm(text) {
 }
 
 // --- fetch stub: route by URL substring --------------------------------------
+//
+// Story 10.3 — the deploy affordance now calls `GET /api/allocation/narration`,
+// which returns `{plan, narration}` (the plan shapes are unchanged, just nested
+// under `plan`). Any other URL is unexpected in these tests.
 
-function stubFetch({ plan, planStatus = 200, planOk = true } = {}) {
+function stubFetch({ plan, narration, ok = true, status = 200 } = {}) {
   const fn = vi.fn((url) => {
     const u = String(url)
-    if (u.includes('/api/allocation/plan')) {
+    if (u.includes('/api/allocation/narration')) {
       return Promise.resolve({
-        ok: planOk,
-        status: planStatus,
-        json: () => Promise.resolve(plan ?? {}),
+        ok,
+        status,
+        json: () => Promise.resolve({ plan: plan ?? {}, narration: narration ?? {} }),
       })
     }
-    // The deploy affordance only calls /api/allocation/plan; any other URL is
-    // unexpected in these tests.
     return Promise.reject(new Error(`unexpected url: ${u}`))
   })
   vi.stubGlobal('fetch', fn)
@@ -71,9 +73,33 @@ const DEPLOY_PLAN = {
   as_of: null,
 }
 
-describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
-  it('populates the order controls (side/amount/symbol/market) on a deploy plan, no submit', async () => {
-    const fetchMock = stubFetch({ plan: DEPLOY_PLAN })
+const DEPLOY_NARRATION = {
+  action_label: 'Put your idle cash to work toward your target mix',
+  reasoning:
+    'Compared with the target mix you chose, you’re light on International ' +
+    'stocks and Bonds, so this plan buys 3000.00 of VXUS and 1000.00 of BND — ' +
+    'the broad, low-cost index funds for those classes — to move you back toward ' +
+    'that balance. This is plain diversification and rebalancing toward your ' +
+    'target, not a bet on any hot pick. It doesn’t try to time the market, and ' +
+    'any leftover cash (0.00) stays put.',
+  uncertainties: [
+    'Markets move, so a fill isn’t guaranteed and this isn’t a prediction.',
+  ],
+  evidence: [
+    {
+      id: 'strat-abc123',
+      kind: 'strategy',
+      statement: 'You’re underweight International stocks versus your target mix.',
+      stats: { amount: '3000.00', current_weight: '0' },
+      source: 'allocation-engine',
+      as_of: '2026-08-12',
+    },
+  ],
+}
+
+describe('CoachConsult — deploy-my-cash affordance (Story 10.2/10.3)', () => {
+  it('populates the order controls + renders the advisor narration on a deploy plan, no submit', async () => {
+    const fetchMock = stubFetch({ plan: DEPLOY_PLAN, narration: DEPLOY_NARRATION })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -89,17 +115,27 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
     const note = await screen.findByTestId('coach-deploy-populated')
     expectCalm(note.textContent)
 
-    // ONLY the read-only plan endpoint was hit — nothing was submitted (no
+    // Story 10.3 — the advisor narration card renders (action_label + reasoning).
+    const card = await screen.findByTestId('coach-card')
+    expect(card).toBeInTheDocument()
+    expect(screen.getByTestId('coach-card-action')).toHaveTextContent(
+      /put your idle cash to work toward your target mix/i,
+    )
+    const reasoning = screen.getByTestId('coach-card-reasoning')
+    expect(reasoning).toHaveTextContent(/diversification and rebalancing/i)
+    expectCalm(card.textContent)
+
+    // ONLY the read-only narration endpoint was hit — nothing was submitted (no
     // /approve, no /recommend, no order placement).
     const urls = fetchMock.mock.calls.map(([u]) => String(u))
-    expect(urls.some((u) => u.includes('/api/allocation/plan'))).toBe(true)
+    expect(urls.some((u) => u.includes('/api/allocation/narration'))).toBe(true)
     expect(urls.some((u) => u.includes('/approve'))).toBe(false)
     expect(urls.some((u) => u.includes('/recommend'))).toBe(false)
-    // The plan GET carries no method/body (read-only).
-    const planCall = fetchMock.mock.calls.find(([u]) =>
-      String(u).includes('/api/allocation/plan'),
+    // The narration GET carries no method/body (read-only).
+    const narrationCall = fetchMock.mock.calls.find(([u]) =>
+      String(u).includes('/api/allocation/narration'),
     )
-    const opts = planCall[1] ?? {}
+    const opts = narrationCall[1] ?? {}
     expect(opts.method ?? 'GET').toBe('GET')
     expect(opts.body).toBeUndefined()
   })
@@ -116,7 +152,13 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
       reason: "Pick a target mix first, and I'll show you how to move your cash toward it.",
       as_of: null,
     }
-    stubFetch({ plan: NO_TARGET })
+    const NO_TARGET_NARRATION = {
+      action_label: 'Nothing to buy right now',
+      reasoning: NO_TARGET.reason,
+      uncertainties: ['This can change as your cash or target mix change.'],
+      evidence: [],
+    }
+    stubFetch({ plan: NO_TARGET, narration: NO_TARGET_NARRATION })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -129,8 +171,9 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
     expect(screen.getByTestId('coach-symbol-input').value).toBe('')
     expect(screen.getByTestId('coach-amount-input').value).toBe('')
     expect(screen.getByTestId('coach-side-select').value).toBe('')
-    // The populated note is NOT shown.
+    // Neither the populated note nor a narration card is shown.
     expect(screen.queryByTestId('coach-deploy-populated')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
   })
 
   it('shows a calm reason for a decide_reserve status, still no populate', async () => {
@@ -145,7 +188,13 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
       reason: "Set your cash cushion first, and I'll only ever deploy what's above it.",
       as_of: null,
     }
-    stubFetch({ plan: DECIDE_RESERVE })
+    const DECIDE_RESERVE_NARRATION = {
+      action_label: 'Nothing to buy right now',
+      reasoning: DECIDE_RESERVE.reason,
+      uncertainties: ['This can change as your cushion or holdings change.'],
+      evidence: [],
+    }
+    stubFetch({ plan: DECIDE_RESERVE, narration: DECIDE_RESERVE_NARRATION })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -156,8 +205,8 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
     expect(screen.getByTestId('coach-amount-input').value).toBe('')
   })
 
-  it('fails calmly when the plan endpoint errors, populating nothing', async () => {
-    stubFetch({ planOk: false, planStatus: 500 })
+  it('fails calmly when the narration endpoint errors, populating nothing', async () => {
+    stubFetch({ ok: false, status: 500 })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -177,7 +226,7 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
         order_type: 'market',
       },
     }
-    stubFetch({ plan: BAD_ZERO })
+    stubFetch({ plan: BAD_ZERO, narration: DEPLOY_NARRATION })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -186,11 +235,12 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
     // un-co-signable order — falls through to the calm failed note.
     const note = await screen.findByTestId('coach-deploy-failed')
     expectCalm(note.textContent)
-    // NOTHING populated — controls stay empty, no populated note.
+    // NOTHING populated — controls stay empty, no populated note, no narration card.
     expect(screen.getByTestId('coach-symbol-input').value).toBe('')
     expect(screen.getByTestId('coach-amount-input').value).toBe('')
     expect(screen.getByTestId('coach-side-select').value).toBe('')
     expect(screen.queryByTestId('coach-deploy-populated')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
   })
 
   it('does NOT populate on a malformed primary_order (blank symbol), shows calm failed note', async () => {
@@ -203,7 +253,7 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
         order_type: 'market',
       },
     }
-    stubFetch({ plan: BAD_SYMBOL })
+    stubFetch({ plan: BAD_SYMBOL, narration: DEPLOY_NARRATION })
     renderConsult()
 
     fireEvent.click(screen.getByTestId('coach-deploy-cash'))
@@ -213,10 +263,11 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2)', () => {
     expect(screen.getByTestId('coach-symbol-input').value).toBe('')
     expect(screen.getByTestId('coach-amount-input').value).toBe('')
     expect(screen.queryByTestId('coach-deploy-populated')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('coach-card')).not.toBeInTheDocument()
   })
 
   it('has calm copy on the deploy button itself', () => {
-    stubFetch({ plan: DEPLOY_PLAN })
+    stubFetch({ plan: DEPLOY_PLAN, narration: DEPLOY_NARRATION })
     renderConsult()
     const btn = screen.getByTestId('coach-deploy-cash')
     expect(btn).toHaveTextContent(/deploy your cash toward your target/i)

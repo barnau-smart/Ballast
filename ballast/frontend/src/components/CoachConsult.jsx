@@ -115,6 +115,11 @@ export function CoachConsult() {
   // failed.
   const [deploy, setDeploy] = useState('idle')
   const [deployMessage, setDeployMessage] = useState('')
+  // Story 10.3 — the fiduciary-advisor narration returned alongside a `deploy`
+  // plan (`data.narration`). Rendered via `<CoachCard>` beside the populated
+  // controls so the human sees the why/tradeoff/uncertainty before co-signing.
+  // Cleared on every fresh ask/decline/deploy alongside the other deploy resets.
+  const [deployNarration, setDeployNarration] = useState(null)
   const deployingRef = useRef(false) // synchronous double-click guard
 
   // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
@@ -218,6 +223,8 @@ export function CoachConsult() {
     // Story 10.2 — clear any deploy-cash status/message on a fresh ask/decline.
     setDeploy('idle')
     setDeployMessage('')
+    // Story 10.3 — clear any advisor narration on a fresh ask/decline.
+    setDeployNarration(null)
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -486,12 +493,15 @@ export function CoachConsult() {
     }
   }
 
-  // Story 10.2 — "Deploy your cash toward your target": ask the backend for the
-  // deterministic gap-to-target plan and, on a `deploy` status, POPULATE the order
-  // controls with the primary buy (side=buy, the canonical fund symbol, the dollar
-  // amount, a MARKET order) via the existing setters so the human co-signs through
-  // the unchanged approve spine. On any no-action status show the calm `reason` and
-  // populate NOTHING. Nothing is ever submitted here.
+  // Story 10.2/10.3 — "Deploy your cash toward your target": ask the backend for
+  // the deterministic gap-to-target plan + its fiduciary-advisor narration
+  // (`GET /api/allocation/narration` → `{plan, narration}`) and, on a `deploy`
+  // status, POPULATE the order controls with `plan.primary_order` (side=buy, the
+  // canonical fund symbol, the dollar amount, a MARKET order) via the existing
+  // setters so the human co-signs through the unchanged approve spine — AND render
+  // the narration card (why/tradeoff/uncertainty). On any no-action status show the
+  // calm narration reason (or `plan.reason`) and populate NOTHING. Nothing is ever
+  // submitted here.
   async function onDeploy() {
     if (deployingRef.current) return // synchronous double-click guard
     if (suggestingRef.current) return // don't race an in-flight suggest populate
@@ -503,7 +513,7 @@ export function CoachConsult() {
     // error deploy must leave any recommendation the user is viewing intact — we
     // only clear it on the successful populate branch, right before we repopulate.
     try {
-      const res = await apiFetch('/api/allocation/plan')
+      const res = await apiFetch('/api/allocation/narration')
       if (!mounted.current) return
       if (res.status === 401) {
         setDeployMessage('Sign in to see how to deploy your cash.')
@@ -526,7 +536,11 @@ export function CoachConsult() {
         return
       }
       if (!mounted.current) return
-      const primary = data?.primary_order
+      // Story 10.3 — the plan is now nested under `data.plan`; the advisor
+      // narration under `data.narration`.
+      const plan = data?.plan
+      const narration = data?.narration
+      const primary = plan?.primary_order
       const primaryOk =
         primary &&
         typeof primary.symbol === 'string' &&
@@ -534,7 +548,7 @@ export function CoachConsult() {
         typeof primary.amount === 'string' &&
         DECIMAL_RE.test(primary.amount.trim()) &&
         Number(primary.amount) > 0
-      if (data?.status === 'deploy' && primaryOk) {
+      if (plan?.status === 'deploy' && primaryOk) {
         // A new order is about to land — only NOW clear a shown recommendation
         // (it no longer matches once we repopulate the form).
         if (recommendation !== null) {
@@ -556,27 +570,34 @@ export function CoachConsult() {
         setSide('buy')
         setAmount(primary.amount)
         setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
+        // Story 10.3 — store the advisor narration for the CoachCard beside the
+        // populated controls.
+        setDeployNarration(narration ?? null)
         setDeployMessage('')
         setDeploy('deployed')
         return
       }
-      if (data?.status === 'deploy') {
+      if (plan?.status === 'deploy') {
         // status says deploy but the primary_order is unreadable (backend contract
         // drift) — a blank/zero populate would produce an un-co-signable order.
         // Do NOT populate; fall through to a calm failed note.
+        setDeployNarration(null)
         setDeployMessage('We couldn’t read that plan — try again.')
         setDeploy('failed')
         return
       }
       // Any no-action status (at_target / no_cash / no_target / decide_reserve) —
-      // show the calm backend reason and populate NOTHING.
+      // show the calm narration reason (or the plan reason) and populate NOTHING.
+      setDeployNarration(null)
       setDeployMessage(
-        data?.reason ||
+        narration?.reasoning ||
+          plan?.reason ||
           'There’s nothing to deploy toward your target right now.',
       )
       setDeploy('no-action')
     } catch {
       if (!mounted.current) return
+      setDeployNarration(null)
       setDeployMessage(
         'We couldn’t reach the coach just now — try again in a moment.',
       )
@@ -728,14 +749,19 @@ export function CoachConsult() {
       </form>
 
       {deploy === 'deployed' ? (
-        <p
-          className="ballast-consult__note"
-          data-testid="coach-deploy-populated"
-          role="status"
-        >
-          I’ve filled in a buy that moves your cash toward your target mix. Review
-          it, then ask the coach to co-sign it with you.
-        </p>
+        <div className="ballast-consult__deploy-result">
+          <p
+            className="ballast-consult__note"
+            data-testid="coach-deploy-populated"
+            role="status"
+          >
+            I’ve filled in a buy that moves your cash toward your target mix.
+            Review it, then ask the coach to co-sign it with you.
+          </p>
+          {/* Story 10.3 — the fiduciary-advisor narration (why/tradeoff/cited
+              data/uncertainty) beside the populated controls. */}
+          {deployNarration ? <CoachCard recommendation={deployNarration} /> : null}
+        </div>
       ) : null}
 
       {deploy === 'no-action' ? (

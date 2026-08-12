@@ -25,9 +25,11 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from allocation.engine import ActionItem, Plan, build_plan
+from allocation.narrate import AllocationNarration, narrate_plan
 from api.deps import get_scope
 from db.scope import Scope
 from db.session import get_async_session
+from llm.factory import get_llm_gateway
 from money import format_money
 
 logger = logging.getLogger("ballast.api.allocation")
@@ -84,6 +86,28 @@ class PlanOut(BaseModel):
     undeployed_cash: str
     reason: str
     as_of: datetime.datetime | None = None
+
+
+class NarrationOut(BaseModel):
+    """The advisor narration over a deploy plan (Story 10.3).
+
+    ``action_label``/``reasoning`` are the plain-English call + why; ``uncertainties``
+    is what is explicitly unknown; ``evidence`` is the cited ``STRATEGY`` records
+    serialized via ``record.to_dict()`` (Decimal→fixed-point string). Empty
+    ``evidence`` for a no-action status."""
+
+    action_label: str
+    reasoning: str
+    uncertainties: list[str]
+    evidence: list[dict]
+
+
+class NarrationResponse(BaseModel):
+    """The ``GET /api/allocation/narration`` payload — the unchanged plan + its
+    advisor narration."""
+
+    plan: PlanOut
+    narration: NarrationOut
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -148,3 +172,40 @@ async def read_plan(
     """
     plan = await build_plan(scope, session)
     return _plan_out(plan)
+
+
+def _narration_out(narration: AllocationNarration) -> NarrationOut:
+    return NarrationOut(
+        action_label=narration.action_label,
+        reasoning=narration.reasoning,
+        uncertainties=list(narration.uncertainties),
+        evidence=[record.to_dict() for record in narration.evidence],
+    )
+
+
+@router.get("/narration", response_model=NarrationResponse)
+async def read_narration(
+    scope: Scope = Depends(get_scope),
+    session: AsyncSession = Depends(get_async_session),
+) -> NarrationResponse:
+    """Return the caller's deploy plan + the fiduciary-advisor narration (Story 10.3).
+
+    READ-ONLY, degraded-safe, per-user scoped: builds the same deterministic
+    :func:`~allocation.engine.build_plan` as ``/plan`` (cached portfolio, no live
+    broker session) and narrates it via
+    :func:`~allocation.narrate.narrate_plan` against the configured LLM gateway.
+    The narration itself is degraded-safe — any gateway/parse/gate failure during
+    narration yields the deterministic templated fallback, never an unvalidated
+    number (an upstream ``build_plan`` read error surfaces through the app's global
+    calm-envelope handler, exactly as it does for ``/plan``). Places NOTHING and
+    writes no ``decision_record`` — the human co-signs the
+    unchanged ``primary_order`` through the existing ``/approve`` spine. 401 unauth;
+    money as fixed-point strings.
+    """
+    plan = await build_plan(scope, session)
+    gateway = get_llm_gateway()
+    narration = narrate_plan(gateway, plan)
+    return NarrationResponse(
+        plan=_plan_out(plan),
+        narration=_narration_out(narration),
+    )
