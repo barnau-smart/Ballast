@@ -282,9 +282,9 @@ action_items:
     owner: "MasterB"
     status: open
   - epic: 10
-    action: "Close the spec-hygiene gap: Story 10-1 shipped with no governing spec file and expense_ratio.py (a 10-4 file) was bundled early. Backfill/document, and avoid cross-story file bundling going forward."
+    action: "Spec-hygiene HARD GATE adopted 2026-08-12: every story must have an approved governing spec before dev (no specless stories; 10-1 was). Enforced via .bmad-loop/policy.toml gates.mode=per-story-spec-approval + docs/dev-loop-policy.md. Also no cross-story file bundling. Residual: optionally backfill a 10-1 spec retroactively."
     owner: "MasterB"
-    status: open
+    status: done  # gate adopted + documented 2026-08-12 (policy.toml local-only; docs/dev-loop-policy.md committed)
   - epic: 10
     action: "Before enabling the real-money deploy path: confirm Schwab portfolio_balance.cash is SETTLED-only (merges Epic 9 #2a) now that the deploy engine relies on ready_to_trade = view.cash after the parked-cash fix; tune remaining disclosed placeholders (Epic 9 #4)."
     owner: "MasterB"
