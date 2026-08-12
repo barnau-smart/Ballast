@@ -113,6 +113,35 @@ FORECAST_TERMS: tuple[str, ...] = (
     "over the long run",
     "in the long run",
     "target price",
+    # Modal-hedge PREDICTIONS. Directional phrases only (never bare "could"/"may"/
+    # "might", which appear in benign coaching like "you may want to consider" and
+    # would over-degrade every narration to the template). A miss here is bounded
+    # exactly like the rest of this list; add directional combos as gaps surface.
+    "could rise",
+    "could grow",
+    "could climb",
+    "could double",
+    "could triple",
+    "could gain",
+    "could go up",
+    "could increase",
+    "may rise",
+    "may grow",
+    "may climb",
+    "may double",
+    "may gain",
+    "may increase",
+    "might rise",
+    "might grow",
+    "might climb",
+    "might double",
+    "might gain",
+    "should do well",
+    "should outperform",
+    "should beat",
+    "on track to",
+    "on track for",
+    "poised for",
 )
 
 #: The narration output schema — the ``RECOMMENDATION_OUTPUT_SCHEMA`` MINUS

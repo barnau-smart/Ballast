@@ -96,6 +96,29 @@ def test_concentration_over_ceiling_produces_trim():
     assert f.order_intent.amount == Decimal("1500.00")
 
 
+def test_find_review_aggregates_duplicate_symbol_rows_into_one_trim():
+    """Two cache rows for the SAME ticker are ONE economic position: they must
+    produce a single concentration trim at the SUMMED weight, never two overlapping
+    SELLs a human could co-sign into an oversell (regression: dup-symbol double-trim)."""
+    # TSLA split across two rows (9000 + 9000 = 18000 = 90% of a $20,000 total); VTI 10%.
+    view = _view(
+        [
+            _Holding("TSLA", Decimal("9000"), Decimal("30")),
+            _Holding("TSLA", Decimal("9000"), Decimal("30")),
+            _Holding("VTI", Decimal("2000"), Decimal("5")),
+        ]
+    )
+    findings = find_review(view, None)
+    tsla = [f for f in findings if f.symbol == "TSLA"]
+    assert len(tsla) == 1  # ONE trim, not two
+    f = tsla[0]
+    # Real TSLA weight is 18000/20000 = 90% (not the per-row 45%); trim back to 40%:
+    # 18000 - 0.40 * 20000 = 10000.
+    assert f.weight == Decimal("18000") / Decimal("20000")
+    assert f.amount == Decimal("10000.00")
+    assert f.order_intent.amount == Decimal("10000.00")
+
+
 def test_concentration_includes_cash_in_total():
     """The weight denominator is Σ holdings + cash — cash dilutes the weight."""
     # TSLA 4000 of (4000 holdings + 6000 cash) = 40% exactly → NOT over the ceiling.

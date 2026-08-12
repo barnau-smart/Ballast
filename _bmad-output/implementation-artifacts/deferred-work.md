@@ -340,3 +340,21 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
   summary: `build_review` narrates each finding via a synchronous `gateway.complete()` inside the async `read_review` handler — N sequential blocking event-loop round-trips; offload to `asyncio.to_thread`/gather (or bound the finding count).
   evidence: `LLMGateway.complete` is synchronous (`llm/port.py`); `allocation/review.py:build_review` calls `narrate_finding` per finding with no threadpool offload, inside `async def read_review` in `api/allocation.py`. Amplifies the same pattern already deferred in Story 10-3 (F8) from one plan to N findings.
+
+## Deferred from: code review of spec-10-3 / spec-10-4 (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: Deterministic fallback prose (`_fallback_narration`/`_fallback_review_narration`) and the evidence `statement` string are surfaced to the API without passing through `check_no_invented_numbers` / `check_no_forecast` — authored to pass "by construction" but not re-validated, so a future copy edit (e.g. adding a `FORECAST_TERMS` phrase) could ship an unguarded string.
+  evidence: `allocation/narrate.py:367-460, 545` (fallback returned directly), evidence `statement` built with f-strings at narrate.py:228-231 / review.py:386-392. Hardening only; run the surfaced fallback/statement strings through the same gates as a regression backstop.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: `narrate_plan` hardcodes `status="deploy"` on the LLM-success path while the fallback and no-action paths use `plan.status`; a deploy-variant status would be labelled inconsistently depending only on whether the LLM call passed the gates.
+  evidence: `allocation/narrate.py:~533` (hardcoded "deploy") vs narrate.py:423 (`status=plan.status`). Low severity; source status consistently from the plan.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: Negative-cash (margin debit) account makes `_total_portfolio_value <= 0`, so the concentration detector returns `[]` (a genuinely over-concentrated single name is silently never flagged) while the cost detector still fires and renders `weight=0`. The two detectors disagree on the same degenerate portfolio.
+  evidence: `allocation/review.py:213-215` (concentration early-return on total<=0) vs review.py:322 (cost has no such guard, `weight=0`). Out of scope (Ballast is a cash-deployment tool, no margin); align both detectors' degenerate-total handling if margin ever enters scope.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: A concentration finding's `asset_class` falls back to the raw symbol/internal class token (`asset_class_for(symbol) or symbol`) instead of a display label, so the API can surface a bare ticker or raw class key where every other surface uses `ASSET_CLASS_LABEL`.
+  evidence: `allocation/review.py:246`. Cosmetic/consistency; map through the label table (or document the intended fallback copy).

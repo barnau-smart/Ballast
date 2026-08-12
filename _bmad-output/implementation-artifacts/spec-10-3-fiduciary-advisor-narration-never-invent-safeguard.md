@@ -147,3 +147,12 @@ Status: done (follow-up review pass on a `done` spec)
 
 **Residual risks:** The no-forecast gate remains a best-effort denylist by design (qualitative, number-free forecasts and fully-general spelled-out magnitudes are not provably caught) — bounded by the digit-form numeric gate, the calm system prompt, and the always-safe degrade-to-template. The async blocking `gateway.complete()` (F8) is still deferred for a focused `asyncio.to_thread` fix.
 
+### Review Findings — Independent (2026-08-12)
+
+_First independent human-requested review (loop self-review was auto-skipped on 10-2/10-3/10-4). Group A = narration guardrails. Blind Hunter + Edge Case Hunter + Acceptance Auditor._
+
+- [x] [Review][Decision→Story] Numeric allow-set is value-based / unit-blind — a fabricated integer coinciding with an admitted weight-percent or amount (e.g. "30 companies" when 30% is a target weight) passes `check_no_invented_numbers` [narrate.py:330-345]. **RESOLVED 2026-08-12: new follow-up story** — make the gate unit-tagged / context-aware ($ vs % vs count), validating each number against the matching allowed set (supersedes the prior "accept as degrade-safe" call).
+- [x] [Review][Patch] Forecast denylist misses modal-hedge predictions — "could double", "may rise", "should do well", "might grow" pass `check_no_forecast` [narrate.py:78-116, 348-361]. **APPLIED 2026-08-12:** added directional modal PHRASES (could/may/might + rise/grow/climb/double/gain, should outperform/do well/beat, on track to/for, poised for) — never bare modals (avoids over-degrade); +2 regression tests (`test_check_no_forecast_rejects_modal_hedge_predictions`, `test_check_no_forecast_allows_benign_modal_usage`).
+- [x] [Review][Defer] Deterministic fallback prose + evidence `statement` bypass both honesty gates (authored to pass "by construction", not re-validated against future copy edits) [narrate.py:367-460, 545] — deferred, hardening only.
+- [x] [Review][Defer] `narrate_plan` hardcodes `status="deploy"` on the LLM-success path vs `plan.status` on the fallback/no-action paths (latent divergence if ever called with a deploy-variant status) [narrate.py:~533] — deferred, low.
+

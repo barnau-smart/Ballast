@@ -201,6 +201,27 @@ def test_forecast_terms_is_named_nonempty_tuple():
     assert isinstance(FORECAST_TERMS, tuple) and len(FORECAST_TERMS) > 0
 
 
+def test_check_no_forecast_rejects_modal_hedge_predictions():
+    """Directional modal predictions (could/may/might + a direction) are forecasts —
+    regression for the denylist gap where "could double"/"may rise" slipped through."""
+    for phrase in (
+        "your position could double",
+        "this may rise over time",
+        "it might climb from here",
+        "this fund should outperform",
+        "you are on track to beat inflation",
+    ):
+        with pytest.raises(NarrationValidationError):
+            check_no_forecast(phrase)
+
+
+def test_check_no_forecast_allows_benign_modal_usage():
+    """Bare could/may/might are deliberately NOT denylisted (they appear in plain
+    coaching), so benign advice with no directional prediction still passes."""
+    check_no_forecast("You may want to consider your bond mix.")
+    check_no_forecast("This could be a good fit for your chosen target.")
+
+
 # --- The 5 good-lesson tests (against _fallback_narration) --------------------
 
 

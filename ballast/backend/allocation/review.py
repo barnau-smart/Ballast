@@ -338,6 +338,51 @@ def find_cost_findings(
     return findings
 
 
+@dataclass(frozen=True)
+class _AggregatedHolding:
+    """One symbol's summed position across the raw cache rows (pure, duck-typed).
+
+    Carries only the fields the detectors read (``symbol``/``quantity``/
+    ``market_value``); used to build the aggregated :class:`PortfolioView` fed to the
+    detectors so a symbol split across multiple rows is one economic position."""
+
+    symbol: str
+    quantity: Decimal
+    market_value: Decimal
+
+
+def _aggregate_by_symbol(view: PortfolioView) -> PortfolioView:
+    """Collapse holdings to ONE position per normalized symbol (pure).
+
+    The cached portfolio can hold more than one row for the same ticker — the
+    reconcile writer stores one row per broker snapshot position and enforces no
+    ``(owner_id, symbol)`` uniqueness. Left un-aggregated, two rows of the same
+    over-weight name would each be measured at its own (understated) weight and each
+    clear the concentration ceiling, surfacing as SEPARATE trims — a human co-signing
+    both oversells the real position. Summing quantity + market_value per symbol
+    first makes the detectors see the true single position (correct weight, one
+    trim). Cash + as_of pass through unchanged; unsymboled rows are dropped (the
+    detectors skip them anyway). Insertion order is preserved for determinism."""
+    sums: dict[str, list[Decimal]] = {}  # symbol -> [qty_sum, mv_sum]
+    order: list[str] = []
+    for h in view.holdings or []:
+        symbol = (h.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        quantity = h.quantity if h.quantity is not None else _ZERO
+        market_value = h.market_value if h.market_value is not None else _ZERO
+        if symbol not in sums:
+            sums[symbol] = [_ZERO, _ZERO]
+            order.append(symbol)
+        sums[symbol][0] += quantity
+        sums[symbol][1] += market_value
+    holdings = [
+        _AggregatedHolding(symbol=s, quantity=sums[s][0], market_value=sums[s][1])
+        for s in order
+    ]
+    return PortfolioView(holdings=holdings, cash=view.cash, as_of=view.as_of)
+
+
 def find_review(
     view: PortfolioView, cash_config: CashConfig | None
 ) -> list[ReviewFinding]:
@@ -346,6 +391,10 @@ def find_review(
     Ranked by SELL dollar ``amount`` descending, ties broken by ``symbol`` ascending
     (deterministic). "Nothing to fix" → an EMPTY list (the honest, valid output).
 
+    Holdings are first aggregated to one position per symbol (:func:`_aggregate_by_symbol`)
+    so a ticker split across multiple cache rows can never surface as two overlapping
+    trims (a co-sign-into-oversell hazard).
+
     A single holding can qualify for BOTH buckets — a non-index high-fee fund held
     over the ceiling (e.g. an actively-managed fund at 55%). Surfacing both would
     double-count one position (two overlapping SELLs the human could co-sign into an
@@ -353,6 +402,7 @@ def find_review(
     same-class core, which subsumes the concentration trim (a partial sell of the
     same holding), so we prefer the cost switch and drop the redundant trim for that
     symbol."""
+    view = _aggregate_by_symbol(view)
     concentration = find_concentration_findings(view, cash_config)
     cost = find_cost_findings(view, cash_config)
     cost_symbols = {f.symbol for f in cost}
