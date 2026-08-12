@@ -77,6 +77,23 @@ TABLE_STATEMENTS: list[tuple[str, str]] = [
         ' FOREIGN KEY(owner_id) REFERENCES "user" (id) ON DELETE CASCADE'
         ")",
     ),
+    (
+        # Story 10.1: the per-user target-allocation selection (one row per user).
+        # Same belt-and-suspenders as ``pending_buy`` — ``create_all`` builds it on
+        # a fresh DB, and this idempotent statement guarantees a carried-over DB
+        # (e.g. the live ``ballast``) gets it too. Types match the ORM exactly.
+        "create_target_allocation_config",
+        "CREATE TABLE IF NOT EXISTS target_allocation_config ("
+        " id UUID NOT NULL,"
+        " model_key VARCHAR(32),"
+        " created_at TIMESTAMPTZ NOT NULL,"
+        " updated_at TIMESTAMPTZ NOT NULL,"
+        " owner_id UUID NOT NULL,"
+        " PRIMARY KEY (id),"
+        " CONSTRAINT uq_target_allocation_config_owner UNIQUE (owner_id),"
+        ' FOREIGN KEY(owner_id) REFERENCES "user" (id) ON DELETE CASCADE'
+        ")",
+    ),
 ]
 
 # (1) Additive columns on the pre-existing ``decision_record`` table. Types match

@@ -1,6 +1,9 @@
+---
+baseline_commit: bb2d3ef027e22abae8f7acbaa12f35b2c776f532
+---
 # Story 10.1: Target-allocation model — pick a model portfolio
 
-Status: ready-for-dev
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -76,26 +79,26 @@ Source of truth for the epic: `_bmad-output/brainstorming/brainstorm-allocation-
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Model-portfolio reference data (AC: 1, 7)**
-  - [ ] New `ballast/backend/strategy/target_allocation.py` mirroring `strategy/index_core.py`: an `AssetClass` enum/consts (`US_EQUITY`, `INTL_EQUITY`, `BONDS`); `SYMBOL_ASSET_CLASS: dict[str, AssetClass]` covering `INDEX_CORE_SYMBOLS` (US: VTI/ITOT/SCHB/VOO/IVV/SPY/SWPPX; Intl: VXUS/IXUS/VEU; Bonds: BND/AGG/BNDX/SCHZ; **note VT is whole-world — document it as a spans-classes special case, out of the pure map for v1, resolved in 10-2**); `CANONICAL_FUND: dict[AssetClass, str]` = {US: `VTI`, Intl: `VXUS`, Bonds: `BND`}; and `MODEL_PORTFOLIOS` with the LOCKED v1 weights (each summing to `Decimal("1.00")`):
+- [x] **Task 1 — Model-portfolio reference data (AC: 1, 7)**
+  - [x] New `ballast/backend/strategy/target_allocation.py` mirroring `strategy/index_core.py`: an `AssetClass` enum/consts (`US_EQUITY`, `INTL_EQUITY`, `BONDS`); `SYMBOL_ASSET_CLASS: dict[str, AssetClass]` covering `INDEX_CORE_SYMBOLS` (US: VTI/ITOT/SCHB/VOO/IVV/SPY/SWPPX; Intl: VXUS/IXUS/VEU; Bonds: BND/AGG/BNDX/SCHZ; **note VT is whole-world — document it as a spans-classes special case, out of the pure map for v1, resolved in 10-2**); `CANONICAL_FUND: dict[AssetClass, str]` = {US: `VTI`, Intl: `VXUS`, Bonds: `BND`}; and `MODEL_PORTFOLIOS` with the LOCKED v1 weights (each summing to `Decimal("1.00")`):
     - `conservative` — US `0.30` / Intl `0.10` / Bonds `0.60` — "Mostly bonds for a steadier ride — smaller ups and downs."
     - `balanced` — US `0.45` / Intl `0.20` / Bonds `0.35` — "A middle path: a solid stock base with a real bond cushion."
     - `growth` — US `0.60` / Intl `0.30` / Bonds `0.10` — "Mostly stocks for long-term growth — expect bigger swings."
-  - [ ] Pure helpers: `list_models()`, `get_model(key)` (unknown key → `None` or a caught error), `resolve_weights(key)` → weights-by-class + funds-by-class. Deterministic, no I/O (like `is_index_core`).
-- [ ] **Task 2 — Per-user `TargetAllocationConfig` model (AC: 2, 3)**
-  - [ ] Add `TargetAllocationConfig(OwnedEntityMixin, Base)` in `ballast/backend/db/models.py` (table `target_allocation_config`) mirroring `CashConfig`: `id` UUID pk; `model_key: Mapped[str | None] = mapped_column(String(32), nullable=True)`; `created_at`/`updated_at` tz-aware UTC; `__table_args__ = (UniqueConstraint("owner_id", name="uq_target_allocation_config_owner"),)`. No `db/migrations.py` entry needed (new table → `create_all` builds it in full).
-- [ ] **Task 3 — Config helpers, scoped + fail-closed (AC: 2, 3, 5)**
-  - [ ] New `ballast/backend/strategy/target_config.py` (or `allocation/config.py` — a new package with `__init__.py`) mirroring `cash/config.py`: `get_or_create_config` (create-on-first-read with `IntegrityError` lost-race handling, commit on create); `get_config` (READ-ONLY, no create — for the read path); `set_model(scope, session, key)` (validate `key` ∈ known model keys, else raise a caught `ValueError` → 422); `resolve_target(config)` (→ weights/funds by class, or `None` when undecided). All via `ScopedRepository(TargetAllocationConfig, scope, session)`.
-- [ ] **Task 4 — Target-allocation API (AC: 4, 5, 7)**
-  - [ ] New `ballast/backend/api/target_allocation.py` router (`prefix="/api/target-allocation"`) mirroring `api/cash.py`: `GET` → `{ model, choices[], resolved }`; `PUT` accepting `{ model }` (invalid → calm 422). Weights out as fixed-point strings via `WireMoney`. Auth via `get_scope`; session via `get_async_session`.
-  - [ ] Register the router in `ballast/backend/api/app.py` (`app.include_router(target_allocation_router)`), alongside `cash_router`.
-- [ ] **Task 5 — Frontend: Settings "Target mix" card (AC: 6, 7)**
-  - [ ] `ballast/frontend/src/routes/Settings.jsx`: add a "Your target mix" card (mirror the Epic 9 `CashSetupCard`): a radio/select of the models, each with its plain-English description + mix percentages; wired to `GET`/`PUT /api/target-allocation` via `apiFetch`; optimistic + fail-quiet.
-- [ ] **Task 6 — Frontend: Dashboard set-or-decline prompt (AC: 3, 6, 7)**
-  - [ ] `ballast/frontend/src/routes/Dashboard.jsx`: a calm, non-blocking, dismissible prompt when `model === null`, inviting the user to pick a target mix and linking to Settings; dismissal persisted in `localStorage` (mirror the Epic 9 reserve prompt). Disappears once a model is chosen.
-- [ ] **Task 7 — Tests (AC: 8, 7) — full suite must stay green**
-  - [ ] Backend `ballast/backend/tests/test_target_allocation.py`: reference data (every model's weights sum to exactly `Decimal("1.00")`; symbol→class map correct; helper determinism); config default-undecided; set model; invalid key → 422; **scoped isolation** (A cannot read/modify B); GET/PUT round-trip with weights as fixed-point strings; new-user reads undecided.
-  - [ ] Frontend `ballast/frontend/src/test/`: a `target-allocation` settings test (get/put, pick a model) and a Dashboard test (prompt appears only when undecided, is dismissible, disappears once chosen). Assert calm copy (reuse the digest FORBIDDEN-word discipline).
+  - [x] Pure helpers: `list_models()`, `get_model(key)` (unknown key → `None` or a caught error), `resolve_weights(key)` → weights-by-class + funds-by-class. Deterministic, no I/O (like `is_index_core`).
+- [x] **Task 2 — Per-user `TargetAllocationConfig` model (AC: 2, 3)**
+  - [x] Add `TargetAllocationConfig(OwnedEntityMixin, Base)` in `ballast/backend/db/models.py` (table `target_allocation_config`) mirroring `CashConfig`: `id` UUID pk; `model_key: Mapped[str | None] = mapped_column(String(32), nullable=True)`; `created_at`/`updated_at` tz-aware UTC; `__table_args__ = (UniqueConstraint("owner_id", name="uq_target_allocation_config_owner"),)`. No `db/migrations.py` entry needed (new table → `create_all` builds it in full).
+- [x] **Task 3 — Config helpers, scoped + fail-closed (AC: 2, 3, 5)**
+  - [x] New `ballast/backend/strategy/target_config.py` (or `allocation/config.py` — a new package with `__init__.py`) mirroring `cash/config.py`: `get_or_create_config` (create-on-first-read with `IntegrityError` lost-race handling, commit on create); `get_config` (READ-ONLY, no create — for the read path); `set_model(scope, session, key)` (validate `key` ∈ known model keys, else raise a caught `ValueError` → 422); `resolve_target(config)` (→ weights/funds by class, or `None` when undecided). All via `ScopedRepository(TargetAllocationConfig, scope, session)`.
+- [x] **Task 4 — Target-allocation API (AC: 4, 5, 7)**
+  - [x] New `ballast/backend/api/target_allocation.py` router (`prefix="/api/target-allocation"`) mirroring `api/cash.py`: `GET` → `{ model, choices[], resolved }`; `PUT` accepting `{ model }` (invalid → calm 422). Weights out as fixed-point strings via `WireMoney`. Auth via `get_scope`; session via `get_async_session`.
+  - [x] Register the router in `ballast/backend/api/app.py` (`app.include_router(target_allocation_router)`), alongside `cash_router`.
+- [x] **Task 5 — Frontend: Settings "Target mix" card (AC: 6, 7)**
+  - [x] `ballast/frontend/src/routes/Settings.jsx`: add a "Your target mix" card (mirror the Epic 9 `CashSetupCard`): a radio/select of the models, each with its plain-English description + mix percentages; wired to `GET`/`PUT /api/target-allocation` via `apiFetch`; optimistic + fail-quiet.
+- [x] **Task 6 — Frontend: Dashboard set-or-decline prompt (AC: 3, 6, 7)**
+  - [x] `ballast/frontend/src/routes/Dashboard.jsx`: a calm, non-blocking, dismissible prompt when `model === null`, inviting the user to pick a target mix and linking to Settings; dismissal persisted in `localStorage` (mirror the Epic 9 reserve prompt). Disappears once a model is chosen.
+- [x] **Task 7 — Tests (AC: 8, 7) — full suite must stay green**
+  - [x] Backend `ballast/backend/tests/test_target_allocation.py`: reference data (every model's weights sum to exactly `Decimal("1.00")`; symbol→class map correct; helper determinism); config default-undecided; set model; invalid key → 422; **scoped isolation** (A cannot read/modify B); GET/PUT round-trip with weights as fixed-point strings; new-user reads undecided.
+  - [x] Frontend `ballast/frontend/src/test/`: a `target-allocation` settings test (get/put, pick a model) and a Dashboard test (prompt appears only when undecided, is dismissible, disappears once chosen). Assert calm copy (reuse the digest FORBIDDEN-word discipline).
 
 ## Dev Notes
 
@@ -142,12 +145,58 @@ A brand-new table needs **no** `db/migrations.py` entry — `create_all` (`db.se
 - [Source: ballast/backend/tests/test_cash_config.py, ballast/frontend/src/test/cash-config.test.jsx, dashboard.test.jsx] — the test patterns (scoped isolation, calm copy, prompt) to mirror.
 - [Source: ballast/backend/tests/conftest.py, tests/test_digest_compose.py] — test harness + calm-copy tone check + the live-link DB guard.
 
+## Review Findings
+
+_Code review 2026-08-11 (adversarial: Blind Hunter + Edge Case Hunter + Acceptance Auditor). All 8 ACs confirmed satisfied; isolation, read-only GET, weights-sum-to-1.00, and Decimal wire round-trip independently verified. Zero High, zero correctness/isolation bugs — findings below are polish/hardening._
+
+- [x] [Review][Patch] Coordinate the two Dashboard set-or-decline prompts — a brand-new user sees BOTH the Epic 9 reserve prompt and the new target-mix prompt stacked at once, undercutting the calm first-run intent. Show one at a time (target prompt only when the reserve prompt isn't showing). [ballast/frontend/src/routes/Dashboard.jsx]
+- [x] [Review][Patch] Add a `CREATE TABLE IF NOT EXISTS target_allocation_config` entry to `db/migrations.py` (belt-and-suspenders for carried-over DBs like the live `ballast`, matching the 9-3 `pending_buy` convention). Functionally `create_all` builds it, but the codebase convention adds the idempotent statement. [ballast/backend/db/migrations.py]
+- [x] [Review][Patch] `set_model` single commit — consolidate the get_or_create (commit) + mutate (commit) into one write, matching `cash.set_config` (the pattern this mirrors). Benign today but a divergence. [ballast/backend/allocation/config.py]
+- [x] [Review][Patch] Widen the calm-copy tests to the full digest FORBIDDEN word list (frontend regex is narrower than the spec's tone bar) + add a backend tone test over the new reference-data/API copy. Copy is verified clean; the guard is weaker than AC7 asks. [ballast/frontend/src/test/target-allocation.test.jsx, ballast/backend/tests/test_target_allocation.py]
+- [x] [Review][Patch] Defensive polish (all latent — reachable only if the reference data changes): guard `formatMixWeights` against a missing/non-numeric weight (no `NaN%`); guard the GET read path with `is_valid_model` so a stale stored `model_key` doesn't echo with `resolved:null`; use `.get()` in `_resolved_out`. [ballast/frontend/src/routes/Settings.jsx, ballast/backend/api/target_allocation.py]
+- [x] [Review][Defer] `ballast-reserve-prompt__actions` has no CSS definition — the target prompt reuses it faithfully; it's a pre-existing gap inherited from the Epic 9 reserve prompt (not introduced here). Add minimal layout CSS when the prompt styling is next touched.
+- [x] [Review][Dismiss] IntegrityError re-raise → 500 on a lost-race + concurrent delete — mirrors the accepted digest/cash pattern; extremely narrow. · `weights` vs spec's `weights_by_class` wire key — the 10-2 contract is internal; the cleaner names are accepted. · null-vs-empty-string 422 shape difference + rapid-radio out-of-order PUT — the frontend controls the input and a re-read reconciles; benign for a config selection.
+
 ## Dev Agent Record
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Claude Opus 4.8, 1M context) — via `/bmad-dev-story 10-1`.
+
 ### Debug Log References
+
+- Ran the suite against the disposable **`ballast_test`** DB (never `ballast`, which holds MasterB's live Schwab link): `DATABASE_URL=…/ballast_test BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1 uv run pytest -q`.
+- No linter configured (no ruff, no `npm run lint`) — pytest + vitest are the quality gate.
 
 ### Completion Notes List
 
+- **Faithful twin of Epic 9's `cash_config`** — the config model, scoped helpers, API, Settings card, and set-or-decline prompt all mirror the Epic 9 pattern almost 1:1, so this is low-risk.
+- **Reference data (`strategy/target_allocation.py`)** mirrors `strategy/index_core.py`: three asset classes (US equity / international equity / bonds), a symbol→class map over `INDEX_CORE_SYMBOLS`, and three model portfolios with LOCKED v1 weights that each sum to **exactly `Decimal("1.00")`** (asserted per-model): conservative 0.30/0.10/0.60, balanced 0.45/0.20/0.35, growth 0.60/0.30/0.10. Canonical buy-funds VTI/VXUS/BND. **VT (whole-world) is deliberately omitted from the symbol→class map** (a spans-classes special case for Story 10-2) — asserted in a test.
+- **GET is read-only** (uses `get_config`, not `get_or_create`) — applying the P4 lesson from the 9-1 review, a plain read never writes a row; a test proves no row is created on GET. The row is created on the first PUT.
+- **Honest undecided state:** `model_key = NULL` is the undecided default (drives the prompt); never silently a default model. An unknown model key → calm 422 (nothing persisted).
+- **Frontend:** a Settings "Target mix" radio card (reuses the existing `ballast-cash__*` styles — no new CSS) showing each model's plain-English description + its mix as percentages; a dismissible Dashboard prompt (localStorage-persisted, mirroring the reserve prompt) shown only when undecided. Both fetch `/api/target-allocation` fail-quiet.
+- **No new migration:** `create_all` builds `target_allocation_config` in full (verified — the full suite ran green against a DB where the table was auto-created).
+- **Tests:** backend **714 passed** (+9: reference-data purity, weights-sum-to-1, symbol map incl. VT, GET read-only, set/resolve, invalid→422, scoped isolation, auth); frontend **172 passed** (+5: the card's choices/copy/pick/reflect + the Dashboard prompt appears-when-undecided/dismiss/hidden-when-chosen). Zero regressions.
+
 ### File List
+
+**New:**
+- `ballast/backend/strategy/target_allocation.py`
+- `ballast/backend/allocation/__init__.py`
+- `ballast/backend/allocation/config.py`
+- `ballast/backend/api/target_allocation.py`
+- `ballast/backend/tests/test_target_allocation.py`
+- `ballast/frontend/src/test/target-allocation.test.jsx`
+
+**Modified:**
+- `ballast/backend/db/models.py` (add `TargetAllocationConfig`)
+- `ballast/backend/api/app.py` (import + register `target_allocation_router`)
+- `ballast/frontend/src/routes/Settings.jsx` (`TargetMixCard`)
+- `ballast/frontend/src/routes/Dashboard.jsx` (target-mix set-or-decline prompt)
+- `_bmad-output/implementation-artifacts/10-1-target-allocation-model-pick-a-model-portfolio.md` (this file)
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` (status → review)
+
+## Change Log
+
+- 2026-08-11 — Implemented Story 10.1 (Target-allocation model — pick a model portfolio). New `strategy/target_allocation.py` reference data (3 asset classes, symbol→class map, 3 model portfolios summing to 1.00, canonical funds); new `TargetAllocationConfig` owned table + `allocation/config.py` scoped helpers (read-only GET, validated set → 422); `GET/PUT /api/target-allocation`; Settings "Target mix" card + dismissible Dashboard prompt. All 8 ACs satisfied; backend 714 / frontend 172 pass. Status → review.
+- 2026-08-12 — Adversarial code review (Blind Hunter + Edge Case Hunter + Acceptance Auditor): all 8 ACs confirmed, isolation/read-only-GET/weights-sum-to-1.00/Decimal-round-trip independently verified; 0 High, 0 correctness bugs. 5 patches applied: coordinate the two Dashboard prompts (no stacked setup cards); add the `CREATE TABLE IF NOT EXISTS target_allocation_config` migration entry (carried-over-DB convention); `set_model` single commit; widen the calm-copy tests to the full FORBIDDEN list + a backend tone test; defensive polish (NaN% guard, stale-key GET guard, `.get()` in `_resolved_out`). 1 deferred (pre-existing prompt-actions CSS), rest dismissed. Backend 715 / frontend 172 pass. Status → done.

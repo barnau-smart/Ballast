@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from api.brokerage import router as brokerage_router
 from api.cash import router as cash_router
 from api.coach import router as coach_router
+from api.target_allocation import router as target_allocation_router
 from api.config import get_settings
 from api.digest import router as digest_router
 from api.portfolio import router as portfolio_router
@@ -230,6 +231,12 @@ def create_app() -> FastAPI:
     # authenticated GET/PUT config endpoints — user-declared reserve + parked
     # money-market symbols, funneled through the fail-closed scope (AD-10).
     app.include_router(cash_router)
+
+    # Target-allocation selection (Story 10.1, Epic 10): the Settings "Target mix"
+    # card's authenticated GET/PUT endpoints — which named model portfolio the
+    # user picked, funneled through the fail-closed scope (AD-10). Foundation for
+    # the gap-to-target deploy-cash engine (10-2).
+    app.include_router(target_allocation_router)
 
     # --- Routes --------------------------------------------------------------
 
