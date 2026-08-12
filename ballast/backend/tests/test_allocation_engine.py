@@ -609,25 +609,28 @@ def test_at_target_with_cash_but_no_underweight(client):
         _delete_user(email)
 
 
-def test_parked_excluded_from_investable(client):
+def test_parked_holding_does_not_reduce_settlement_investable(client):
     email = _unique_email()
     try:
         _register(client, email)
         headers = {"Authorization": f"Bearer {_login(client, email)}"}
         uid = _user_id_for(email)
-        # $4,000 cash but $4,000 is parked in a money-market → 0 investable.
+        # $4,000 ready settlement cash PLUS a SEPARATE $4,000 SWVXX money-market
+        # holding. The two are independent pools (Epic 9: ready_to_trade = view.cash).
+        # Parked money-market is a holding, never part of settlement cash, so it must
+        # NOT reduce investable — the $4,000 settlement cash is fully deployable.
         _seed_balance(uid, "4000")
-        _seed_holding(uid, "SWVXX", "4000")  # a parked money-market holding
+        _seed_holding(uid, "SWVXX", "4000")  # a parked money-market holding (separate)
         client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
         _seed_cash_config(
             uid, reserve_amount="0", reserve_decided=True, parked_symbols=["SWVXX"]
         )
 
         body = client.get("/api/allocation/plan", headers=headers).json()
-        # Wait — parked_market_value sums HOLDINGS whose symbol is parked, not cash.
-        # Here the $4,000 cash is fully ready; the $4,000 SWVXX holding is parked and
-        # excluded from investable. ready_to_trade = 4000 - 4000 = 0 → no_cash.
-        assert body["status"] == "no_cash"
+        # Regression: previously the engine did view.cash - parked = 0 → false no_cash.
+        # The $4,000 settlement cash deploys; the parked SWVXX is untouched.
+        assert body["status"] == "deploy"
+        assert body["investable_cash"] == "4000.00"
     finally:
         _delete_user(email)
 

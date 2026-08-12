@@ -358,3 +358,29 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
   summary: A concentration finding's `asset_class` falls back to the raw symbol/internal class token (`asset_class_for(symbol) or symbol`) instead of a display label, so the API can surface a bare ticker or raw class key where every other surface uses `ASSET_CLASS_LABEL`.
   evidence: `allocation/review.py:246`. Cosmetic/consistency; map through the label table (or document the intended fallback copy).
+
+## Deferred from: code review of spec-10-2 — Group B deploy engine (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `_current_breakdown` sleeve weight serializes as bare `"0"` when total==0 but 4dp `"0.0000"` otherwise, and three independently-4dp-quantized weights need not sum to 1.0000 on the wire.
+  evidence: `allocation/engine.py:~434` (`(value/total).quantize(0.0001) if total>0 else _ZERO`). Display honesty only — this dict is not used by trade math. Quantize the zero branch and/or reconcile the residual if the frontend renders these as fixed strings.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: The pure engine trusts caller-supplied `target_weights` sum to 1.0 (enforced only by a test over MODEL_PORTFOLIOS, never asserted at the engine boundary). A future model or partial dict summing ≠ 1 silently strands cash (<1) or over-targets every class (>1).
+  evidence: `allocation/engine.py:~349` (`target_weights.get(cls, _ZERO)`); guarantee lives in `test_target_allocation.py`. Cheap `assert sum == 1` (or a `no_target`-style bail) would let the money core defend itself.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: No test pins `CANONICAL_FUND ⊆ index-core`; the engine populates a primary BUY for `CANONICAL_FUND[cls]`, and `/approve` rejects a non-index-core symbol — so a future edit to CANONICAL_FUND could yield a plan the user can't co-sign.
+  evidence: `strategy/target_allocation.py:CANONICAL_FUND` (VTI/VXUS/BND) vs `coach/execution.py:~318` (`is_index_core` scope gate). Coincidentally safe today; add a `CANONICAL_FUND ⊆ INDEX_CORE_SYMBOLS` invariant test.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `MIN_DEPLOY` dust-drop can silently swallow a genuinely-underweight small sleeve (e.g. bonds on modest cash) while deploying its neighbors; the `deploy` status/reason never surfaces the skipped class.
+  evidence: `allocation/engine.py:~411-419`. Money is accounted honestly (goes to `undeployed_cash`) but "close the largest gaps toward target" is quietly defeated for the smallest sleeve. Product decision on whether to surface dropped-as-dust classes.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `parked_market_value` sums `h.market_value` with no `None`-guard (asymmetric with `classify_holdings`, which coerces None→0). Now MOOT for the deploy engine (no longer called after the 2026-08-12 parked-cash HIGH fix) but still latent for the other Epic 9 callers (`GET /api/portfolio`, missed-growth read).
+  evidence: `cash/config.py:parked_market_value`; DB column is `nullable=False` so unreachable from the cache path today. Make it symmetric (coerce None→0) when touched.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: PROCESS/traceability — Story 10-1 (`strategy/target_allocation.py`, `api/target_allocation.py`) shipped with NO governing spec file; `expense_ratio.py` (a Story 10-4 file) was bundled into the 10-2/earlier commits. For the epic-10 retrospective, not a code fix.
+  evidence: only `spec-10-2/10-3/10-4` exist in `implementation-artifacts/`; no `spec-10-1`. `expense_ratio.py` docstring says "Story 10.4".

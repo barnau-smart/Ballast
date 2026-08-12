@@ -3,8 +3,8 @@
 Answers the beginner's real freeze — *"I have $2k of idle cash, what do I
 actually buy?"* — with a **pure, deterministic, cash-only rebalance plan**: group
 the user's holdings by asset class, compare to their resolved 10-1 target, compute
-investable cash (Epic 9: ``ready_to_trade − reserve``, excluding parked), and
-produce concrete BUYs that close the largest gaps *toward* target.
+investable cash (Epic 9: ``ready_to_trade − reserve``), and produce concrete BUYs
+that close the largest gaps *toward* target.
 
 Design guardrails (locked, non-negotiable):
 
@@ -19,8 +19,9 @@ Design guardrails (locked, non-negotiable):
   no investable cash → a calm no-action status. Never manufacture a trade.
 - **Honest undecided.** An undecided target (10-1 → ``None``) → ``no_target``; a
   never-decided reserve (Epic 9 ``resolve_reserve`` → ``None``, or no config row at
-  all) → ``decide_reserve`` — NEVER silently 0. Parked money-market is excluded
-  from investable cash.
+  all) → ``decide_reserve`` — NEVER silently 0. Parked money-market is a SEPARATE
+  holding pool (not part of settlement ``view.cash``), so it is already outside
+  investable cash — never subtracted again.
 - **Populate, don't submit.** This engine NEVER places an order and NEVER writes a
   ``decision_record``; :func:`build_plan` only *computes* a plan the human co-signs
   through the existing ``/approve`` spine.
@@ -44,7 +45,6 @@ from allocation.config import get_config as get_target_config, resolve as resolv
 from brokers.portfolio import get_portfolio
 from cash.config import (
     get_config as get_cash_config,
-    parked_market_value,
     resolve_reserve,
 )
 from db.scope import Scope
@@ -312,7 +312,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     1. Undecided target (10-1 → ``None``) → ``no_target``.
     2. Never-decided reserve (no cash config, or ``resolve_reserve`` → ``None``) →
        ``decide_reserve`` (NEVER silently 0).
-    3. Investable cash (``ready_to_trade − reserve``, excl. parked) ≤ 0 →
+    3. Investable cash (``ready_to_trade − reserve``, ready = settlement view.cash) ≤ 0 →
        ``no_cash``.
     4. No underweight class the cash can add to (or every allocation is dust) →
        ``at_target``.
@@ -366,13 +366,20 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
-    # (3) Investable cash = ready_to_trade − reserve, EXCLUDING parked money-market.
-    parked = parked_market_value(view.holdings, cash_config)
-    # ``view.cash`` (balance-row) and ``parked`` (summed parked holding values) are
-    # independent data sources; a source mismatch could drive this negative. Clamp
-    # to zero so a mismatch collapses honestly to no_cash rather than flowing a
-    # negative into the math.
-    ready_to_trade = max(_ZERO, view.cash - parked)
+    # (3) Investable cash = ready_to_trade − reserve. ``ready_to_trade`` is the
+    # settlement cash (``view.cash``, the balance row) — Epic 9's canonical
+    # definition (``api/portfolio``, ``cash/liquidation``, ``api/cash`` all set
+    # ``ready_to_trade = view.cash``). Parked money-market is a SEPARATE holding pool
+    # (never part of ``view.cash``): subtracting its value here would double-remove
+    # money that was never in settlement, under-deploying or falsely reporting
+    # no_cash for any user of the Epic 9 park feature. Clamp cash to zero (a negative
+    # settlement balance is not investable). ``reserve`` is re-validated here (finite,
+    # non-negative) because the engine trusts a value stored by another writer — a
+    # NaN would otherwise slip past the ``investable <= 0`` guard (NaN compares False)
+    # and a negative would inflate investable past the real cash.
+    ready_to_trade = max(_ZERO, view.cash)
+    if not reserve.is_finite() or reserve < _ZERO:
+        reserve = _ZERO
     investable = ready_to_trade - reserve
     if investable <= _ZERO:
         return Plan(
