@@ -112,7 +112,7 @@ export function CoachConsult() {
   // unchanged approve spine — POPULATE, never submit. On any no-action status
   // (`at_target`/`no_cash`/`no_target`/`decide_reserve`) it shows the calm `reason`
   // and populates NOTHING. `deploy` phases: idle | loading | deployed | no-action |
-  // failed.
+  // signed-out | failed.
   const [deploy, setDeploy] = useState('idle')
   const [deployMessage, setDeployMessage] = useState('')
   // Story 10.3 — the fiduciary-advisor narration returned alongside a `deploy`
@@ -481,6 +481,11 @@ export function CoachConsult() {
         setSuggestReasoning(data.reasoning ?? '')
         setSuggestFillNote(data.fill_note ?? '')
         setSuggestStaleNote(data.stale_note ?? '')
+        // A suggest populate supersedes any shown Review findings — clear them so a
+        // stale SELL "Fill" button can't sit beside this suggested BUY.
+        setReview('idle')
+        setReviewFindings([])
+        setReviewMessage('')
         setSuggest('suggested')
         return
       }
@@ -533,7 +538,7 @@ export function CoachConsult() {
       if (!mounted.current) return
       if (res.status === 401) {
         setDeployMessage('Sign in to see how to deploy your cash.')
-        setDeploy('failed')
+        setDeploy('signed-out')
         return
       }
       if (!res.ok) {
@@ -580,6 +585,11 @@ export function CoachConsult() {
         setSuggestFillNote('')
         setSuggestStaleNote('')
         setPendingSuggestion(null)
+        // Clear any shown Review findings so their SELL "Fill in this order" buttons
+        // can't sit beside — and be clicked to overwrite — this fresh BUY populate.
+        setReview('idle')
+        setReviewFindings([])
+        setReviewMessage('')
         // Populate the order controls with the primary MARKET BUY (mirrors the 8-4
         // onSuggest populate pattern). The human reviews & co-signs — no submit.
         setSymbol(primary.symbol)
@@ -660,6 +670,16 @@ export function CoachConsult() {
         return
       }
       if (!mounted.current) return
+      // Review results supersede any shown Deploy/Suggest populate panel — clear
+      // those notes so only one result surface is visible and it matches Review.
+      setDeploy('idle')
+      setDeployMessage('')
+      setDeployNarration(null)
+      setSuggest('idle')
+      setSuggestReasoning('')
+      setSuggestFillNote('')
+      setSuggestStaleNote('')
+      setPendingSuggestion(null)
       const findings = Array.isArray(data?.findings) ? data.findings : []
       if (findings.length === 0) {
         setReviewFindings([])
@@ -690,6 +710,10 @@ export function CoachConsult() {
     const ok =
       symbol !== '' && DECIMAL_RE.test(amount) && Number(amount) > 0
     if (!ok) return // contract-drift insurance — never populate an un-co-signable order
+    // Don't populate while a Deploy/Suggest fetch is in flight — its async success
+    // branch would overwrite this SELL with a BUY (a buy/sell flip the user never
+    // chose). Mirrors the onReview in-flight guard.
+    if (deployingRef.current || suggestingRef.current) return
     // A shown recommendation no longer matches once we repopulate the form.
     if (recommendation !== null) {
       resetResult()
@@ -955,6 +979,19 @@ export function CoachConsult() {
           role="status"
         >
           {deployMessage}
+        </p>
+      ) : null}
+
+      {deploy === 'signed-out' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-signed-out"
+          role="status"
+        >
+          {deployMessage || 'Sign in to see how to deploy your cash.'}{' '}
+          <Link className="ballast-consult__link" to="/auth">
+            Sign in
+          </Link>
         </p>
       ) : null}
 

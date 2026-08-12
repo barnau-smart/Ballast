@@ -167,6 +167,65 @@ describe('CoachConsult — review-my-portfolio affordance (Story 10.4)', () => {
     expect(opts.body).toBeUndefined()
   })
 
+  it('clears a shown review list when the user deploys (mutually-exclusive result panels)', async () => {
+    // Regression (Group-C review): a shown Review list left its SELL "Fill" button
+    // live beside a fresh Deploy BUY — one click could overwrite the BUY with a SELL
+    // the user never chose. Deploying must clear the review list.
+    const fetchMock = vi.fn((url) => {
+      const u = String(url)
+      if (u.includes('/api/allocation/review')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ findings: [CONCENTRATION_FINDING] }),
+        })
+      }
+      if (u.includes('/api/allocation/narration')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              plan: {
+                status: 'deploy',
+                primary_order: {
+                  symbol: 'VTI',
+                  side: 'buy',
+                  amount: '2000.00',
+                  order_type: 'market',
+                },
+                reason: '',
+              },
+              narration: null,
+            }),
+        })
+      }
+      return Promise.reject(new Error(`unexpected url: ${u}`))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderConsult()
+
+    // 1) Review → the findings list (with its SELL "Fill" button) is on screen.
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    expect(screen.getByTestId('coach-review-fill-0')).toBeInTheDocument()
+
+    // 2) Deploy → a BUY is populated AND the stale review list/Fill button are gone.
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+    await screen.findByTestId('coach-deploy-populated')
+
+    expect(screen.queryByTestId('coach-review-result')).toBeNull()
+    expect(screen.queryByTestId('coach-review-fill-0')).toBeNull()
+    expect(screen.getByTestId('coach-symbol-input').value).toBe('VTI')
+    expect(screen.getByTestId('coach-side-select').value).toBe('buy')
+    expect(screen.getByTestId('coach-amount-input').value).toBe('2000.00')
+
+    // Still nothing submitted.
+    const urls = fetchMock.mock.calls.map(([u]) => String(u))
+    expect(urls.some((u) => u.includes('/approve'))).toBe(false)
+    expect(urls.some((u) => u.includes('/recommend'))).toBe(false)
+  })
+
   it('shows the calm "nothing to fix" message on empty findings, populates nothing', async () => {
     stubFetch({ findings: [] })
     renderConsult()

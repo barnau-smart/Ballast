@@ -384,3 +384,21 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
   summary: PROCESS/traceability — Story 10-1 (`strategy/target_allocation.py`, `api/target_allocation.py`) shipped with NO governing spec file; `expense_ratio.py` (a Story 10-4 file) was bundled into the 10-2/earlier commits. For the epic-10 retrospective, not a code fix.
   evidence: only `spec-10-2/10-3/10-4` exist in `implementation-artifacts/`; no `spec-10-1`. `expense_ratio.py` docstring says "Story 10.4".
+
+## Deferred from: code review of epic-10 — Group C API/DB/frontend wiring (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: Startup migration cannot repair a pre-existing `target_allocation_config` table that lacks its `UNIQUE(owner_id)` constraint — `CREATE TABLE IF NOT EXISTS` silently skips, so the per-owner uniqueness `config.py` relies on would go unenforced (two rows/user, nondeterministic `rows[0]`).
+  evidence: `db/migrations.py` `create_target_allocation_config`. Unreachable for real fresh/known DBs (`create_all` builds it correctly); latent only for an out-of-band table shape. Add an explicit constraint-add step if defensiveness is wanted.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: `read_narration` (and `read_review`) construct the LLM gateway on every request even for no-action plans / zero findings, which make NO LLM call — wasted on the common undecided/at-target beginner path.
+  evidence: `api/allocation.py` `read_narration` calls `get_llm_gateway()` unconditionally before `narrate_plan` short-circuits. Minor latency, not correctness; construct lazily only when an LLM call will actually happen.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `PUT /api/target-allocation` returns `model=config.model_key` unguarded, while GET filters the returned model via `is_valid_model`. If the valid-model set and the resolvable set ever diverge, PUT and GET would report different `model` for the same stored row.
+  evidence: `api/target_allocation.py` update vs read handlers. Consistent today (both wired from the same constants); guard PUT the same way as GET when touched.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `/plan` serializes `unclassified` (VT/single-stocks/non-index ETFs) and the `current` sleeve breakdown, but the deploy UI (`CoachConsult.onDeploy`) never renders them — the spec intent "those holdings are surfaced honestly" is only half-met (endpoint yes, UI no).
+  evidence: `CoachConsult.jsx` deploy branch reads only `plan.primary_order`/`status`/`reason`. Product/UX decision on whether to show the unclassified sleeve + current mix in the deploy card.
