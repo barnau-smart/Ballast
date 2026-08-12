@@ -160,7 +160,7 @@ development_status:
   # Parked: aware-but-don't-act, praise-the-healthy, tax, the whole teaching layer.
   epic-10: in-progress
   10-1-target-allocation-model-pick-a-model-portfolio: done
-  10-2-gap-to-target-deploy-cash-engine: backlog
+  10-2-gap-to-target-deploy-cash-engine: done
   10-3-fiduciary-advisor-narration-never-invent-safeguard: backlog
   10-4-analysis-buckets-concentration-cost: backlog
   epic-10-retrospective: optional

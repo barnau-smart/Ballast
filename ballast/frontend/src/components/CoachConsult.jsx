@@ -105,6 +105,18 @@ export function CoachConsult() {
   const [pendingSuggestion, setPendingSuggestion] = useState(null)
   const suggestingRef = useRef(false) // synchronous double-click guard
 
+  // Story 10.2 — "Deploy your cash toward your target". Fetches the deterministic
+  // gap-to-target plan (`GET /api/allocation/plan`) and, on `status:"deploy"`,
+  // populates the order controls with the `primary_order` (the largest-gap MARKET
+  // BUY) via the existing setters so the human reviews & co-signs through the
+  // unchanged approve spine — POPULATE, never submit. On any no-action status
+  // (`at_target`/`no_cash`/`no_target`/`decide_reserve`) it shows the calm `reason`
+  // and populates NOTHING. `deploy` phases: idle | loading | deployed | no-action |
+  // failed.
+  const [deploy, setDeploy] = useState('idle')
+  const [deployMessage, setDeployMessage] = useState('')
+  const deployingRef = useRef(false) // synchronous double-click guard
+
   // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
   // ready-to-trade cash is short, we fetch a pre-filled money-market SELL plan
   // (`/api/cash/liquidation-plan`) and render `LiquidationCard` in place of a
@@ -203,6 +215,9 @@ export function CoachConsult() {
     setSuggestStaleNote('')
     // Story 9.3 — clear any just-in-time liquidation plan on a fresh ask/decline.
     setLiquidationPlan(null)
+    // Story 10.2 — clear any deploy-cash status/message on a fresh ask/decline.
+    setDeploy('idle')
+    setDeployMessage('')
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -367,6 +382,7 @@ export function CoachConsult() {
   // the human still runs the /approve co-sign path.
   async function onSuggest() {
     if (suggestingRef.current) return // synchronous double-click guard
+    if (deployingRef.current) return // don't race an in-flight deploy populate
     if (phase === 'thinking') return // don't race an in-flight ask
     const s = symbol.trim()
     if (s === '') {
@@ -467,6 +483,106 @@ export function CoachConsult() {
       setSuggest('suggest-failed')
     } finally {
       suggestingRef.current = false
+    }
+  }
+
+  // Story 10.2 — "Deploy your cash toward your target": ask the backend for the
+  // deterministic gap-to-target plan and, on a `deploy` status, POPULATE the order
+  // controls with the primary buy (side=buy, the canonical fund symbol, the dollar
+  // amount, a MARKET order) via the existing setters so the human co-signs through
+  // the unchanged approve spine. On any no-action status show the calm `reason` and
+  // populate NOTHING. Nothing is ever submitted here.
+  async function onDeploy() {
+    if (deployingRef.current) return // synchronous double-click guard
+    if (suggestingRef.current) return // don't race an in-flight suggest populate
+    if (phase === 'thinking') return // don't race an in-flight ask
+    deployingRef.current = true
+    setDeploy('loading')
+    setDeployMessage('')
+    // NOTE: we do NOT reset a shown recommendation here. A no-action / failed /
+    // error deploy must leave any recommendation the user is viewing intact — we
+    // only clear it on the successful populate branch, right before we repopulate.
+    try {
+      const res = await apiFetch('/api/allocation/plan')
+      if (!mounted.current) return
+      if (res.status === 401) {
+        setDeployMessage('Sign in to see how to deploy your cash.')
+        setDeploy('failed')
+        return
+      }
+      if (!res.ok) {
+        setDeployMessage(
+          'We couldn’t work out a plan just now — try again in a moment.',
+        )
+        setDeploy('failed')
+        return
+      }
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setDeployMessage('We couldn’t read that plan — try again.')
+        setDeploy('failed')
+        return
+      }
+      if (!mounted.current) return
+      const primary = data?.primary_order
+      const primaryOk =
+        primary &&
+        typeof primary.symbol === 'string' &&
+        primary.symbol.trim() !== '' &&
+        typeof primary.amount === 'string' &&
+        DECIMAL_RE.test(primary.amount.trim()) &&
+        Number(primary.amount) > 0
+      if (data?.status === 'deploy' && primaryOk) {
+        // A new order is about to land — only NOW clear a shown recommendation
+        // (it no longer matches once we repopulate the form).
+        if (recommendation !== null) {
+          resetResult()
+          setPhase('idle')
+        }
+        // Clear any stale 8-4 suggestion panel so a LIMIT suggestion doesn't sit
+        // next to the new MARKET populate. (resetResult above blanks the suggest
+        // state when a recommendation was showing; do it unconditionally here and
+        // also drop the held pending suggestion resetResult doesn't touch.)
+        setSuggest('idle')
+        setSuggestReasoning('')
+        setSuggestFillNote('')
+        setSuggestStaleNote('')
+        setPendingSuggestion(null)
+        // Populate the order controls with the primary MARKET BUY (mirrors the 8-4
+        // onSuggest populate pattern). The human reviews & co-signs — no submit.
+        setSymbol(primary.symbol)
+        setSide('buy')
+        setAmount(primary.amount)
+        setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
+        setDeployMessage('')
+        setDeploy('deployed')
+        return
+      }
+      if (data?.status === 'deploy') {
+        // status says deploy but the primary_order is unreadable (backend contract
+        // drift) — a blank/zero populate would produce an un-co-signable order.
+        // Do NOT populate; fall through to a calm failed note.
+        setDeployMessage('We couldn’t read that plan — try again.')
+        setDeploy('failed')
+        return
+      }
+      // Any no-action status (at_target / no_cash / no_target / decide_reserve) —
+      // show the calm backend reason and populate NOTHING.
+      setDeployMessage(
+        data?.reason ||
+          'There’s nothing to deploy toward your target right now.',
+      )
+      setDeploy('no-action')
+    } catch {
+      if (!mounted.current) return
+      setDeployMessage(
+        'We couldn’t reach the coach just now — try again in a moment.',
+      )
+      setDeploy('failed')
+    } finally {
+      deployingRef.current = false
     }
   }
 
@@ -594,7 +710,54 @@ export function CoachConsult() {
         >
           {suggest === 'suggesting' ? 'Suggesting…' : 'Suggest this order'}
         </button>
+
+        {/* Story 10.2 — "Deploy your cash toward your target". Computes a calm,
+            deterministic gap-to-target plan and, on a deploy status, populates the
+            form with the primary MARKET BUY; never executes. */}
+        <button
+          type="button"
+          className="ballast-consult__deploy"
+          data-testid="coach-deploy-cash"
+          onClick={onDeploy}
+          disabled={deploy === 'loading' || phase === 'thinking'}
+        >
+          {deploy === 'loading'
+            ? 'Working it out…'
+            : 'Deploy your cash toward your target'}
+        </button>
       </form>
+
+      {deploy === 'deployed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-populated"
+          role="status"
+        >
+          I’ve filled in a buy that moves your cash toward your target mix. Review
+          it, then ask the coach to co-sign it with you.
+        </p>
+      ) : null}
+
+      {deploy === 'no-action' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-no-action"
+          role="status"
+        >
+          {deployMessage}
+        </p>
+      ) : null}
+
+      {deploy === 'failed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-failed"
+          role="status"
+        >
+          {deployMessage ||
+            'We couldn’t work out a plan just now — try again in a moment.'}
+        </p>
+      ) : null}
 
       {suggest === 'suggested' ? (
         <div

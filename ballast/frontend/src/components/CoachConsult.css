@@ -50,7 +50,8 @@
 
 /* Story 8.4 — the optional "Suggest this order" button + its calm narration
    panel. A quiet secondary action, never the loud brand-red co-sign. */
-.ballast-consult__suggest {
+.ballast-consult__suggest,
+.ballast-consult__deploy {
   font-family: var(--ballast-font-terminal);
   font-size: var(--ballast-text-sm);
   color: var(--ballast-color-phosphor);
@@ -62,7 +63,8 @@
   align-self: flex-start;
 }
 
-.ballast-consult__suggest:disabled {
+.ballast-consult__suggest:disabled,
+.ballast-consult__deploy:disabled {
   opacity: 0.5;
   cursor: default;
 }
