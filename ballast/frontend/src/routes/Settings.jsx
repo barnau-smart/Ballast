@@ -101,6 +101,8 @@ export function Settings() {
       </div>
 
       <CashSetupCard />
+
+      <TargetMixCard />
     </section>
   )
 }
@@ -306,4 +308,102 @@ function CashSetupCard() {
       </div>
     </div>
   )
+}
+
+/**
+ * Target mix (Story 10.1) — pick a named model portfolio (Conservative / Balanced
+ * / Growth) as the "where my money should be" the Allocation Coach measures
+ * against. Calm, plain-English; presentation-only; optimistic + fail-quiet.
+ */
+function TargetMixCard() {
+  const [status, setStatus] = useState('loading')
+  const [model, setModel] = useState(null) // selected key | null (undecided)
+  const [choices, setChoices] = useState([])
+
+  useEffect(() => {
+    let active = true
+    apiFetch('/api/target-allocation')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active || !data) return
+        setModel(data.model ?? null)
+        setChoices(Array.isArray(data.choices) ? data.choices : [])
+        setStatus('ready')
+      })
+      .catch(() => {
+        if (active) setStatus('ready')
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  function handleSelect(key) {
+    const prev = model
+    setModel(key) // optimistic
+    apiFetch('/api/target-allocation', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: key }),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then((data) => setModel(data.model ?? null))
+      .catch(() => setModel(prev)) // roll back the optimistic pick
+  }
+
+  const disabled = status !== 'ready'
+
+  return (
+    <div className="ballast-card" data-testid="target-mix-card">
+      <div className="ballast-digest__copy">
+        <h2 className="ballast-digest__title">Your target mix</h2>
+        <p className="ballast-digest__prose">
+          Pick a target balance of broad, low-cost funds — how much sits in US
+          stocks, international stocks, and bonds. Ballast uses it to suggest what
+          to buy so your money moves toward that balance. You can change it any time.
+        </p>
+      </div>
+      <ul className="ballast-cash__symbol-list" data-testid="target-mix-options">
+        {choices.map((c) => (
+          <li key={c.key}>
+            <label className="ballast-cash__label">
+              <input
+                type="radio"
+                name="target-mix"
+                checked={model === c.key}
+                onChange={() => handleSelect(c.key)}
+                disabled={disabled}
+                data-testid={`target-mix-${c.key}`}
+              />
+              <span>
+                <strong>{c.name}</strong> — {c.description}
+                <br />
+                <span className="ballast-cash__state">{formatMixWeights(c.weights)}</span>
+              </span>
+            </label>
+          </li>
+        ))}
+      </ul>
+      <p className="ballast-cash__state" data-testid="target-mix-state">
+        {model == null
+          ? 'No target mix picked yet — totally fine to choose later.'
+          : `Your target mix: ${choices.find((c) => c.key === model)?.name ?? model}.`}
+      </p>
+    </div>
+  )
+}
+
+/** Render model weights (strings like "0.45") as a calm plain-English mix line. */
+function formatMixWeights(weights) {
+  if (!weights) return ''
+  // Guard against a missing/non-numeric weight (e.g. a future reference-data
+  // key change) so we never render "NaN%".
+  const pct = (w) => {
+    const n = Number(w)
+    return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '—'
+  }
+  return `${pct(weights.us_equity)} US stocks · ${pct(weights.intl_equity)} international · ${pct(weights.bonds)} bonds`
 }

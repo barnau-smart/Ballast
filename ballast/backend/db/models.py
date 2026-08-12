@@ -585,3 +585,42 @@ class CashConfig(OwnedEntityMixin, Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class TargetAllocationConfig(OwnedEntityMixin, Base):
+    """A user's chosen target-allocation model portfolio (table:
+    ``target_allocation_config``, Epic 10).
+
+    Story 10.1 (Allocation Coach): a per-user owned entity (AD-10) — reachable
+    ONLY through the fail-closed ``ScopedRepository``, exactly one row per user
+    (``UniqueConstraint`` on ``owner_id``) — that records which named model
+    portfolio the user picked (Conservative / Balanced / Growth). It is the
+    "where my money should be" that Story 10-2's gap-to-target engine measures
+    against.
+
+    ``model_key`` is the string key of a model in
+    :data:`strategy.target_allocation.MODEL_PORTFOLIOS` (validated on write), or
+    ``NULL`` for the honest **undecided** state — a brand-new user has no target,
+    which drives the calm one-time set-or-decline prompt and is NEVER silently
+    treated as a default model. Twin of :class:`CashConfig`.
+
+    ``created_at``/``updated_at`` are tz-aware UTC.
+    """
+
+    __tablename__ = "target_allocation_config"
+    __table_args__ = (
+        UniqueConstraint("owner_id", name="uq_target_allocation_config_owner"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    # The chosen model portfolio's key (e.g. "balanced"), or NULL when the user
+    # has not yet picked a target. Validated against the known models on write.
+    model_key: Mapped[str | None] = mapped_column(String(length=32), nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

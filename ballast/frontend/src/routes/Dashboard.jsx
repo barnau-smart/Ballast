@@ -37,6 +37,26 @@ export function Dashboard() {
     }
   }
 
+  // Story 10.1 — a calm, one-time prompt to pick a target mix when undecided.
+  // Same localStorage-persisted dismissal as the reserve prompt.
+  const [targetUndecided, setTargetUndecided] = useState(false)
+  const [targetPromptDismissed, setTargetPromptDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem('ballast.targetMixPromptDismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+
+  function dismissTargetPrompt() {
+    setTargetPromptDismissed(true)
+    try {
+      window.localStorage.setItem('ballast.targetMixPromptDismissed', '1')
+    } catch {
+      // Memory-only dismissal is fine.
+    }
+  }
+
   useEffect(() => {
     let active = true
     apiFetch('/api/portfolio')
@@ -56,10 +76,25 @@ export function Dashboard() {
         setPortfolio({ holdings: [], cash: 0, as_of: null })
         setStatus('ready')
       })
+    // Independently: is the target mix still undecided? (fail-quiet)
+    apiFetch('/api/target-allocation')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (active && data) setTargetUndecided(data.model == null)
+      })
+      .catch(() => {})
     return () => {
       active = false
     }
   }, [])
+
+  // Coordinate the set-or-decline prompts so a brand-new user never sees two
+  // "quick setup" cards stacked at once (calm-first-run). The reserve prompt
+  // takes priority; the target-mix prompt waits until it's out of the way.
+  const reservePromptShowing =
+    status === 'ready' &&
+    portfolio?.cash_states?.reserve_decided === false &&
+    !reservePromptDismissed
 
   return (
     <section className="ballast-screen">
@@ -69,9 +104,7 @@ export function Dashboard() {
         Your calm home base — here’s everything you hold, in plain English.
       </p>
 
-      {status === 'ready' &&
-      portfolio?.cash_states?.reserve_decided === false &&
-      !reservePromptDismissed ? (
+      {reservePromptShowing ? (
         <div className="ballast-card" data-testid="reserve-prompt">
           <p className="ballast-screen__prose">
             One optional thing: tell Ballast how much cash you’d like to keep as a
@@ -87,6 +120,31 @@ export function Dashboard() {
               type="button"
               onClick={dismissReservePrompt}
               data-testid="reserve-prompt-dismiss"
+            >
+              Maybe later
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {status === 'ready' &&
+      targetUndecided &&
+      !targetPromptDismissed &&
+      !reservePromptShowing ? (
+        <div className="ballast-card" data-testid="target-mix-prompt">
+          <p className="ballast-screen__prose">
+            One quick setup: pick a target mix — a simple balance of US stocks,
+            international stocks, and bonds to aim for. It lets Ballast suggest
+            what to buy with any spare cash. No rush; you can choose any time.
+          </p>
+          <div className="ballast-reserve-prompt__actions">
+            <Link to="/settings" data-testid="target-mix-prompt-link">
+              Pick a target mix in Settings
+            </Link>
+            <button
+              type="button"
+              onClick={dismissTargetPrompt}
+              data-testid="target-mix-prompt-dismiss"
             >
               Maybe later
             </button>

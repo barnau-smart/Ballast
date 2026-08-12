@@ -19,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.allocation import router as allocation_router
 from api.brokerage import router as brokerage_router
 from api.cash import router as cash_router
 from api.coach import router as coach_router
+from api.target_allocation import router as target_allocation_router
 from api.config import get_settings
 from api.digest import router as digest_router
 from api.portfolio import router as portfolio_router
@@ -230,6 +232,19 @@ def create_app() -> FastAPI:
     # authenticated GET/PUT config endpoints — user-declared reserve + parked
     # money-market symbols, funneled through the fail-closed scope (AD-10).
     app.include_router(cash_router)
+
+    # Target-allocation selection (Story 10.1, Epic 10): the Settings "Target mix"
+    # card's authenticated GET/PUT endpoints — which named model portfolio the
+    # user picked, funneled through the fail-closed scope (AD-10). Foundation for
+    # the gap-to-target deploy-cash engine (10-2).
+    app.include_router(target_allocation_router)
+
+    # Gap-to-target deploy-my-cash plan (Story 10.2, Epic 10): the read-only,
+    # degraded-safe GET /api/allocation/plan the coach console populates its order
+    # controls from — a deterministic cash-only rebalance toward the user's 10-1
+    # target, funneled through the fail-closed scope (AD-10). Populates, never
+    # submits: the human co-signs the primary buy via the existing /approve spine.
+    app.include_router(allocation_router)
 
     # --- Routes --------------------------------------------------------------
 

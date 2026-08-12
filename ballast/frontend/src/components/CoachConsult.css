@@ -50,7 +50,10 @@
 
 /* Story 8.4 — the optional "Suggest this order" button + its calm narration
    panel. A quiet secondary action, never the loud brand-red co-sign. */
-.ballast-consult__suggest {
+.ballast-consult__suggest,
+.ballast-consult__deploy,
+.ballast-consult__review,
+.ballast-consult__review-fill {
   font-family: var(--ballast-font-terminal);
   font-size: var(--ballast-text-sm);
   color: var(--ballast-color-phosphor);
@@ -62,9 +65,25 @@
   align-self: flex-start;
 }
 
-.ballast-consult__suggest:disabled {
+.ballast-consult__suggest:disabled,
+.ballast-consult__deploy:disabled,
+.ballast-consult__review:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Story 10.4 — the "Review my portfolio" results: each finding is a calm advisor
+   card with its own "Fill in this order" populate control. */
+.ballast-consult__review-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-16);
+}
+
+.ballast-consult__review-finding {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ballast-space-8);
 }
 
 .ballast-consult__suggest-panel {

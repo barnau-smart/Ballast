@@ -105,6 +105,35 @@ export function CoachConsult() {
   const [pendingSuggestion, setPendingSuggestion] = useState(null)
   const suggestingRef = useRef(false) // synchronous double-click guard
 
+  // Story 10.2 — "Deploy your cash toward your target". Fetches the deterministic
+  // gap-to-target plan (`GET /api/allocation/plan`) and, on `status:"deploy"`,
+  // populates the order controls with the `primary_order` (the largest-gap MARKET
+  // BUY) via the existing setters so the human reviews & co-signs through the
+  // unchanged approve spine — POPULATE, never submit. On any no-action status
+  // (`at_target`/`no_cash`/`no_target`/`decide_reserve`) it shows the calm `reason`
+  // and populates NOTHING. `deploy` phases: idle | loading | deployed | no-action |
+  // signed-out | failed.
+  const [deploy, setDeploy] = useState('idle')
+  const [deployMessage, setDeployMessage] = useState('')
+  // Story 10.3 — the fiduciary-advisor narration returned alongside a `deploy`
+  // plan (`data.narration`). Rendered via `<CoachCard>` beside the populated
+  // controls so the human sees the why/tradeoff/uncertainty before co-signing.
+  // Cleared on every fresh ask/decline/deploy alongside the other deploy resets.
+  const [deployNarration, setDeployNarration] = useState(null)
+  const deployingRef = useRef(false) // synchronous double-click guard
+
+  // Story 10.4 — "Review my portfolio". Fetches the SELL-side analysis buckets
+  // (`GET /api/allocation/review` → `{findings: [...]}`) and lists each finding as
+  // an advisor `<CoachCard>` with a "Fill in this order" control that populates the
+  // shared controls with that finding's SELL MARKET order (`finding.order`) via the
+  // existing setters — POPULATE, never submit. Zero findings → a calm "nothing to
+  // fix" message; 401 → sign-in. `review` phases: idle | loading | ready | empty |
+  // signed-out | failed. `reviewFindings` holds the fetched findings.
+  const [review, setReview] = useState('idle')
+  const [reviewMessage, setReviewMessage] = useState('')
+  const [reviewFindings, setReviewFindings] = useState([])
+  const reviewingRef = useRef(false) // synchronous double-click guard
+
   // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
   // ready-to-trade cash is short, we fetch a pre-filled money-market SELL plan
   // (`/api/cash/liquidation-plan`) and render `LiquidationCard` in place of a
@@ -203,6 +232,15 @@ export function CoachConsult() {
     setSuggestStaleNote('')
     // Story 9.3 — clear any just-in-time liquidation plan on a fresh ask/decline.
     setLiquidationPlan(null)
+    // Story 10.2 — clear any deploy-cash status/message on a fresh ask/decline.
+    setDeploy('idle')
+    setDeployMessage('')
+    // Story 10.3 — clear any advisor narration on a fresh ask/decline.
+    setDeployNarration(null)
+    // Story 10.4 — clear any portfolio-review findings on a fresh ask/decline.
+    setReview('idle')
+    setReviewMessage('')
+    setReviewFindings([])
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -367,6 +405,7 @@ export function CoachConsult() {
   // the human still runs the /approve co-sign path.
   async function onSuggest() {
     if (suggestingRef.current) return // synchronous double-click guard
+    if (deployingRef.current) return // don't race an in-flight deploy populate
     if (phase === 'thinking') return // don't race an in-flight ask
     const s = symbol.trim()
     if (s === '') {
@@ -442,6 +481,11 @@ export function CoachConsult() {
         setSuggestReasoning(data.reasoning ?? '')
         setSuggestFillNote(data.fill_note ?? '')
         setSuggestStaleNote(data.stale_note ?? '')
+        // A suggest populate supersedes any shown Review findings — clear them so a
+        // stale SELL "Fill" button can't sit beside this suggested BUY.
+        setReview('idle')
+        setReviewFindings([])
+        setReviewMessage('')
         setSuggest('suggested')
         return
       }
@@ -468,6 +512,227 @@ export function CoachConsult() {
     } finally {
       suggestingRef.current = false
     }
+  }
+
+  // Story 10.2/10.3 — "Deploy your cash toward your target": ask the backend for
+  // the deterministic gap-to-target plan + its fiduciary-advisor narration
+  // (`GET /api/allocation/narration` → `{plan, narration}`) and, on a `deploy`
+  // status, POPULATE the order controls with `plan.primary_order` (side=buy, the
+  // canonical fund symbol, the dollar amount, a MARKET order) via the existing
+  // setters so the human co-signs through the unchanged approve spine — AND render
+  // the narration card (why/tradeoff/uncertainty). On any no-action status show the
+  // calm narration reason (or `plan.reason`) and populate NOTHING. Nothing is ever
+  // submitted here.
+  async function onDeploy() {
+    if (deployingRef.current) return // synchronous double-click guard
+    if (suggestingRef.current) return // don't race an in-flight suggest populate
+    if (phase === 'thinking') return // don't race an in-flight ask
+    deployingRef.current = true
+    setDeploy('loading')
+    setDeployMessage('')
+    // NOTE: we do NOT reset a shown recommendation here. A no-action / failed /
+    // error deploy must leave any recommendation the user is viewing intact — we
+    // only clear it on the successful populate branch, right before we repopulate.
+    try {
+      const res = await apiFetch('/api/allocation/narration')
+      if (!mounted.current) return
+      if (res.status === 401) {
+        setDeployMessage('Sign in to see how to deploy your cash.')
+        setDeploy('signed-out')
+        return
+      }
+      if (!res.ok) {
+        setDeployMessage(
+          'We couldn’t work out a plan just now — try again in a moment.',
+        )
+        setDeploy('failed')
+        return
+      }
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setDeployMessage('We couldn’t read that plan — try again.')
+        setDeploy('failed')
+        return
+      }
+      if (!mounted.current) return
+      // Story 10.3 — the plan is now nested under `data.plan`; the advisor
+      // narration under `data.narration`.
+      const plan = data?.plan
+      const narration = data?.narration
+      const primary = plan?.primary_order
+      const primaryOk =
+        primary &&
+        typeof primary.symbol === 'string' &&
+        primary.symbol.trim() !== '' &&
+        typeof primary.amount === 'string' &&
+        DECIMAL_RE.test(primary.amount.trim()) &&
+        Number(primary.amount) > 0
+      if (plan?.status === 'deploy' && primaryOk) {
+        // A new order is about to land — only NOW clear a shown recommendation
+        // (it no longer matches once we repopulate the form).
+        if (recommendation !== null) {
+          resetResult()
+          setPhase('idle')
+        }
+        // Clear any stale 8-4 suggestion panel so a LIMIT suggestion doesn't sit
+        // next to the new MARKET populate. (resetResult above blanks the suggest
+        // state when a recommendation was showing; do it unconditionally here and
+        // also drop the held pending suggestion resetResult doesn't touch.)
+        setSuggest('idle')
+        setSuggestReasoning('')
+        setSuggestFillNote('')
+        setSuggestStaleNote('')
+        setPendingSuggestion(null)
+        // Clear any shown Review findings so their SELL "Fill in this order" buttons
+        // can't sit beside — and be clicked to overwrite — this fresh BUY populate.
+        setReview('idle')
+        setReviewFindings([])
+        setReviewMessage('')
+        // Populate the order controls with the primary MARKET BUY (mirrors the 8-4
+        // onSuggest populate pattern). The human reviews & co-signs — no submit.
+        setSymbol(primary.symbol)
+        setSide('buy')
+        setAmount(primary.amount)
+        setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
+        // Story 10.3 — store the advisor narration for the CoachCard beside the
+        // populated controls.
+        setDeployNarration(narration ?? null)
+        setDeployMessage('')
+        setDeploy('deployed')
+        return
+      }
+      if (plan?.status === 'deploy') {
+        // status says deploy but the primary_order is unreadable (backend contract
+        // drift) — a blank/zero populate would produce an un-co-signable order.
+        // Do NOT populate; fall through to a calm failed note.
+        setDeployNarration(null)
+        setDeployMessage('We couldn’t read that plan — try again.')
+        setDeploy('failed')
+        return
+      }
+      // Any no-action status (at_target / no_cash / no_target / decide_reserve) —
+      // show the calm narration reason (or the plan reason) and populate NOTHING.
+      setDeployNarration(null)
+      setDeployMessage(
+        narration?.reasoning ||
+          plan?.reason ||
+          'There’s nothing to deploy toward your target right now.',
+      )
+      setDeploy('no-action')
+    } catch {
+      if (!mounted.current) return
+      setDeployNarration(null)
+      setDeployMessage(
+        'We couldn’t reach the coach just now — try again in a moment.',
+      )
+      setDeploy('failed')
+    } finally {
+      deployingRef.current = false
+    }
+  }
+
+  // Story 10.4 — "Review my portfolio": ask the backend for the SELL-side analysis
+  // buckets (`GET /api/allocation/review` → `{findings}`). Each finding is listed as
+  // an advisor CoachCard; a per-finding "Fill in this order" control populates the
+  // shared controls with that finding's SELL MARKET order — POPULATE, never submit.
+  // Zero findings → a calm "nothing to fix" message; 401 → sign-in. Read-only.
+  async function onReview() {
+    if (reviewingRef.current) return // synchronous double-click guard
+    if (deployingRef.current || suggestingRef.current) return // don't race a populate
+    if (phase === 'thinking') return // don't race an in-flight ask
+    reviewingRef.current = true
+    setReview('loading')
+    setReviewMessage('')
+    setReviewFindings([])
+    try {
+      const res = await apiFetch('/api/allocation/review')
+      if (!mounted.current) return
+      if (res.status === 401) {
+        setReviewMessage('Sign in to review your portfolio.')
+        setReview('signed-out')
+        return
+      }
+      if (!res.ok) {
+        setReviewMessage(
+          'We couldn’t review your portfolio just now — try again in a moment.',
+        )
+        setReview('failed')
+        return
+      }
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setReviewMessage('We couldn’t read that review — try again.')
+        setReview('failed')
+        return
+      }
+      if (!mounted.current) return
+      // Review results supersede any shown Deploy/Suggest populate panel — clear
+      // those notes so only one result surface is visible and it matches Review.
+      setDeploy('idle')
+      setDeployMessage('')
+      setDeployNarration(null)
+      setSuggest('idle')
+      setSuggestReasoning('')
+      setSuggestFillNote('')
+      setSuggestStaleNote('')
+      setPendingSuggestion(null)
+      const findings = Array.isArray(data?.findings) ? data.findings : []
+      if (findings.length === 0) {
+        setReviewFindings([])
+        setReview('empty')
+        return
+      }
+      setReviewFindings(findings)
+      setReview('ready')
+    } catch {
+      if (!mounted.current) return
+      setReviewMessage(
+        'We couldn’t reach the coach just now — try again in a moment.',
+      )
+      setReview('failed')
+    } finally {
+      reviewingRef.current = false
+    }
+  }
+
+  // Story 10.4 — "Fill in this order": populate the shared order controls with a
+  // review finding's SELL MARKET order (side='sell') via the existing setters, so
+  // the human reviews & co-signs through the unchanged approve spine. POPULATE,
+  // never submit. Mirrors the deploy/suggest populate pattern: guard a malformed
+  // order, clear a shown recommendation before repopulating, drop stale suggestions.
+  function onFillOrder(order) {
+    const symbol = typeof order?.symbol === 'string' ? order.symbol.trim() : ''
+    const amount = typeof order?.amount === 'string' ? order.amount.trim() : ''
+    const ok =
+      symbol !== '' && DECIMAL_RE.test(amount) && Number(amount) > 0
+    if (!ok) return // contract-drift insurance — never populate an un-co-signable order
+    // Don't populate while a Deploy/Suggest fetch is in flight — its async success
+    // branch would overwrite this SELL with a BUY (a buy/sell flip the user never
+    // chose). Mirrors the onReview in-flight guard.
+    if (deployingRef.current || suggestingRef.current) return
+    // A shown recommendation no longer matches once we repopulate the form.
+    if (recommendation !== null) {
+      resetResult()
+      setPhase('idle')
+    }
+    // Clear any stale suggest/deploy populate panels so they don't sit next to the
+    // new SELL populate.
+    setSuggest('idle')
+    setSuggestReasoning('')
+    setSuggestFillNote('')
+    setSuggestStaleNote('')
+    setPendingSuggestion(null)
+    setDeploy('idle')
+    setDeployMessage('')
+    setDeployNarration(null)
+    setSymbol(symbol)
+    setSide('sell')
+    setAmount(amount)
+    setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
   }
 
   // "not now" — always equally easy, never penalized (EXPERIENCE.md). No network
@@ -594,7 +859,152 @@ export function CoachConsult() {
         >
           {suggest === 'suggesting' ? 'Suggesting…' : 'Suggest this order'}
         </button>
+
+        {/* Story 10.2 — "Deploy your cash toward your target". Computes a calm,
+            deterministic gap-to-target plan and, on a deploy status, populates the
+            form with the primary MARKET BUY; never executes. */}
+        <button
+          type="button"
+          className="ballast-consult__deploy"
+          data-testid="coach-deploy-cash"
+          onClick={onDeploy}
+          disabled={deploy === 'loading' || phase === 'thinking'}
+        >
+          {deploy === 'loading'
+            ? 'Working it out…'
+            : 'Deploy your cash toward your target'}
+        </button>
+
+        {/* Story 10.4 — "Review my portfolio". Runs the SELL-side analysis buckets
+            (over-concentration / high fees) and lists each concrete fix as a calm
+            advisor card with a "Fill in this order" control; never executes. */}
+        <button
+          type="button"
+          className="ballast-consult__review"
+          data-testid="coach-review-portfolio"
+          onClick={onReview}
+          disabled={review === 'loading' || phase === 'thinking'}
+        >
+          {review === 'loading' ? 'Reviewing…' : 'Review my portfolio'}
+        </button>
       </form>
+
+      {review === 'ready' ? (
+        <div
+          className="ballast-consult__review-result"
+          data-testid="coach-review-result"
+        >
+          <p
+            className="ballast-consult__note"
+            data-testid="coach-review-intro"
+            role="status"
+          >
+            Here’s what stands out in your portfolio. Each fix pre-fills an order you
+            can review and co-sign — nothing is placed for you.
+          </p>
+          {reviewFindings.map((finding, i) => (
+            <div
+              key={finding?.kind ? `${finding.kind}-${finding?.order?.symbol ?? i}` : i}
+              className="ballast-consult__review-finding"
+              data-testid={`coach-review-finding-${i}`}
+            >
+              <CoachCard recommendation={finding.narration} />
+              <button
+                type="button"
+                className="ballast-consult__review-fill"
+                data-testid={`coach-review-fill-${i}`}
+                onClick={() => onFillOrder(finding.order)}
+              >
+                Fill in this order
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {review === 'empty' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-empty"
+          role="status"
+        >
+          Nothing to fix right now — your portfolio looks diversified and low-cost.
+        </p>
+      ) : null}
+
+      {review === 'signed-out' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-signed-out"
+          role="status"
+        >
+          {reviewMessage || 'Sign in to review your portfolio.'}{' '}
+          <Link className="ballast-consult__link" to="/auth">
+            Sign in
+          </Link>
+        </p>
+      ) : null}
+
+      {review === 'failed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-failed"
+          role="status"
+        >
+          {reviewMessage ||
+            'We couldn’t review your portfolio just now — try again in a moment.'}
+        </p>
+      ) : null}
+
+      {deploy === 'deployed' ? (
+        <div className="ballast-consult__deploy-result">
+          <p
+            className="ballast-consult__note"
+            data-testid="coach-deploy-populated"
+            role="status"
+          >
+            I’ve filled in a buy that moves your cash toward your target mix.
+            Review it, then ask the coach to co-sign it with you.
+          </p>
+          {/* Story 10.3 — the fiduciary-advisor narration (why/tradeoff/cited
+              data/uncertainty) beside the populated controls. */}
+          {deployNarration ? <CoachCard recommendation={deployNarration} /> : null}
+        </div>
+      ) : null}
+
+      {deploy === 'no-action' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-no-action"
+          role="status"
+        >
+          {deployMessage}
+        </p>
+      ) : null}
+
+      {deploy === 'signed-out' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-signed-out"
+          role="status"
+        >
+          {deployMessage || 'Sign in to see how to deploy your cash.'}{' '}
+          <Link className="ballast-consult__link" to="/auth">
+            Sign in
+          </Link>
+        </p>
+      ) : null}
+
+      {deploy === 'failed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-deploy-failed"
+          role="status"
+        >
+          {deployMessage ||
+            'We couldn’t work out a plan just now — try again in a moment.'}
+        </p>
+      ) : null}
 
       {suggest === 'suggested' ? (
         <div

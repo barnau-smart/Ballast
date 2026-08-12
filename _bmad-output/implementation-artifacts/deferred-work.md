@@ -332,3 +332,73 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-9-3-just-in-time-liquidation-deferred-buy.md`
   summary: Both new pending-buy reads (`GET /pending-buys` and the plan-time dedupe lookup) call `repo.list()`, which materializes ALL of the owner's pending_buy rows — including every `resumed`/`cancelled` row ever — into memory and filters `status=='awaiting_funds'` in Python, so the `(owner_id, status)` index the spec added specifically to back this read is never used and the read grows unbounded (pending_buy is append-only, never pruned).
   evidence: `ballast/backend/api/cash.py::list_pending_buys` (line 544) and `::_find_awaiting_pending_buy` (line 404) both `await repo.list()`, which issues `SELECT * WHERE owner_id = ?` with no status predicate (`db/repository.py:74`) and loads every row before the Python-side `status` filter; `ScopedRepository.list_page` (`db/repository.py:85`) exists precisely for SQL-side filtered/paged reads (Story 6.6) and is not used, and the `Index("...", "owner_id", "status")` on `PendingBuy` (`db/models.py`) cannot serve a full-table `SELECT *`. Low consequence at current beginner single-user scale (few rows), but a real coherence gap in this story's own work (added an index the read can't use) and unbounded over time. Same class as the already-logged 6.6/4.9 "unbounded per-user table + index that the read doesn't exploit" entries. Fix: switch both reads to `list_page` with a SQL-side `status='awaiting_funds'` filter so the index is used and resumed/cancelled history is never loaded.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: The new `GET /api/allocation/narration` handler runs the synchronous blocking `gateway.complete()` (a real Anthropic network round-trip on the non-fake path) directly inside an `async def` endpoint, stalling the event loop for the call's duration.
+  evidence: `ballast/backend/api/allocation.py::read_narration` calls `narrate_plan(get_llm_gateway(), plan)` → `gateway.complete()` (`llm/anthropic_adapter.py`) without `await asyncio.to_thread(...)`. This is NOT a regression introduced by 10-3 — it exactly mirrors the pre-existing `coach/suggest.py::suggest_resting_order` → `narrate_suggestion` pattern already in the codebase, so it is a repo-wide habit worth a single focused fix (offload every synchronous `gateway.complete` via `asyncio.to_thread`), not a 10-3-local defect. Low consequence today (fake adapter is instant; single-user beginner scale), real under live-LLM concurrency.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: `build_review` narrates each finding via a synchronous `gateway.complete()` inside the async `read_review` handler — N sequential blocking event-loop round-trips; offload to `asyncio.to_thread`/gather (or bound the finding count).
+  evidence: `LLMGateway.complete` is synchronous (`llm/port.py`); `allocation/review.py:build_review` calls `narrate_finding` per finding with no threadpool offload, inside `async def read_review` in `api/allocation.py`. Amplifies the same pattern already deferred in Story 10-3 (F8) from one plan to N findings.
+
+## Deferred from: code review of spec-10-3 / spec-10-4 (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: Deterministic fallback prose (`_fallback_narration`/`_fallback_review_narration`) and the evidence `statement` string are surfaced to the API without passing through `check_no_invented_numbers` / `check_no_forecast` — authored to pass "by construction" but not re-validated, so a future copy edit (e.g. adding a `FORECAST_TERMS` phrase) could ship an unguarded string.
+  evidence: `allocation/narrate.py:367-460, 545` (fallback returned directly), evidence `statement` built with f-strings at narrate.py:228-231 / review.py:386-392. Hardening only; run the surfaced fallback/statement strings through the same gates as a regression backstop.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: `narrate_plan` hardcodes `status="deploy"` on the LLM-success path while the fallback and no-action paths use `plan.status`; a deploy-variant status would be labelled inconsistently depending only on whether the LLM call passed the gates.
+  evidence: `allocation/narrate.py:~533` (hardcoded "deploy") vs narrate.py:423 (`status=plan.status`). Low severity; source status consistently from the plan.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: Negative-cash (margin debit) account makes `_total_portfolio_value <= 0`, so the concentration detector returns `[]` (a genuinely over-concentrated single name is silently never flagged) while the cost detector still fires and renders `weight=0`. The two detectors disagree on the same degenerate portfolio.
+  evidence: `allocation/review.py:213-215` (concentration early-return on total<=0) vs review.py:322 (cost has no such guard, `weight=0`). Out of scope (Ballast is a cash-deployment tool, no margin); align both detectors' degenerate-total handling if margin ever enters scope.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: A concentration finding's `asset_class` falls back to the raw symbol/internal class token (`asset_class_for(symbol) or symbol`) instead of a display label, so the API can surface a bare ticker or raw class key where every other surface uses `ASSET_CLASS_LABEL`.
+  evidence: `allocation/review.py:246`. Cosmetic/consistency; map through the label table (or document the intended fallback copy).
+
+## Deferred from: code review of spec-10-2 — Group B deploy engine (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `_current_breakdown` sleeve weight serializes as bare `"0"` when total==0 but 4dp `"0.0000"` otherwise, and three independently-4dp-quantized weights need not sum to 1.0000 on the wire.
+  evidence: `allocation/engine.py:~434` (`(value/total).quantize(0.0001) if total>0 else _ZERO`). Display honesty only — this dict is not used by trade math. Quantize the zero branch and/or reconcile the residual if the frontend renders these as fixed strings.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: The pure engine trusts caller-supplied `target_weights` sum to 1.0 (enforced only by a test over MODEL_PORTFOLIOS, never asserted at the engine boundary). A future model or partial dict summing ≠ 1 silently strands cash (<1) or over-targets every class (>1).
+  evidence: `allocation/engine.py:~349` (`target_weights.get(cls, _ZERO)`); guarantee lives in `test_target_allocation.py`. Cheap `assert sum == 1` (or a `no_target`-style bail) would let the money core defend itself.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: No test pins `CANONICAL_FUND ⊆ index-core`; the engine populates a primary BUY for `CANONICAL_FUND[cls]`, and `/approve` rejects a non-index-core symbol — so a future edit to CANONICAL_FUND could yield a plan the user can't co-sign.
+  evidence: `strategy/target_allocation.py:CANONICAL_FUND` (VTI/VXUS/BND) vs `coach/execution.py:~318` (`is_index_core` scope gate). Coincidentally safe today; add a `CANONICAL_FUND ⊆ INDEX_CORE_SYMBOLS` invariant test.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `MIN_DEPLOY` dust-drop can silently swallow a genuinely-underweight small sleeve (e.g. bonds on modest cash) while deploying its neighbors; the `deploy` status/reason never surfaces the skipped class.
+  evidence: `allocation/engine.py:~411-419`. Money is accounted honestly (goes to `undeployed_cash`) but "close the largest gaps toward target" is quietly defeated for the smallest sleeve. Product decision on whether to surface dropped-as-dust classes.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `parked_market_value` sums `h.market_value` with no `None`-guard (asymmetric with `classify_holdings`, which coerces None→0). Now MOOT for the deploy engine (no longer called after the 2026-08-12 parked-cash HIGH fix) but still latent for the other Epic 9 callers (`GET /api/portfolio`, missed-growth read).
+  evidence: `cash/config.py:parked_market_value`; DB column is `nullable=False` so unreachable from the cache path today. Make it symmetric (coerce None→0) when touched.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: PROCESS/traceability — Story 10-1 (`strategy/target_allocation.py`, `api/target_allocation.py`) shipped with NO governing spec file; `expense_ratio.py` (a Story 10-4 file) was bundled into the 10-2/earlier commits. For the epic-10 retrospective, not a code fix.
+  evidence: only `spec-10-2/10-3/10-4` exist in `implementation-artifacts/`; no `spec-10-1`. `expense_ratio.py` docstring says "Story 10.4".
+
+## Deferred from: code review of epic-10 — Group C API/DB/frontend wiring (2026-08-12)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-4-analysis-buckets-concentration-cost.md`
+  summary: Startup migration cannot repair a pre-existing `target_allocation_config` table that lacks its `UNIQUE(owner_id)` constraint — `CREATE TABLE IF NOT EXISTS` silently skips, so the per-owner uniqueness `config.py` relies on would go unenforced (two rows/user, nondeterministic `rows[0]`).
+  evidence: `db/migrations.py` `create_target_allocation_config`. Unreachable for real fresh/known DBs (`create_all` builds it correctly); latent only for an out-of-band table shape. Add an explicit constraint-add step if defensiveness is wanted.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-3-fiduciary-advisor-narration-never-invent-safeguard.md`
+  summary: `read_narration` (and `read_review`) construct the LLM gateway on every request even for no-action plans / zero findings, which make NO LLM call — wasted on the common undecided/at-target beginner path.
+  evidence: `api/allocation.py` `read_narration` calls `get_llm_gateway()` unconditionally before `narrate_plan` short-circuits. Minor latency, not correctness; construct lazily only when an LLM call will actually happen.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `PUT /api/target-allocation` returns `model=config.model_key` unguarded, while GET filters the returned model via `is_valid_model`. If the valid-model set and the resolvable set ever diverge, PUT and GET would report different `model` for the same stored row.
+  evidence: `api/target_allocation.py` update vs read handlers. Consistent today (both wired from the same constants); guard PUT the same way as GET when touched.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
+  summary: `/plan` serializes `unclassified` (VT/single-stocks/non-index ETFs) and the `current` sleeve breakdown, but the deploy UI (`CoachConsult.onDeploy`) never renders them — the spec intent "those holdings are surfaced honestly" is only half-met (endpoint yes, UI no).
+  evidence: `CoachConsult.jsx` deploy branch reads only `plan.primary_order`/`status`/`reason`. Product/UX decision on whether to show the unclassified sleeve + current mix in the deploy card.

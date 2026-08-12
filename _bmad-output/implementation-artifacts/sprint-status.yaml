@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-23
-last_updated: 2026-08-11  # EPIC 10 (Allocation Coach — Deploy My Cash) OPENED from the allocation-coach brainstorm (4-story MVP, all backlog; 10-1 next via create-story). EPIC 9 (Cash Intelligence) COMPLETE + retro done (epic-9-retro-2026-08-11.md): 9-1/9-2/9-3 all done, independently reviewed/hardened (8 fixes on loop-built 9-2/9-3), merged to main a43004e + pushed. 5 Epic 9 action items recorded (top: mandatory independent review before merging loop money-path work; gate real-money liquidation on settled-cash + APY tuning). Earlier: GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
+last_updated: 2026-08-12  # 2026-08-12: EPIC 10 all 4 stories DONE via bmad-loop + FULL independent review DONE (Groups A guardrails / B deploy-engine / C API-DB-frontend). Fixes: A=forecast modal-hedge denylist + dup-symbol oversell (0ff200f); B=HIGH deploy engine under-counted investable cash by subtracting parked money-market from settlement cash — false no_cash/under-deploy, aligned to Epic 9 ready_to_trade=view.cash + reserve hardening (fa3ecf6); C=mutually-exclusive Coach result panels + deploy 401 sign-in link (3f8a9d9). 816 backend + 186 frontend green. All money-safety cardinal contracts verified CLEAN in C. 2 decisions → backlog stories 10-5 (cost-switch linked SELL+BUY) + 10-6 (unit-tagged number gate); ~14 low/latent items in deferred-work.md. NOW READY TO MERGE to main (never release/mvp). Epic-10 retro DONE (epic-10-retro-2026-08-12.md); closed Epic 9 action items #1 (mandatory independent review — applied+proven) + #3 (honesty-twin); 4 Epic 10 action items recorded. Next: merge to main + create-story 10-5/10-6. --- EPIC 10 (Allocation Coach — Deploy My Cash) OPENED from the allocation-coach brainstorm (4-story MVP, all backlog; 10-1 next via create-story). EPIC 9 (Cash Intelligence) COMPLETE + retro done (epic-9-retro-2026-08-11.md): 9-1/9-2/9-3 all done, independently reviewed/hardened (8 fixes on loop-built 9-2/9-3), merged to main a43004e + pushed. 5 Epic 9 action items recorded (top: mandatory independent review before merging loop money-path work; gate real-money liquidation on settled-cash + APY tuning). Earlier: GO LIVE ACHIEVED + Epic 7 retro done (epic-7-retro-2026-08-07.md). 7.7 real-money exercise DONE: 1 real SCHB share bought (filled @ $29.895) via propose->approve->place->reconcile; seam 6 confirmed both ways. Epic 7 done. 7.6 pre-flight live-verified same day (all 6 seams PASS) + 2 schwab-py token-wrapper bugs fixed (424864a). 3 Epic 7 action items recorded (test-isolation guard, schwab-py contract canary, verify maintenance scheduler on deploy).
 project: ai_practice_project
 project_key: NOKEY
 tracking_system: file-system
@@ -159,11 +159,14 @@ development_status:
   # Guardrails: opinion-not-forecast; never invent a fact; "nothing to do" is valid; rebalance-toward not chase.
   # Parked: aware-but-don't-act, praise-the-healthy, tax, the whole teaching layer.
   epic-10: in-progress
-  10-1-target-allocation-model-pick-a-model-portfolio: ready-for-dev
-  10-2-gap-to-target-deploy-cash-engine: backlog
-  10-3-fiduciary-advisor-narration-never-invent-safeguard: backlog
-  10-4-analysis-buckets-concentration-cost: backlog
-  epic-10-retrospective: optional
+  10-1-target-allocation-model-pick-a-model-portfolio: done
+  10-2-gap-to-target-deploy-cash-engine: done
+  10-3-fiduciary-advisor-narration-never-invent-safeguard: done
+  10-4-analysis-buckets-concentration-cost: done
+  # Follow-up stories opened from the 2026-08-12 independent Group-A guardrail review (need create-story to spec):
+  10-5-cost-switch-linked-sell-buy-pair: backlog
+  10-6-unit-tagged-number-gate: backlog
+  epic-10-retrospective: done
 
 action_items:
   - epic: 4
@@ -253,7 +256,7 @@ action_items:
   - epic: 9
     action: "Mandatory independent adversarial review BEFORE merging loop-built money-path / guardrail stories to main (not after). Epic 8 flagged the class; Epic 9 proved the loop's self-review misses real-money + honesty defects (8 fixes on 9-2/9-3 post-merge)."
     owner: "MasterB"
-    status: open
+    status: done  # APPLIED + re-proven on Epic 10 (2026-08-12): independent review caught a HIGH parked-cash bug the loop's own review had explicitly rejected. Standing mandate remains in force.
   - epic: 9
     action: "Gate real-money liquidation (9-3): before BROKER_ADAPTER=schwab for the liquidation path, (a) confirm Schwab portfolio_balance.cash is SETTLED-only cash (the 'genuinely spendable' resume premise depends on it), and (b) tune the disclosed DEFAULT_MONEY_MARKET_APY=0.04 placeholder."
     owner: "MasterB"
@@ -261,12 +264,28 @@ action_items:
   - epic: 9
     action: "Honesty-twin check: when fixing an honesty/framing bug, immediately check for its mirror on the other side of the stack (backend statement <-> frontend glyph/label/copy). 9-2's market-direction bug lived in both; only the backend twin was fixed during the loop's review."
     owner: "MasterB"
-    status: open
+    status: done  # Epic 10 Group-C review verified the backend<->frontend mirror (money serialization, calm copy, no-XSS) end-to-end.
   - epic: 9
     action: "Tune disclosed placeholder constants before real-money reliance: DEFAULT_MONEY_MARKET_APY=0.04 (9-2) + the carry-over 8.4 suggestion heuristics. Merges Epic 8 action item 2."
     owner: "MasterB"
     status: open
   - epic: 9
     action: "Close the tracked deferred-work items when their code is next touched: APY backend/frontend format divergence; pending-buy full-table read (unused (owner_id,status) index); aggregate over-draw across concurrent pending buys. None blocking."
+    owner: "MasterB"
+    status: open
+  - epic: 10
+    action: "Merge epic-10/allocation-coach -> main (reviewed A/B/C + green: 816 backend + 186 frontend). NEVER into release/mvp (keep the v1.0-mvp tag untainted)."
+    owner: "MasterB"
+    status: open
+  - epic: 10
+    action: "create-story for 10-5 (cost-switch emits a linked SELL+BUY pair co-signed together via /approve) and 10-6 (unit-tagged / context-aware number gate: $ vs % vs count). Both promoted from Group-A/B review decisions."
+    owner: "MasterB"
+    status: open
+  - epic: 10
+    action: "Close the spec-hygiene gap: Story 10-1 shipped with no governing spec file and expense_ratio.py (a 10-4 file) was bundled early. Backfill/document, and avoid cross-story file bundling going forward."
+    owner: "MasterB"
+    status: open
+  - epic: 10
+    action: "Before enabling the real-money deploy path: confirm Schwab portfolio_balance.cash is SETTLED-only (merges Epic 9 #2a) now that the deploy engine relies on ready_to_trade = view.cash after the parked-cash fix; tune remaining disclosed placeholders (Epic 9 #4)."
     owner: "MasterB"
     status: open
