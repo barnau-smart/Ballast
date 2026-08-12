@@ -122,6 +122,18 @@ export function CoachConsult() {
   const [deployNarration, setDeployNarration] = useState(null)
   const deployingRef = useRef(false) // synchronous double-click guard
 
+  // Story 10.4 — "Review my portfolio". Fetches the SELL-side analysis buckets
+  // (`GET /api/allocation/review` → `{findings: [...]}`) and lists each finding as
+  // an advisor `<CoachCard>` with a "Fill in this order" control that populates the
+  // shared controls with that finding's SELL MARKET order (`finding.order`) via the
+  // existing setters — POPULATE, never submit. Zero findings → a calm "nothing to
+  // fix" message; 401 → sign-in. `review` phases: idle | loading | ready | empty |
+  // signed-out | failed. `reviewFindings` holds the fetched findings.
+  const [review, setReview] = useState('idle')
+  const [reviewMessage, setReviewMessage] = useState('')
+  const [reviewFindings, setReviewFindings] = useState([])
+  const reviewingRef = useRef(false) // synchronous double-click guard
+
   // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
   // ready-to-trade cash is short, we fetch a pre-filled money-market SELL plan
   // (`/api/cash/liquidation-plan`) and render `LiquidationCard` in place of a
@@ -225,6 +237,10 @@ export function CoachConsult() {
     setDeployMessage('')
     // Story 10.3 — clear any advisor narration on a fresh ask/decline.
     setDeployNarration(null)
+    // Story 10.4 — clear any portfolio-review findings on a fresh ask/decline.
+    setReview('idle')
+    setReviewMessage('')
+    setReviewFindings([])
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -607,6 +623,94 @@ export function CoachConsult() {
     }
   }
 
+  // Story 10.4 — "Review my portfolio": ask the backend for the SELL-side analysis
+  // buckets (`GET /api/allocation/review` → `{findings}`). Each finding is listed as
+  // an advisor CoachCard; a per-finding "Fill in this order" control populates the
+  // shared controls with that finding's SELL MARKET order — POPULATE, never submit.
+  // Zero findings → a calm "nothing to fix" message; 401 → sign-in. Read-only.
+  async function onReview() {
+    if (reviewingRef.current) return // synchronous double-click guard
+    if (deployingRef.current || suggestingRef.current) return // don't race a populate
+    if (phase === 'thinking') return // don't race an in-flight ask
+    reviewingRef.current = true
+    setReview('loading')
+    setReviewMessage('')
+    setReviewFindings([])
+    try {
+      const res = await apiFetch('/api/allocation/review')
+      if (!mounted.current) return
+      if (res.status === 401) {
+        setReviewMessage('Sign in to review your portfolio.')
+        setReview('signed-out')
+        return
+      }
+      if (!res.ok) {
+        setReviewMessage(
+          'We couldn’t review your portfolio just now — try again in a moment.',
+        )
+        setReview('failed')
+        return
+      }
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setReviewMessage('We couldn’t read that review — try again.')
+        setReview('failed')
+        return
+      }
+      if (!mounted.current) return
+      const findings = Array.isArray(data?.findings) ? data.findings : []
+      if (findings.length === 0) {
+        setReviewFindings([])
+        setReview('empty')
+        return
+      }
+      setReviewFindings(findings)
+      setReview('ready')
+    } catch {
+      if (!mounted.current) return
+      setReviewMessage(
+        'We couldn’t reach the coach just now — try again in a moment.',
+      )
+      setReview('failed')
+    } finally {
+      reviewingRef.current = false
+    }
+  }
+
+  // Story 10.4 — "Fill in this order": populate the shared order controls with a
+  // review finding's SELL MARKET order (side='sell') via the existing setters, so
+  // the human reviews & co-signs through the unchanged approve spine. POPULATE,
+  // never submit. Mirrors the deploy/suggest populate pattern: guard a malformed
+  // order, clear a shown recommendation before repopulating, drop stale suggestions.
+  function onFillOrder(order) {
+    const symbol = typeof order?.symbol === 'string' ? order.symbol.trim() : ''
+    const amount = typeof order?.amount === 'string' ? order.amount.trim() : ''
+    const ok =
+      symbol !== '' && DECIMAL_RE.test(amount) && Number(amount) > 0
+    if (!ok) return // contract-drift insurance — never populate an un-co-signable order
+    // A shown recommendation no longer matches once we repopulate the form.
+    if (recommendation !== null) {
+      resetResult()
+      setPhase('idle')
+    }
+    // Clear any stale suggest/deploy populate panels so they don't sit next to the
+    // new SELL populate.
+    setSuggest('idle')
+    setSuggestReasoning('')
+    setSuggestFillNote('')
+    setSuggestStaleNote('')
+    setPendingSuggestion(null)
+    setDeploy('idle')
+    setDeployMessage('')
+    setDeployNarration(null)
+    setSymbol(symbol)
+    setSide('sell')
+    setAmount(amount)
+    setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
+  }
+
   // "not now" — always equally easy, never penalized (EXPERIENCE.md). No network
   // call; dismiss the card back to a calm ready-to-ask state, keeping the form.
   function onDecline() {
@@ -746,7 +850,87 @@ export function CoachConsult() {
             ? 'Working it out…'
             : 'Deploy your cash toward your target'}
         </button>
+
+        {/* Story 10.4 — "Review my portfolio". Runs the SELL-side analysis buckets
+            (over-concentration / high fees) and lists each concrete fix as a calm
+            advisor card with a "Fill in this order" control; never executes. */}
+        <button
+          type="button"
+          className="ballast-consult__review"
+          data-testid="coach-review-portfolio"
+          onClick={onReview}
+          disabled={review === 'loading' || phase === 'thinking'}
+        >
+          {review === 'loading' ? 'Reviewing…' : 'Review my portfolio'}
+        </button>
       </form>
+
+      {review === 'ready' ? (
+        <div
+          className="ballast-consult__review-result"
+          data-testid="coach-review-result"
+        >
+          <p
+            className="ballast-consult__note"
+            data-testid="coach-review-intro"
+            role="status"
+          >
+            Here’s what stands out in your portfolio. Each fix pre-fills an order you
+            can review and co-sign — nothing is placed for you.
+          </p>
+          {reviewFindings.map((finding, i) => (
+            <div
+              key={finding?.kind ? `${finding.kind}-${finding?.order?.symbol ?? i}` : i}
+              className="ballast-consult__review-finding"
+              data-testid={`coach-review-finding-${i}`}
+            >
+              <CoachCard recommendation={finding.narration} />
+              <button
+                type="button"
+                className="ballast-consult__review-fill"
+                data-testid={`coach-review-fill-${i}`}
+                onClick={() => onFillOrder(finding.order)}
+              >
+                Fill in this order
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {review === 'empty' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-empty"
+          role="status"
+        >
+          Nothing to fix right now — your portfolio looks diversified and low-cost.
+        </p>
+      ) : null}
+
+      {review === 'signed-out' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-signed-out"
+          role="status"
+        >
+          {reviewMessage || 'Sign in to review your portfolio.'}{' '}
+          <Link className="ballast-consult__link" to="/auth">
+            Sign in
+          </Link>
+        </p>
+      ) : null}
+
+      {review === 'failed' ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-failed"
+          role="status"
+        >
+          {reviewMessage ||
+            'We couldn’t review your portfolio just now — try again in a moment.'}
+        </p>
+      ) : null}
 
       {deploy === 'deployed' ? (
         <div className="ballast-consult__deploy-result">

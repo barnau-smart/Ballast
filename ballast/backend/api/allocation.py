@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from allocation.engine import ActionItem, Plan, build_plan
 from allocation.narrate import AllocationNarration, narrate_plan
+from allocation.review import NarratedFinding, build_review
 from api.deps import get_scope
 from db.scope import Scope
 from db.session import get_async_session
@@ -108,6 +109,40 @@ class NarrationResponse(BaseModel):
 
     plan: PlanOut
     narration: NarrationOut
+
+
+class SellOrderOut(BaseModel):
+    """A SELL MARKET order the coach console pre-fills into the shared order
+    controls for the human to co-sign (Story 10.4). ``amount`` is a fixed-point
+    string; ``side`` is always ``"sell"`` and ``order_type`` always ``"market"`` —
+    populate, never submit."""
+
+    symbol: str
+    side: str
+    amount: str
+    order_type: str
+
+
+class ReviewFindingOut(BaseModel):
+    """One SELL-side analysis finding (Story 10.4).
+
+    ``kind`` ∈ ``{concentration, cost}``. ``switch_to`` is the cheaper canonical fund
+    to BUY next (``cost`` only; ``null`` for ``concentration``). ``order`` is the
+    ready-to-approve SELL MARKET order; ``narration`` is the fiduciary-advisor card
+    (same shape as :class:`NarrationOut`)."""
+
+    kind: str
+    symbol: str
+    switch_to: str | None = None
+    order: SellOrderOut
+    narration: NarrationOut
+
+
+class ReviewResponse(BaseModel):
+    """The ``GET /api/allocation/review`` payload — the ranked findings (empty when
+    there is nothing to fix)."""
+
+    findings: list[ReviewFindingOut]
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -209,3 +244,40 @@ async def read_narration(
         plan=_plan_out(plan),
         narration=_narration_out(narration),
     )
+
+
+def _review_finding_out(narrated: NarratedFinding) -> ReviewFindingOut:
+    finding = narrated.finding
+    return ReviewFindingOut(
+        kind=finding.kind,
+        symbol=finding.symbol,
+        switch_to=finding.switch_to,
+        order=SellOrderOut(
+            symbol=finding.order_intent.symbol,
+            side="sell",
+            amount=format_money(finding.order_intent.amount),
+            order_type="market",
+        ),
+        narration=_narration_out(narrated.narration),
+    )
+
+
+@router.get("/review", response_model=ReviewResponse)
+async def read_review(
+    scope: Scope = Depends(get_scope),
+    session: AsyncSession = Depends(get_async_session),
+) -> ReviewResponse:
+    """Return the caller's SELL-side portfolio-review findings (Story 10.4).
+
+    READ-ONLY, degraded-safe, per-user scoped: reads the cached portfolio + the
+    scoped cash config (no live broker session), runs the two deterministic analysis
+    buckets (concentration / cost), and narrates each finding via
+    :func:`~allocation.review.narrate_finding` against the configured LLM gateway.
+    Each finding's narration is degraded-safe — any gateway/parse/gate failure yields
+    the deterministic templated fallback, never an unvalidated number. "Nothing to
+    fix" → ``{"findings": []}`` with NO LLM call. Places NOTHING and writes no
+    ``decision_record`` — each finding's SELL MARKET order is co-signed by the human
+    through the existing ``/approve`` spine. 401 unauth; money as fixed-point strings.
+    """
+    findings = await build_review(scope, session, get_llm_gateway())
+    return ReviewResponse(findings=[_review_finding_out(f) for f in findings])
