@@ -71,6 +71,39 @@ INDETERMINATE: frozenset[OrderStatus] = frozenset(
     {OrderStatus.TIMEOUT, OrderStatus.PENDING}
 )
 
+#: The DEFINITIVELY-placed outcome statuses — a real order exists at the broker.
+#: ``filled``/``partial`` are unambiguous placements. Used by :func:`_is_placed`
+#: (with the ``broker_ref`` rule for the indeterminate states) to gate any
+#: post-placement side effect (Story 10.5: seeding the linked cost-switch BUY only
+#: on a genuinely-placed SELL).
+_DEFINITIVELY_PLACED: frozenset[OrderStatus] = frozenset(
+    {OrderStatus.FILLED, OrderStatus.PARTIAL}
+)
+
+
+def _is_placed(outcome: OrderOutcome) -> bool:
+    """True iff ``outcome`` reflects an order that genuinely reached the broker (10.5).
+
+    A genuinely-placed order is one whose existence at the broker is CONFIRMED:
+
+    - ``filled`` / ``partial`` — an unambiguous placement (shares moved), placed
+      regardless of ``broker_ref``.
+    - ``pending`` / ``timeout`` — INDETERMINATE: the order is confirmed to exist
+      ONLY when it carries a ``broker_ref`` (a queryable id the broker assigned). A
+      no-``broker_ref`` ``pending``/``timeout`` is an UNCONFIRMABLE placement (the
+      order may never have reached the broker), so it is NOT treated as placed.
+    - ``rejected`` — the broker refused it; nothing was placed.
+
+    Used to gate the Story 10.5 linked cost-switch BUY: the deferred BUY is seeded
+    ONLY on a genuinely-placed SELL, so an unconfirmable/rejected SELL never leaves
+    a beginner with a dead pending buy AND a false "step 2 queued" reassurance.
+    """
+    if outcome.status in _DEFINITIVELY_PLACED:
+        return True
+    if outcome.status in INDETERMINATE:
+        return outcome.broker_ref is not None
+    return False
+
 
 class OrderScopeError(ValueError):
     """Raised when an ``order_intent`` falls outside the v1 order scope (FR10/AD-7).
@@ -271,6 +304,7 @@ async def execute_approved_order(
     idempotency_key: str | None = None,
     scope: "Scope | None" = None,
     session: "AsyncSession | None" = None,
+    switch_to: str | None = None,
 ) -> OrderOutcome:
     """Assert session integrity, validate v1 scope, place, then reconcile.
 
@@ -284,22 +318,31 @@ async def execute_approved_order(
     validates the v1 order scope, raising :class:`OrderScopeError` on any violation
     BEFORE the broker is called.
 
-    v1 ORDER SCOPE (widened for SELL, Story 9.3): a **BUY** stays index-core-only
-    (:func:`~strategy.index_core.is_index_core`). A **SELL** is in-scope when the
-    symbol is index-core **OR** it is one of the scope user's declared
-    ``parked_symbols`` — so a beginner can sell their own money-market
-    cash-equivalent to fund an in-scope buy (the just-in-time liquidation path),
-    while the gate still stops beginners *buying* random securities. The
+    v1 ORDER SCOPE (widened for SELL, Story 9.3 + 10.5): a **BUY** stays
+    index-core-only (:func:`~strategy.index_core.is_index_core`) and is NEVER
+    widened. A **SELL** is in-scope when the symbol is index-core **OR** it is one
+    of the scope user's declared ``parked_symbols`` (Story 9.3 just-in-time
+    liquidation) **OR** a non-null ``switch_to`` is supplied (Story 10.5: a
+    SERVER-VERIFIED cost-switch SELL of a high-fee held fund into its cheaper
+    canonical). ``switch_to`` MUST already be server-verified by the caller
+    (``api/coach.py`` re-derives it from the user's own holdings before threading it
+    onto the immutable snapshot) — this owner NEVER re-checks it and NEVER trusts a
+    raw client value; the ``/approve`` handler passes ONLY the snapshot's verified
+    value. The gate still stops beginners *buying* random securities. The
     parked-symbol widening applies ONLY when a USER ``scope`` + ``session`` are
     supplied (the ``/approve`` path always supplies them); a scope-less direct
-    engine call keeps the strict index-core-only behavior (fail-closed). All other
-    hardening — the ``amount > 0`` gate, ``validate_order_intent``, session
-    integrity, key minting, atomic reconcile — is UNCHANGED.
+    engine call keeps the strict index-core-only behavior for the parked path
+    (fail-closed). All other hardening — the ``amount > 0`` gate,
+    ``validate_order_intent``, session integrity, key minting, atomic reconcile — is
+    UNCHANGED.
 
     On a passing intent it mints an idempotency key (unless one is supplied),
     awaits a single ``place_order``, then reconciles the placement via
     :func:`_reconcile` and returns the true :class:`OrderOutcome`. Pure
-    orchestration + gate: no persistence (Story 4.9).
+    orchestration + gate: NO persistence (Story 4.9) — the linked cost-switch BUY
+    (Story 10.5) is seeded by the ``/approve`` handler AFTER this returns a placed
+    outcome (via :func:`_is_placed`), so this owner keeps its no-write contract and
+    the approve handler (which owns the commit) wraps that seed transaction-safely.
 
     The symbol is canonicalized (strip + upper) ONCE here so the scope check and
     the order actually placed operate on the same string — otherwise a symbol
@@ -317,11 +360,20 @@ async def execute_approved_order(
     normalized_symbol = (order_intent.symbol or "").strip().upper()
     in_scope = is_index_core(normalized_symbol)
     if not in_scope and order_intent.side == OrderSide.SELL:
-        # SELL widening (Story 9.3): a declared parked money-market symbol is a
-        # legitimate sell even when it is not index-core. Read-only, scoped —
-        # loaded ONLY when a user scope+session are supplied (the /approve path).
-        parked = await _scope_user_parked_symbols(scope, session)
-        in_scope = normalized_symbol in parked
+        # SELL widening (Story 10.5): a SERVER-VERIFIED cost-switch (a non-null
+        # ``switch_to`` threaded from the immutable snapshot) is a legitimate sell of
+        # a high-fee held fund into its cheaper canonical, even when the held fund is
+        # not index-core. Safe to widen on because the caller re-derived and verified
+        # the switch from the user's OWN holdings before it ever reached the snapshot
+        # — a raw client ``switch_to`` never reaches here (a BUY is never widened).
+        if switch_to is not None and str(switch_to).strip():
+            in_scope = True
+        else:
+            # SELL widening (Story 9.3): a declared parked money-market symbol is a
+            # legitimate sell even when it is not index-core. Read-only, scoped —
+            # loaded ONLY when a user scope+session are supplied (the /approve path).
+            parked = await _scope_user_parked_symbols(scope, session)
+            in_scope = normalized_symbol in parked
     if not in_scope:
         raise OrderScopeError(
             "This order is outside the v1 scope. Ballast v1 can only place "

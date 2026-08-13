@@ -134,6 +134,22 @@ export function CoachConsult() {
   const [reviewFindings, setReviewFindings] = useState([])
   const reviewingRef = useRef(false) // synchronous double-click guard
 
+  // Story 10.5 — the cheaper canonical fund a cost-switch SELL switches INTO. When
+  // the user fills a `cost` finding's SELL, we stash `finding.switch_to` here so the
+  // next `/recommend` carries it; the BACKEND re-derives + verifies it (never trusts
+  // it) and, on a genuinely-placed SELL, durably queues the linked step-2 BUY. The
+  // "step 2 of 2 queued" reassurance is surfaced ONLY from the `/approve` response's
+  // server-truth `linked_buy_queued` flag — never inferred from the status. Cleared
+  // on decline / re-ask / any symbol-or-amount edit / a failed placement.
+  const [pendingSwitchTo, setPendingSwitchTo] = useState(null)
+  // Story 10.5 — the cost-switch target that rode THIS co-signable ask (set on a
+  // SELL ask that carried a stashed switch_to). Unlike `pendingSwitchTo` (cleared by
+  // resetResult at ask time) this survives into the approve step so the placed-outcome
+  // render can (a) show the "step 2 queued" reassurance and (b) show a calm fallback
+  // note when the SELL placed but the linked buy failed to queue. Cleared on
+  // decline/re-ask alongside the other switch state.
+  const [switchLinked, setSwitchLinked] = useState(null)
+
   // Story 9.3 — just-in-time liquidation. At the BUY approve step, when the
   // ready-to-trade cash is short, we fetch a pre-filled money-market SELL plan
   // (`/api/cash/liquidation-plan`) and render `LiquidationCard` in place of a
@@ -241,6 +257,11 @@ export function CoachConsult() {
     setReview('idle')
     setReviewMessage('')
     setReviewFindings([])
+    // Story 10.5 — a fresh ask/decline/edit drops any stashed cost-switch target so
+    // a later SELL can't silently carry a stale `switch_to` into /recommend, and the
+    // co-sign-scoped switch target (drives the step-2 / fallback notes).
+    setPendingSwitchTo(null)
+    setSwitchLinked(null)
   }
 
   // Editing any field invalidates a shown recommendation — it no longer matches
@@ -251,6 +272,12 @@ export function CoachConsult() {
         resetResult()
         setPhase('idle')
       }
+      // Story 10.5 — ALWAYS drop any stashed cost-switch target on a symbol-or-amount
+      // (or any) edit, even when no recommendation is shown yet: a filled cost finding
+      // then a symbol edit BEFORE asking must not ride a stale switch_to to /recommend.
+      // (resetResult also clears it, but only fires when a recommendation is shown —
+      // so this unconditional clear is what makes the invariant true.)
+      setPendingSwitchTo(null)
       setter(value)
     }
   }
@@ -272,6 +299,11 @@ export function CoachConsult() {
     // Capture any prior AI suggestion BEFORE resetResult() blanks `options`, so we
     // can re-seed the resting LIMIT into the co-sign step once the decision lands.
     const pending = pendingSuggestion
+    // Story 10.5 — capture the stashed cost-switch target BEFORE resetResult()
+    // clears it. Carry it only when the form is a SELL (the state a cost-finding
+    // fill leaves the controls in). The backend re-derives + verifies it from the
+    // user's own holdings, so this is purely plumbing so it reaches /recommend.
+    const switchTo = pendingSwitchTo && side === 'sell' ? pendingSwitchTo : null
     setPhase('thinking')
     resetResult()
     try {
@@ -283,6 +315,9 @@ export function CoachConsult() {
           question,
           amount: validAmount,
           side: side || null,
+          // Story 10.5 — untrusted client input; the backend re-derives + verifies
+          // it from the user's own holdings before it can widen scope or queue a buy.
+          switch_to: switchTo,
         }),
       })
       if (!mounted.current) return
@@ -299,6 +334,10 @@ export function CoachConsult() {
       setRecommendation(data)
       setSubmitted(snapshot)
       setPhase('ready')
+      // Story 10.5 — remember the cost-switch target for THIS co-signable SELL so
+      // the placed-outcome render can show either the "step 2 queued" reassurance
+      // (server-truth flag) or, if the linked buy failed to queue, a calm fallback.
+      setSwitchLinked(switchTo)
       // Story 8.4 — carry a prior AI suggestion through the ask so its computed
       // resting LIMIT (GTC) survives to the co-sign step (AC-4). resetResult()
       // above blanked `options`; re-seed from the suggestion when it still matches
@@ -370,6 +409,10 @@ export function CoachConsult() {
       }
       const detail = await readDetail(res)
       if (!mounted.current) return
+      // Story 10.5 — a FAILED placement seeds no linked buy, so drop the stashed
+      // cost-switch target: the "step 2 queued" note is driven purely by the
+      // /approve response's server-truth flag on a placed order.
+      setPendingSwitchTo(null)
       if (res.status === 401) {
         setApprove('signed-out')
       } else if (res.status === 409) {
@@ -704,7 +747,7 @@ export function CoachConsult() {
   // the human reviews & co-signs through the unchanged approve spine. POPULATE,
   // never submit. Mirrors the deploy/suggest populate pattern: guard a malformed
   // order, clear a shown recommendation before repopulating, drop stale suggestions.
-  function onFillOrder(order) {
+  function onFillOrder(order, switchTo = null) {
     const symbol = typeof order?.symbol === 'string' ? order.symbol.trim() : ''
     const amount = typeof order?.amount === 'string' ? order.amount.trim() : ''
     const ok =
@@ -733,6 +776,14 @@ export function CoachConsult() {
     setSide('sell')
     setAmount(amount)
     setOptions({ ...DEFAULT_OPTIONS, order_type: 'market' })
+    // Story 10.5 — stash the cost-switch target AFTER resetResult() (which cleared
+    // it) so the next /recommend carries it. A concentration finding has no
+    // switch_to (null) — nothing is stashed. Set last so it survives this call.
+    setPendingSwitchTo(
+      typeof switchTo === 'string' && switchTo.trim() !== ''
+        ? switchTo.trim()
+        : null,
+    )
   }
 
   // "not now" — always equally easy, never penalized (EXPERIENCE.md). No network
@@ -913,7 +964,7 @@ export function CoachConsult() {
                 type="button"
                 className="ballast-consult__review-fill"
                 data-testid={`coach-review-fill-${i}`}
-                onClick={() => onFillOrder(finding.order)}
+                onClick={() => onFillOrder(finding.order, finding.switch_to)}
               >
                 Fill in this order
               </button>
@@ -1405,6 +1456,38 @@ export function CoachConsult() {
                     <span aria-hidden="true">↻</span> if it dips, I’ll replay
                     this back to you
                   </p>
+                  {/* Story 10.5 — the "step 2 of 2 is queued" reassurance is shown
+                      ONLY from the /approve response's server-truth
+                      `linked_buy_queued` flag, NEVER inferred from the status.
+                      True only when the backend durably queued the linked buy of
+                      the cheaper fund on this genuinely-placed cost-switch SELL. */}
+                  {outcome.linked_buy_queued ? (
+                    <p
+                      className="ballast-consult__chip"
+                      data-testid="coach-linked-buy-note"
+                    >
+                      <span aria-hidden="true">✓</span> Step 2 of 2 is queued:
+                      your follow-up buy of the cheaper fund is set aside and
+                      linked to this sell — you’ll review it once the cash
+                      settles, so you’re never left stranded in cash.
+                    </p>
+                  ) : null}
+                  {/* Story 10.5 — honest fallback: this co-sign WAS a cost-switch
+                      SELL (switchLinked set), it was placed (filled/partial), but the
+                      linked buy did NOT queue (server-truth flag false, a rare DB
+                      hiccup). Tell the beginner calmly rather than leave them silently
+                      stranded in cash — the exact failure this feature guards against. */}
+                  {switchLinked && !outcome.linked_buy_queued ? (
+                    <p
+                      className="ballast-consult__chip"
+                      data-testid="coach-linked-buy-fallback"
+                    >
+                      <span aria-hidden="true">•</span> Your sell went through,
+                      but we couldn’t set aside the linked buy of {switchLinked}{' '}
+                      just now. Once your cash settles you can buy {switchLinked}{' '}
+                      yourself — nothing was lost.
+                    </p>
+                  ) : null}
                 </>
               ) : outcome.status === 'rejected' ? (
                 <p className="ballast-consult__outcome-line">

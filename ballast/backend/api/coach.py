@@ -47,6 +47,7 @@ UI (Story 4.10).
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -82,6 +83,7 @@ from coach.execution import (
     OrderNotSupportedError,
     OrderScopeError,
     SessionIntegrityError,
+    _is_placed,
     cancel_pending_decision,
     execute_approved_order,
     reconcile_pending_decision,
@@ -96,6 +98,11 @@ from coach.recommendation import (
     Session,
 )
 from coach.validation import BlessedRecommendation
+from allocation.review import (
+    _aggregate_by_symbol,
+    find_cost_findings,
+)
+from cash.config import get_config as get_cash_config
 from db.scope import Scope
 from db.session import get_async_session
 from llm.factory import get_llm_gateway
@@ -234,12 +241,20 @@ class RecommendRequest(BaseModel):
     Mirrors :class:`~coach.pipeline.CoachDecision`'s user-facing fields. ``amount``
     is ``Decimal`` (never float); ``side`` is optional and, when present, feeds
     the FR11 self-destructive-move detector.
+
+    ``switch_to`` (Story 10.5, optional) is the cheaper canonical fund the user is
+    switching a high-fee holding INTO on a cost-switch SELL. It is UNTRUSTED CLIENT
+    INPUT: ``/recommend`` re-derives and verifies the cost-switch from the user's own
+    cached holdings before threading a VERIFIED value onto the immutable snapshot;
+    an unverifiable value is dropped to ``None`` (no snapshot key, no scope widening,
+    no linked buy).
     """
 
     symbol: str | None = None
     question: str = ""
     amount: Decimal | None = None
     side: OrderSide | None = None
+    switch_to: str | None = None
 
 
 class RecommendResponse(BaseModel):
@@ -275,12 +290,20 @@ class ApproveResponse(BaseModel):
     """The reconciled order :class:`~brokers.port.OrderOutcome` (the true state,
     Story 4.7), money as strings. Any of the five statuses
     (``filled``/``partial``/``rejected``/``timeout``/``pending``) is surfaced
-    honestly — a non-``filled`` outcome is truthful data, never an app error."""
+    honestly — a non-``filled`` outcome is truthful data, never an app error.
+
+    ``linked_buy_queued`` (Story 10.5) is SERVER TRUTH: ``True`` ONLY when a linked
+    cost-switch BUY was actually durably queued as an ``awaiting_funds``
+    ``PendingBuy`` on this approve (a genuinely-placed cost-switch SELL per
+    ``_is_placed``). ``False`` for every non-switch order, an unconfirmable/rejected
+    SELL, or the idempotent re-approve replay. The frontend surfaces the "step 2 of
+    2 queued" reassurance ONLY from this flag — never inferred from the status."""
 
     status: str
     filled_qty: str
     avg_price: str | None = None
     broker_ref: str | None = None
+    linked_buy_queued: bool = False
 
 
 class DecisionSummaryOut(BaseModel):
@@ -517,12 +540,15 @@ def _placed_order_matches_proposal(order_intent, snap_intent: dict) -> bool:
         return False
 
 
-def _to_approve_response(outcome: OrderOutcome) -> ApproveResponse:
+def _to_approve_response(
+    outcome: OrderOutcome, *, linked_buy_queued: bool = False
+) -> ApproveResponse:
     return ApproveResponse(
         status=outcome.status.value,
         filled_qty=_money_str(outcome.filled_qty),
         avg_price=None if outcome.avg_price is None else _money_str(outcome.avg_price),
         broker_ref=outcome.broker_ref,
+        linked_buy_queued=linked_buy_queued,
     )
 
 
@@ -548,12 +574,20 @@ def _decision_summary_out(record) -> DecisionSummaryOut:
     )
 
 
-def _recorded_outcome_response(record) -> ApproveResponse:
+def _recorded_outcome_response(
+    record, *, linked_buy_queued: bool = False
+) -> ApproveResponse:
     """Rebuild the recorded :class:`ApproveResponse` from a cosigned record.
 
     Used on an idempotent RE-approve: the reconciled outcome persisted in
     ``cosign_snapshot`` is returned verbatim WITHOUT re-touching the broker
     (Story 4.9). The snapshot money is already a fixed-point decimal string.
+
+    ``linked_buy_queued`` (Story 10.5) is SERVER TRUTH computed by the caller from a
+    scoped existence check (see :func:`_recorded_linked_buy_queued`): on a re-approve
+    of an already-cosigned cost-switch SELL the linked ``PendingBuy`` genuinely
+    exists, so the reassurance must not silently disappear on refresh/re-submit.
+    Defaults ``False`` (the pre-10.5 replay had no linked buy).
     """
     outcome = record.cosign_snapshot["outcome"]
     return ApproveResponse(
@@ -561,7 +595,142 @@ def _recorded_outcome_response(record) -> ApproveResponse:
         filled_qty=outcome["filled_qty"],
         avg_price=outcome["avg_price"],
         broker_ref=outcome["broker_ref"],
+        linked_buy_queued=linked_buy_queued,
     )
+
+
+async def _recorded_linked_buy_queued(
+    record, *, scope: Scope, session: AsyncSession
+) -> bool:
+    """True iff a linked cost-switch ``PendingBuy`` exists for this cosigned decision.
+
+    Story 10.5: server-truth for the idempotent-replay ``linked_buy_queued`` flag. A
+    scoped existence check (reuses the 10.5 dedupe helper keyed on ``sell_decision_id``)
+    — non-``None`` means the linked ``awaiting_funds`` buy was genuinely queued when the
+    SELL first co-signed. A non-switch decision simply has no linked buy → ``None`` →
+    ``False`` (cheap guard). Imported lazily to avoid an api↔api cycle at module load.
+    """
+    from api.cash import _find_awaiting_pending_buy_by_sell_decision
+
+    existing = await _find_awaiting_pending_buy_by_sell_decision(
+        scope, session, sell_decision_id=record.id
+    )
+    return existing is not None
+
+
+# --- Story 10.5: server-verified cost-switch ---------------------------------
+
+
+async def _maybe_queue_switch_buy(
+    *,
+    switch_to,
+    outcome: OrderOutcome,
+    sell_decision_id,
+    scope: Scope,
+    session: AsyncSession,
+) -> bool:
+    """Seed the linked cost-switch BUY on a genuinely-placed SELL — best-effort (10.5).
+
+    Returns ``True`` ONLY when a ``PendingBuy`` was actually created (server truth
+    for the ``/approve`` ``linked_buy_queued`` flag). No-ops (returns ``False``)
+    when there is no server-verified ``switch_to`` (a non-switch order) or the SELL
+    was NOT genuinely placed (``_is_placed`` false — a ``rejected`` or a
+    no-``broker_ref`` ``pending``/``timeout`` seeds nothing, so a beginner is never
+    told a follow-up buy is queued when it is not).
+
+    TRANSACTION-SAFE: the co-sign has ALREADY committed before this runs, so the
+    linked-buy insert + its own commit form a SEPARATE transaction. On ANY failure
+    the SCOPED ``session.rollback()`` discards only this uncommitted insert — it
+    cannot undo the already-committed co-sign — and the placed SELL still succeeds
+    (the linkage is never allowed to fail a placed order). ``amount`` is the honest
+    estimate from the SELL outcome/finding; whole-share flooring is deferred to
+    resume. Imported lazily to avoid an api↔api import cycle at module load.
+    """
+    if not switch_to or not str(switch_to).strip():
+        return False
+    if not _is_placed(outcome):
+        return False
+    # The BUY estimate mirrors the SELL dollar amount (the finding's cached market
+    # value bound onto the snapshot). Read it back from the co-signed record's
+    # order_intent so it survives exactly as proposed; fall back to the reconciled
+    # outcome is unnecessary here because the SELL amount is authoritative on the
+    # snapshot.
+    from api.cash import create_switch_pending_buy
+
+    record = await load_decision(sell_decision_id, scope=scope, session=session)
+    snap = (record.recommendation_snapshot or {}) if record is not None else {}
+    snap_intent = snap.get("order_intent") or {}
+    raw_amount = snap_intent.get("amount")
+    if raw_amount is None:
+        return False
+    try:
+        amount = Decimal(str(raw_amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    try:
+        created = await create_switch_pending_buy(
+            scope,
+            session,
+            switch_to=str(switch_to),
+            amount=amount,
+            sell_decision_id=sell_decision_id,
+        )
+        if created is None:
+            return False
+        await session.commit()
+        return True
+    except Exception:
+        # A linkage failure must NEVER fail the already-placed (and already
+        # co-signed/committed) SELL. Roll back ONLY this uncommitted insert and
+        # surface the honest outcome with ``linked_buy_queued=False``.
+        logger.exception(
+            "cost-switch linked buy failed to seed for decision_id=%s; the SELL "
+            "is placed and co-signed, surfacing linked_buy_queued=False.",
+            sell_decision_id,
+        )
+        await session.rollback()
+        return False
+
+
+async def _verify_cost_switch(
+    body: RecommendRequest,
+    portfolio,
+    scope: Scope,
+    session: AsyncSession,
+) -> "tuple[str, OrderIntent] | None":
+    """Re-derive & verify a client-supplied cost-switch from the USER'S OWN holdings.
+
+    NEVER trusts the client ``switch_to`` (Story 10.5 security gate). A ``switch_to``
+    is honored ONLY when the request is a SELL of a ``symbol`` that the deterministic
+    cost bucket (:func:`allocation.review.find_cost_findings`) actually flags as a
+    high-fee held fund AND the supplied ``switch_to`` equals that finding's canonical
+    cheaper same-class fund. This naturally rejects an arbitrary/unheld symbol, a
+    non-canonical target, and a self-switch (``switch_to == symbol`` is never emitted
+    by ``find_cost_findings``).
+
+    Returns ``(verified_switch_to, sell_order_intent)`` — the canonical target plus
+    the finding's server-computed SELL/MARKET intent (bound onto the snapshot so
+    ``_placed_order_matches_proposal`` enforces propose==approve) — or ``None`` when
+    the pair is not a genuine, server-derived cost-switch (drop ``switch_to`` to
+    ``None``: no snapshot key, no scope widening, no linked buy; the SELL is then
+    refused by the UNCHANGED index-core scope gate if out of scope). Read-only,
+    per-user scoped (AD-10).
+    """
+    raw_switch = (body.switch_to or "").strip()
+    raw_symbol = (body.symbol or "").strip()
+    if not raw_switch or not raw_symbol or body.side != OrderSide.SELL:
+        return None
+    symbol = raw_symbol.upper()
+    switch_to = raw_switch.upper()
+    cash_config = await get_cash_config(scope, session)
+    # Aggregate to one position per symbol first (matches build_review) so the
+    # detector measures the true single position, then re-derive the cost findings.
+    view = _aggregate_by_symbol(portfolio)
+    findings = find_cost_findings(view, cash_config)
+    for f in findings:
+        if f.symbol == symbol and f.switch_to == switch_to:
+            return (switch_to, f.order_intent)
+    return None
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -602,9 +771,25 @@ async def recommend(
         decision_kwargs["symbol"] = raw_symbol
     decision = CoachDecision(**decision_kwargs)
     blessed = await run_coach_pipeline(session, decision, portfolio=portfolio)
+
+    # Story 10.5: SERVER-VERIFY a client-supplied cost-switch from the user's OWN
+    # holdings (never trust the client ``switch_to``). Only a genuine, server-derived
+    # cost-switch threads a VERIFIED ``switch_to`` onto the immutable snapshot AND
+    # binds the finding's server-computed SELL/MARKET intent (so
+    # ``_placed_order_matches_proposal`` enforces propose==approve). An unverifiable
+    # value is dropped to ``None`` — no snapshot key, no scope widening, no linked
+    # buy — and the SELL is refused by the unchanged index-core gate if out of scope.
+    verified_switch_to: str | None = None
+    verified = await _verify_cost_switch(body, portfolio, scope, session)
+    if verified is not None:
+        verified_switch_to, sell_intent = verified
+        blessed = replace(blessed, order_intent=sell_intent)
+
     # Persist the blessed recommendation as an immutable proposed record and
     # return its decision_id (delegated to the sole writer — AD-6).
-    record = await record_proposal(blessed, scope=scope, session=session)
+    record = await record_proposal(
+        blessed, scope=scope, session=session, switch_to=verified_switch_to
+    )
     await session.commit()
     return _to_recommend_response(blessed, decision_id=str(record.id))
 
@@ -668,9 +853,14 @@ async def approve(
         raise HTTPException(status_code=404, detail="Decision record not found.")
 
     # Idempotent re-approve: an already-cosigned decision returns the RECORDED
-    # outcome and never re-touches the broker (cross-request no-double-place).
+    # outcome and never re-touches the broker (cross-request no-double-place). The
+    # ``linked_buy_queued`` flag is re-derived as server truth (Story 10.5) so the
+    # step-2 reassurance survives a refresh/re-submit of a cost-switch SELL.
     if record.status == "cosigned":
-        return _recorded_outcome_response(record)
+        linked = await _recorded_linked_buy_queued(
+            record, scope=scope, session=session
+        )
+        return _recorded_outcome_response(record, linked_buy_queued=linked)
     # Another approve of this decision is already in flight (won the claim, is
     # placing now) → calm 409 in-progress, broker never touched.
     if record.status == "cosigning":
@@ -685,7 +875,10 @@ async def approve(
         if record is None:
             raise HTTPException(status_code=404, detail="Decision record not found.")
         if record.status == "cosigned":
-            return _recorded_outcome_response(record)
+            linked = await _recorded_linked_buy_queued(
+                record, scope=scope, session=session
+            )
+            return _recorded_outcome_response(record, linked_buy_queued=linked)
         # Still cosigning (the winner is placing) → calm 409 in-progress.
         raise HTTPException(status_code=409, detail=IN_PROGRESS_MESSAGE)
 
@@ -726,7 +919,15 @@ async def approve(
     # (order_type/limit_price/session/duration) are human-entered at /approve
     # (Story 8.1) and are intentionally NOT reconciled. When the proposal carried
     # no order_intent, the pre-existing human-supplied contract is unchanged.
-    _snap_intent = (record.recommendation_snapshot or {}).get("order_intent")
+    _snapshot = record.recommendation_snapshot or {}
+    _snap_intent = _snapshot.get("order_intent")
+    # Story 10.5: the SERVER-VERIFIED cost-switch target threaded onto the immutable
+    # snapshot at propose time (``None`` for every non-switch decision). This is the
+    # ONLY ``switch_to`` the execution owner ever sees — it was re-derived from the
+    # user's own holdings at /recommend, never from a raw client value — so it may
+    # safely widen the SELL scope gate and, on a genuinely-placed SELL, seed the
+    # linked deferred BUY of the cheaper canonical fund.
+    _switch_to = _snapshot.get("switch_to")
     if _snap_intent is not None and not _placed_order_matches_proposal(
         body.order_intent, _snap_intent
     ):
@@ -763,6 +964,10 @@ async def approve(
             # (a BUY stays index-core-only). Fail-closed when absent.
             scope=scope,
             session=session,
+            # Story 10.5: the server-verified cost-switch target from the snapshot
+            # (``None`` for a non-switch decision) widens the SELL scope gate for a
+            # genuine cost-switch. A BUY is never widened.
+            switch_to=_switch_to,
         )
     except SessionIntegrityError as exc:
         # Session lapsed or provider mismatched at placement time; release the
@@ -839,10 +1044,34 @@ async def approve(
     # cosign (and never release: a live order may exist).
     record = await load_decision(body.decision_id, scope=scope, session=session)
     if record is None or record.status != "cosigning":
-        return _to_approve_response(outcome)
+        # A concurrent forward-recovery already completed this row. The order was
+        # placed, so still seed the linked cost-switch BUY (best-effort) if this is
+        # a genuinely-placed cost-switch SELL — the SELL is durable regardless.
+        linked = await _maybe_queue_switch_buy(
+            switch_to=_switch_to,
+            outcome=outcome,
+            sell_decision_id=body.decision_id,
+            scope=scope,
+            session=session,
+        )
+        return _to_approve_response(outcome, linked_buy_queued=linked)
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
-    return _to_approve_response(outcome)
+
+    # Story 10.5: on a GENUINELY-placed cost-switch SELL, durably queue the linked
+    # deferred BUY of the cheaper canonical fund. Placed AFTER the cosign commit (so
+    # the co-sign state is already durable and independent) and wrapped so a linkage
+    # failure can NEVER fail the already-placed SELL nor roll back the committed
+    # co-sign. The ``linked_buy_queued`` flag is server truth: true ONLY when the
+    # ``PendingBuy`` was actually created.
+    linked_buy_queued = await _maybe_queue_switch_buy(
+        switch_to=_switch_to,
+        outcome=outcome,
+        sell_decision_id=body.decision_id,
+        scope=scope,
+        session=session,
+    )
+    return _to_approve_response(outcome, linked_buy_queued=linked_buy_queued)
 
 
 @router.post("/suggest-order", response_model=SuggestOrderResponse)

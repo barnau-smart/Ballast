@@ -272,3 +272,336 @@ describe('CoachConsult — review-my-portfolio affordance (Story 10.4)', () => {
     expectCalm(btn.textContent)
   })
 })
+
+// --- Story 10.5: linked cost-switch SELL + BUY pair -------------------------
+
+// A router-by-URL stub that also fields /recommend and /approve so a full
+// review → fill → ask → approve co-sign flow runs. `approve` is the canned
+// /approve body — set `linked_buy_queued` to drive the step-2 note.
+function stubReviewFlow({ findings, recommend, approve } = {}) {
+  const fn = vi.fn((url) => {
+    const u = String(url)
+    if (u.includes('/api/allocation/review')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ findings: findings ?? [] }),
+      })
+    }
+    if (u.includes('/api/coach/recommend')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve(
+            recommend ?? {
+              decision_id: 'dec-switch-1',
+              action_label: 'Switch this pricey fund',
+              reasoning: 'A two-step switch.',
+              evidence: [],
+              uncertainties: ['Markets move.'],
+              order_intent: {
+                symbol: 'AGTHX',
+                side: 'sell',
+                amount: '2000.00',
+              },
+            },
+          ),
+      })
+    }
+    if (u.includes('/api/coach/approve')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve(
+            approve ?? {
+              status: 'filled',
+              filled_qty: '20',
+              avg_price: '100.00',
+              broker_ref: 'fake-order-1',
+              linked_buy_queued: true,
+            },
+          ),
+      })
+    }
+    // /api/portfolio is consulted by the liquidation pre-check on a BUY step; a
+    // SELL never triggers it, but answer calmly if it is ever hit.
+    if (u.includes('/api/portfolio')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ cash_states: { ready_to_trade: '0' } }),
+      })
+    }
+    return Promise.reject(new Error(`unexpected url: ${u}`))
+  })
+  vi.stubGlobal('fetch', fn)
+  return fn
+}
+
+describe('CoachConsult — linked cost-switch SELL + BUY (Story 10.5)', () => {
+  it('frames the cost finding as a linked two-step switch', async () => {
+    stubFetch({ findings: [COST_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+
+    // The cost card is rendered as an advisor CoachCard; the backend narration
+    // copy carries the switch framing. (The two-step copy itself is authored + gate
+    // -tested on the backend; here we assert the card surfaces the switch intent.)
+    const reasonings = screen.getAllByTestId('coach-card-reasoning')
+    expect(reasonings[0]).toHaveTextContent(/switch|cheaper|minimize fund fees/i)
+    expectCalm(screen.getByTestId('coach-review-result').textContent)
+  })
+
+  it('carries switch_to to /recommend when a cost finding is filled + asked', async () => {
+    const fn = stubReviewFlow({ findings: [COST_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+
+    // Fill the cost finding's SELL — this stashes switch_to (VTI).
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    expect(screen.getByTestId('coach-side-select').value).toBe('sell')
+
+    // Ask → /recommend carries the stashed switch_to (untrusted; backend verifies).
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await waitFor(() =>
+      expect(
+        fn.mock.calls.some(([u]) => String(u).includes('/api/coach/recommend')),
+      ).toBe(true),
+    )
+    const recCall = fn.mock.calls.find(([u]) =>
+      String(u).includes('/api/coach/recommend'),
+    )
+    const body = JSON.parse(recCall[1].body)
+    expect(body.side).toBe('sell')
+    expect(body.symbol).toBe('AGTHX')
+    expect(body.switch_to).toBe('VTI')
+  })
+
+  it('shows the "step 2 queued" note ONLY when linked_buy_queued is true', async () => {
+    stubReviewFlow({
+      findings: [COST_FINDING],
+      approve: {
+        status: 'filled',
+        filled_qty: '20',
+        avg_price: '100.00',
+        broker_ref: 'fake-order-1',
+        linked_buy_queued: true,
+      },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    const note = await screen.findByTestId('coach-linked-buy-note')
+    expect(note).toHaveTextContent(/step 2 of 2 is queued/i)
+    expectCalm(note.textContent)
+  })
+
+  it('does NOT show the step-2 note when linked_buy_queued is false', async () => {
+    stubReviewFlow({
+      findings: [COST_FINDING],
+      approve: {
+        status: 'filled',
+        filled_qty: '20',
+        avg_price: '100.00',
+        broker_ref: 'fake-order-1',
+        linked_buy_queued: false,
+      },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    // The placed outcome renders, but the step-2 note NEVER appears (server truth).
+    await screen.findByTestId('coach-outcome')
+    expect(screen.queryByTestId('coach-linked-buy-note')).toBeNull()
+  })
+
+  it('clears the stashed switch_to on decline so a later ask does not carry it', async () => {
+    const fn = stubReviewFlow({ findings: [COST_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+
+    // Ask, then decline (clears the stash), then re-ask — the second /recommend
+    // must NOT carry switch_to (a stale switch could bypass the SELL guardrail).
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-decline'))
+    // Re-ask the same SELL form.
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+
+    await waitFor(() => {
+      const recCalls = fn.mock.calls.filter(([u]) =>
+        String(u).includes('/api/coach/recommend'),
+      )
+      expect(recCalls.length).toBe(2)
+    })
+    const recCalls = fn.mock.calls.filter(([u]) =>
+      String(u).includes('/api/coach/recommend'),
+    )
+    // First ask carried it; the post-decline re-ask did not.
+    expect(JSON.parse(recCalls[0][1].body).switch_to).toBe('VTI')
+    expect(JSON.parse(recCalls[1][1].body).switch_to).toBeNull()
+  })
+
+  it('shows the calm fallback note when a placed switch SELL failed to queue the linked buy', async () => {
+    // PATCH 2: the SELL placed (filled) but linked_buy_queued=false (the seeding
+    // raised) — the beginner must NOT be silently stranded. A calm fallback note
+    // (naming switch_to) appears; the normal "step 2 queued" note does NOT.
+    const fn = stubReviewFlow({
+      findings: [COST_FINDING],
+      approve: {
+        status: 'filled',
+        filled_qty: '20',
+        avg_price: '100.00',
+        broker_ref: 'fake-order-1',
+        linked_buy_queued: false,
+      },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    // The calm fallback appears and names the switch target (VTI).
+    const fallback = await screen.findByTestId('coach-linked-buy-fallback')
+    expect(fallback).toHaveTextContent(/VTI/)
+    expect(fallback).toHaveTextContent(/nothing was lost/i)
+    expectCalm(fallback.textContent)
+
+    // The normal "step 2 queued" note does NOT show (server truth = false).
+    expect(screen.queryByTestId('coach-linked-buy-note')).toBeNull()
+
+    // Nothing auto-submitted beyond the explicit approve click (one /approve).
+    const approveCalls = fn.mock.calls.filter(([u]) =>
+      String(u).includes('/api/coach/approve'),
+    )
+    expect(approveCalls.length).toBe(1)
+  })
+
+  it('does NOT show the switch fallback note for an ordinary non-switch SELL', async () => {
+    // A concentration finding has no switch_to — a placed SELL with
+    // linked_buy_queued=false must show NEITHER the step-2 note NOR the fallback.
+    stubReviewFlow({
+      findings: [CONCENTRATION_FINDING],
+      recommend: {
+        decision_id: 'dec-conc-1',
+        action_label: 'Trim',
+        reasoning: 'Trim it.',
+        evidence: [],
+        uncertainties: ['Markets move.'],
+        order_intent: { symbol: 'TSLA', side: 'sell', amount: '1500.00' },
+      },
+      approve: {
+        status: 'filled',
+        filled_qty: '10',
+        avg_price: '150.00',
+        broker_ref: 'fake-order-2',
+        linked_buy_queued: false,
+      },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('TSLA'),
+    )
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    await screen.findByTestId('coach-outcome')
+    expect(screen.queryByTestId('coach-linked-buy-fallback')).toBeNull()
+    expect(screen.queryByTestId('coach-linked-buy-note')).toBeNull()
+  })
+
+  it('editing the symbol after filling a cost finding drops the stashed switch_to before ask', async () => {
+    // PATCH 4: fill a cost finding (stashes VTI), then EDIT the symbol BEFORE asking
+    // (recommendation === null). The unconditional edit() clear drops the stash, so
+    // the subsequent /recommend must NOT carry a stale switch_to.
+    const fn = stubReviewFlow({ findings: [COST_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    expect(screen.getByTestId('coach-side-select').value).toBe('sell')
+
+    // Edit the symbol BEFORE asking (no recommendation shown yet) — drops the stash.
+    fireEvent.change(screen.getByTestId('coach-symbol-input'), {
+      target: { value: 'BND' },
+    })
+
+    // Ask → /recommend must NOT carry switch_to (stale switch dropped by edit()).
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await waitFor(() =>
+      expect(
+        fn.mock.calls.some(([u]) => String(u).includes('/api/coach/recommend')),
+      ).toBe(true),
+    )
+    const recCall = fn.mock.calls.find(([u]) =>
+      String(u).includes('/api/coach/recommend'),
+    )
+    expect(JSON.parse(recCall[1].body).switch_to).toBeNull()
+  })
+
+  it('does not auto-submit anything when a cost finding is merely filled', async () => {
+    const fn = stubReviewFlow({ findings: [COST_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+
+    // Filling populates but submits NOTHING — no /recommend, no /approve.
+    const urls = fn.mock.calls.map(([u]) => String(u))
+    expect(urls.some((u) => u.includes('/api/coach/recommend'))).toBe(false)
+    expect(urls.some((u) => u.includes('/api/coach/approve'))).toBe(false)
+  })
+})

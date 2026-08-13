@@ -149,23 +149,37 @@ def _order_intent_json(order_intent: OrderIntent) -> dict:
     return result
 
 
-def _snapshot(blessed: BlessedRecommendation) -> dict:
+def _snapshot(
+    blessed: BlessedRecommendation, *, switch_to: str | None = None
+) -> dict:
     """Freeze the blessed recommendation into the immutable proposed snapshot.
 
     Captures action_label, reasoning, the proposed ``order_intent`` (or ``None``),
     the FULL evidence records (AD-12 ``EvidenceRecord.to_dict()`` shape — precedent
     snapshotted at decision time, never recomputed later), and uncertainties.
+
+    ADDITIVE ``switch_to`` (Story 10.5): a SERVER-VERIFIED cost-switch SELL threads
+    the cheaper canonical fund's symbol onto the snapshot so the ``/approve`` co-sign
+    can (a) widen the SELL scope gate for a genuine cost-switch and (b) seed the
+    linked deferred BUY of ``switch_to`` on a placed SELL. It is written ONLY when
+    present (a non-switch proposal omits the key entirely, byte-identical to
+    pre-10.5), so :data:`DECISION_RECORD_SCHEMA_VERSION` stays at 1 (a pure additive
+    superset needing no replay adaptation). ``switch_to`` must ALREADY be
+    server-verified by the caller — this writer never trusts client input.
     """
     order_intent = (
         None if blessed.order_intent is None else _order_intent_json(blessed.order_intent)
     )
-    return {
+    snapshot = {
         "action_label": blessed.action_label,
         "reasoning": blessed.reasoning,
         "order_intent": order_intent,
         "evidence": [record.to_dict() for record in blessed.evidence],
         "uncertainties": list(blessed.uncertainties),
     }
+    if switch_to is not None:
+        snapshot["switch_to"] = switch_to
+    return snapshot
 
 
 async def record_proposal(
@@ -173,6 +187,7 @@ async def record_proposal(
     *,
     scope: Scope,
     session: AsyncSession,
+    switch_to: str | None = None,
 ) -> DecisionRecord:
     """Persist ONE **proposed** decision record for the blessed recommendation.
 
@@ -184,11 +199,17 @@ async def record_proposal(
     :class:`~db.repository.ScopedRepository`, so the owner is stamped from
     ``scope``. Returns the flushed row (its ``id`` is populated); the CALLER
     commits.
+
+    ``switch_to`` (Story 10.5, optional) threads a SERVER-VERIFIED cost-switch's
+    cheaper canonical fund onto the immutable snapshot (additive key,
+    ``schema_version`` unchanged). The caller MUST have already re-derived and
+    verified it from the user's own holdings — this writer never trusts client
+    input.
     """
     repo = ScopedRepository(DecisionRecord, scope, session)
     return await repo.add(
         schema_version=DECISION_RECORD_SCHEMA_VERSION,
-        recommendation_snapshot=_snapshot(blessed),
+        recommendation_snapshot=_snapshot(blessed, switch_to=switch_to),
         status="proposed",
         idempotency_key=mint_idempotency_key(),
         created_at=datetime.datetime.now(datetime.timezone.utc),

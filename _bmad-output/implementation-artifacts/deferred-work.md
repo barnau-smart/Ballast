@@ -402,3 +402,7 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-10-2-gap-to-target-deploy-cash-engine.md`
   summary: `/plan` serializes `unclassified` (VT/single-stocks/non-index ETFs) and the `current` sleeve breakdown, but the deploy UI (`CoachConsult.onDeploy`) never renders them — the spec intent "those holdings are surfaced honestly" is only half-met (endpoint yes, UI no).
   evidence: `CoachConsult.jsx` deploy branch reads only `plan.primary_order`/`status`/`reason`. Product/UX decision on whether to show the unclassified sleeve + current mix in the deploy card.
+
+- source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
+  summary: A cost-switch (or 9.3 deploy) linked PendingBuy is queued for the SELL's full pre-fill dollar estimate, not the realized proceeds; on a PARTIAL market SELL the linked buy is oversized relative to what actually settled.
+  evidence: `coach/execution.py:_is_placed` treats PARTIAL as placed; `api/cash.py:create_switch_pending_buy` seeds `amount` from the snapshot's SELL `order_intent.amount`. Fail-safe today (resume gated on `funds_ready` won't over-place), and it matches the cross-cutting "estimate now, floor at approve" convention shared with the 9.3 deploy/liquidation path — so this is a system-wide honesty consideration (reconcile linked-buy amount from `outcome.filled_qty × avg_price`), not a 10.5-only fix.

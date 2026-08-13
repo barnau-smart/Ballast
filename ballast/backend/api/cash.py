@@ -402,6 +402,15 @@ async def _find_awaiting_pending_buy(
     The dedupe key for the plan endpoint (a re-visit of the same buy step must NOT
     mint a second durable pending buy). Reads ONLY the caller's rows (AD-10), matches
     the hoisted ``amount`` and the buy_intent's normalized symbol.
+
+    SKIPS any Story 10.5 cost-switch buy (``buy_intent.source == "cost_switch"``): a
+    cost-switch buy is an economically-distinct order keyed on its originating SELL
+    (:func:`_find_awaiting_pending_buy_by_sell_decision`), so the deploy/liquidation
+    producer must only ever dedupe against its OWN rows — never swallow a pre-existing
+    cost-switch buy sharing ``(symbol, amount)`` and re-surface its ``sell_decision_id``
+    as the deploy's liquidation sell. Legacy/deploy rows have no ``source`` key, so
+    ``.get("source")`` is ``None`` ≠ ``"cost_switch"`` → still matched (9.3 idempotency
+    preserved).
     """
     repo = ScopedRepository(PendingBuy, scope, session)
     rows = await repo.list()
@@ -409,10 +418,104 @@ async def _find_awaiting_pending_buy(
     for row in rows:
         if row.status != "awaiting_funds":
             continue
+        if (row.buy_intent or {}).get("source") == "cost_switch":
+            # A cost-switch buy is the 10.5 producer's own row — never dedupe the
+            # deploy path against it (economically distinct, keyed on its SELL).
+            continue
         row_symbol = str((row.buy_intent or {}).get("symbol", "")).strip().upper()
         if row_symbol == target and row.amount == amount:
             return row
     return None
+
+
+async def _find_awaiting_pending_buy_by_sell_decision(
+    scope: Scope,
+    session: AsyncSession,
+    *,
+    sell_decision_id: UUID,
+) -> PendingBuy | None:
+    """Find an ``awaiting_funds`` pending buy linked to ``sell_decision_id`` — scoped.
+
+    The dedupe key for the STORY 10.5 cost-switch producer (a replay of the SAME
+    co-signed switch SELL must NOT mint a second linked buy). Deliberately keyed on
+    the originating ``sell_decision_id`` — NOT ``(symbol, amount)`` — so two DISTINCT
+    cost-switch SELLs into the same ``switch_to`` for the same amount each queue
+    their OWN buy, and a pre-existing Story 9.3 deploy/liquidation pending buy
+    sharing ``(symbol, amount)`` (whose ``sell_decision_id`` differs or is NULL) is
+    never swallowed or conflated. Reads ONLY the caller's rows (AD-10).
+    """
+    repo = ScopedRepository(PendingBuy, scope, session)
+    rows = await repo.list()
+    for row in rows:
+        if row.status != "awaiting_funds":
+            continue
+        if row.sell_decision_id is not None and row.sell_decision_id == sell_decision_id:
+            return row
+    return None
+
+
+async def create_switch_pending_buy(
+    scope: Scope,
+    session: AsyncSession,
+    *,
+    switch_to: str,
+    amount: Decimal,
+    sell_decision_id: UUID,
+) -> PendingBuy | None:
+    """Durably seed the linked cost-switch BUY of ``switch_to`` (Story 10.5).
+
+    Called by the ``/approve`` handler AFTER a genuinely-placed cost-switch SELL
+    (``coach.execution._is_placed``), so the follow-up BUY into the cheaper canonical
+    fund is a durable ``awaiting_funds`` :class:`~db.models.PendingBuy` linked to the
+    SELL via ``sell_decision_id`` — the SAME primitive + list/resume/cancel lifecycle
+    Story 9.3 already ships. The BUY is NEVER auto-placed: it resumes as a second
+    human co-sign via :func:`resume_pending_buy` once ``ready_to_trade`` covers it.
+
+    IDEMPOTENT on the originating ``sell_decision_id`` (NOT ``(symbol, amount)``): a
+    replay of the same co-signed switch SELL returns the existing row (no duplicate);
+    two DISTINCT switches each get their own row; a pre-existing 9.3 deploy buy is
+    never conflated. ``amount`` is an honest estimate from the SELL finding's cached
+    market value (whole-share flooring is deferred to resume/approve, mirroring the
+    9.3 "estimate now, floor at approve" convention). Per-user scoped (AD-10);
+    money is ``Decimal``; timestamps are tz-aware UTC. Returns the created (or
+    pre-existing) row, or ``None`` if the amount is not a placeable money value
+    (fail-closed — never fail the already-placed SELL over the linkage).
+
+    The CALLER owns the commit; this only stages the insert via the scoped repo.
+    """
+    target = (switch_to or "").strip().upper()
+    if not target:
+        return None
+    try:
+        amount = _validate_buy_amount(amount)
+    except ValueError:
+        # A malformed estimate must never fail the placed SELL — no buy, no raise.
+        return None
+
+    # Dedupe on the originating SELL decision (replay-safe), NOT (symbol, amount).
+    existing = await _find_awaiting_pending_buy_by_sell_decision(
+        scope, session, sell_decision_id=sell_decision_id
+    )
+    if existing is not None:
+        return existing
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    repo = ScopedRepository(PendingBuy, scope, session)
+    return await repo.add(
+        buy_intent={
+            "symbol": target,
+            "side": OrderSide.BUY.value,
+            "amount": format_money(amount),
+            # Tag the origin (Story 10.5) so the Story 9.3 deploy/liquidation dedupe
+            # (:func:`_find_awaiting_pending_buy`) never swallows this cost-switch buy
+            # and re-surfaces its ``sell_decision_id`` as the deploy's liquidation sell.
+            "source": "cost_switch",
+        },
+        amount=amount,
+        status="awaiting_funds",
+        sell_decision_id=sell_decision_id,
+        created_at=now,
+    )
 
 
 @router.post("/liquidation-plan", response_model=LiquidationPlanResponse)
