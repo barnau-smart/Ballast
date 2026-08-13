@@ -187,7 +187,7 @@ development_status:
   10-12-fresh-cash-at-cover-gate: done
   # 10-13: align the engine's max(0,view.cash) clamp with plan_liquidation's raw view.cash on a
   # margin-DEBIT account (lower priority; 10-9 backstops execution + 10-10 warns).
-  10-13-margin-debit-clamp-alignment: draft
+  10-13-margin-debit-clamp-alignment: review
   epic-10-retrospective: done
 
 action_items:

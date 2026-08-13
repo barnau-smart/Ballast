@@ -449,8 +449,11 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         )
 
     # (3) Investable cash = settlement + single-fund-liquidatable parked − reserve
-    # (Story 10.8, hardened by its 2026-08-13 review). ``ready_to_trade`` is settlement
-    # cash (``view.cash``, clamped ≥ 0 — a negative margin balance is not investable).
+    # (Story 10.8, hardened by its 2026-08-13 review; margin-debit clamp aligned in 10.13).
+    # The investable base is the RAW settlement balance ``view.cash`` — a negative margin-debit
+    # balance correctly REDUCES investable (the debt must be covered before deploying), matching
+    # the raw-cash 9-3 liquidation. ``settlement_cash`` (the SPENDABLE figure shown on the wire)
+    # is separately clamped ≥ 0 so it never displays negative.
     # Parked money-market — the user's DECLARED, unclassified ``parked_symbols`` (e.g.
     # SWVXX) — is a cash-equivalent they hold instead of idle cash, so it IS deployable.
     # The reserve is a cushion out of the TOTAL available (settlement + parked).
@@ -469,7 +472,9 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     # settlement is funded at co-sign by liquidating the parked fund first (Story 9.3),
     # and — as of Story 10.9 — ``execute_approved_order`` REFUSES any buy exceeding real
     # settled cash, so a buy ALWAYS places against real cash, never margin.
-    ready_to_trade = max(_ZERO, view.cash)
+    # ``settlement_cash`` is what's actually SPENDABLE now — clamped ≥ 0 for display so a
+    # margin-debit balance never shows a negative "settled cash" on the wire (Story 10.8 AC5).
+    settlement_cash = max(_ZERO, view.cash)
     parked_total, largest_parked, largest_parked_symbol = _deployable_parked(
         view.holdings, parked_set
     )
@@ -479,7 +484,13 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     liquidatable_parked = (
         largest_parked if largest_parked < parked_after_reserve else parked_after_reserve
     )
-    investable = ready_to_trade + liquidatable_parked
+    # Story 10.13: the investable base is the RAW settlement balance (``view.cash``), NOT
+    # ``max(0, view.cash)`` — so a negative margin-DEBIT balance correctly REDUCES investable
+    # by what's owed, matching the raw-cash 9-3 ``plan_liquidation`` (the correct side). A
+    # normal account (``view.cash ≥ 0``) is byte-identical (raw == the clamp), so nothing
+    # changes there; a margin-debit account no longer over-promises a deploy the liquidation
+    # can't cover. A deep debt drives ``investable ≤ 0 → no_cash`` (correct).
+    investable = view.cash + liquidatable_parked
     if not investable.is_finite() or investable <= _ZERO:
         return Plan(
             status=STATUS_NO_CASH,
@@ -497,13 +508,14 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
-    # Honest funding split (Story 10.8 AC5): the part of ``investable`` that comes
-    # from selling the parked money-market (``from_money_market``) vs settled cash
-    # already spendable now (``settlement_cash``). ``from_money_market`` is the
-    # POSITIVE liquidatable-parked contribution (0 when the deploy is pure settlement
-    # cash, or when the reserve fully absorbs parked); the remainder is settled cash.
-    from_money_market = liquidatable_parked if liquidatable_parked > _ZERO else _ZERO
-    settlement_cash = investable - from_money_market
+    # Honest funding split (Story 10.8 AC5 / 10.13): ``settlement_cash`` (computed above as
+    # ``max(0, view.cash)``, never negative) is what's spendable now; the REMAINDER of
+    # ``investable`` nets from selling the parked money-market. Invariant preserved:
+    # ``settlement_cash + from_money_market == investable``. On a normal account this equals
+    # the old ``liquidatable_parked``; on a margin-debit account ``settlement_cash`` is 0 and
+    # ``from_money_market`` is the whole (debt-reduced) ``investable`` — honest about the fact
+    # that all deployable cash comes from the money-market after the proceeds cover the debit.
+    from_money_market = investable - settlement_cash
     # Name ONLY the single fund the 9-3 liquidation actually sells (the largest) —
     # never the whole parked list, which would misstate what's being sold.
     money_market_symbols = (
