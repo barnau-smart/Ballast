@@ -208,7 +208,7 @@ def test_missed_growth_returns_figure_for_idle_cash(client):
         assert body["parked"] == "0.00"
         assert body["settlement_cash"] == "25000.00"
         assert body["investable_base"] == "25000.00"
-        assert body["money_market_apy"] == "0.04"
+        assert body["money_market_apy"] == "0.035"
         assert body["sufficient"] is True
         assert body["reason"] is None
         assert body["benchmark"] == EP_SYMBOL
@@ -367,11 +367,11 @@ def test_missed_growth_parked_and_reserve_raise_figure_honestly(client):
         assert body["reserve_decided"] is True
         assert body["investable_base"] == "8000.00"
         # parked drawn-first → parked_inv=3000, cash_inv=5000;
-        # 5000·0.14 + 3000·(0.14−0.04) = 700 + 300 = 1000.00.
-        assert body["forgone_growth"] == "1000.00"
+        # 5000·0.14 + 3000·(0.14−0.035) = 700 + 315 = 1015.00.
+        assert body["forgone_growth"] == "1015.00"
         # Discloses the yield assumption; surfaces the reserve in the statement.
         assert "money-market" in body["statement"].lower()
-        assert body["money_market_apy"] == "0.04"
+        assert body["money_market_apy"] == "0.035"
         assert "$2,000.00" in body["statement"]
     finally:
         _clean_market([EP_SYMBOL])

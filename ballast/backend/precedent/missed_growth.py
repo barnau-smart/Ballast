@@ -46,11 +46,16 @@ LOOKBACK_TRADING_DAYS = 252
 #: NOT in the market-data set (Tiingo carries only the 14 index ETFs) and 9-1
 #: stores no per-fund yield, so a single disclosed default is the honest v1 source:
 #: every statement that uses it states the assumption out loud ("counting your
-#: parked money-market cash as already earning about 4% a year"). It is a TUNABLE
+#: parked money-market cash as already earning about 3.5% a year"). It is a TUNABLE
 #: placeholder — tune it against real money-market data later, and consider a
 #: user-editable yield as a later refinement; do NOT hardcode this rate anywhere
 #: else (this constant is the single source).
-DEFAULT_MONEY_MARKET_APY = Decimal("0.04")
+#:
+#: Tuned 2026-08-13 to SWVXX (Schwab Prime Advantage Money Investor) 7-day yield =
+#: 3.50% as of 2026-08-12 (MasterB's declared parked money-market fund). Money-market
+#: yields drift week to week, so this static disclosed assumption will slowly go stale
+#: — refresh it periodically, or wire a live yield feed (the noted later refinement).
+DEFAULT_MONEY_MARKET_APY = Decimal("0.035")
 
 #: Trading days per year — the denominator that prorates an annual APY down to the
 #: lookback window (``yield_over_window = apy × lookback_days / 252``).
