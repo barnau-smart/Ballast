@@ -1,6 +1,6 @@
 # Story 10.11: Close the human-coach no-balance cash-cover gap
 
-Status: paused-needs-decision
+Status: deferred
 baseline_commit: 29983a2
 
 <!-- HARD GATE (docs/dev-loop-policy.md): Approach A approved 2026-08-13, but PAUSED during
