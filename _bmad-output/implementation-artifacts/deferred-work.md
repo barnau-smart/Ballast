@@ -424,3 +424,9 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
   summary: The `/recommend` switch path silently ignores a client-supplied `amount` (a verified cost-switch always sells the whole 10-4 position), so a user asking to switch only part of a position is quietly upsized to the whole position.
   evidence: `api/coach.py:_verify_cost_switch` binds `order_intent = f.order_intent` (whole-position `market_value`) and discards `body.amount`. Documented 10-4 whole-position design; ignore `amount` explicitly for a verified switch or refuse a mismatch, for clarity.
+
+## Deferred from: story 10-7 review — current-vs-target x-ray (2026-08-13)
+
+- source_spec: `_bmad-output/implementation-artifacts/10-7-surface-current-vs-target-xray.md`
+  summary: The deploy-card x-ray shows no per-class current-vs-target comparison on an `at_target` plan (only the unclassified line, or nothing) — exactly the no-action state where "you're on your target mix" would be most reassuring. Cause: the engine populates `Plan.target_weights` only on the `deploy` branch; no-action statuses carry `{}`.
+  evidence: `allocation/engine.py` sets `target_weights` on deploy (~:429) but leaves the `{}` default for `at_target`/`no_cash` (~:333); the frontend `AllocationXray` needs a non-empty `target_weights` to render the comparison. Small engine follow-up: carry the resolved target on `at_target` (and other resolved-target no-action statuses) so the x-ray shows "you're at 60/30/10, right on target." Display-only story left the engine untouched.

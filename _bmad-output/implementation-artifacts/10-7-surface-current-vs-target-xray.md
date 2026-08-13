@@ -1,6 +1,6 @@
 # Story 10.7: Surface the current-vs-target x-ray in the deploy card
 
-Status: review
+Status: done
 baseline_commit: 6df402f
 
 <!-- HARD GATE (docs/dev-loop-policy.md): scope APPROVED by MasterB 2026-08-13 (deferred
@@ -79,3 +79,4 @@ claude-opus-4-8[1m] (dev-story, in-chat)
 ## Change Log
 
 - 2026-08-13 — Story 10.7 implemented: surface the current-vs-target x-ray + unclassified sleeve in the deploy card. Added `target_weights` to `PlanOut`; `AllocationXray` renders the breakdown. Display-only; closes the Group-C deferred UI-completeness item. Backend 838 + frontend 197 green.
+- 2026-08-13 — Focused independent adversarial review: **CLEAN** (no Critical/High/Medium). Verified strictly-additive read-only display, no money-path regression, no XSS (React-escaped), non-finite-guarded percents, calm degrade, no stale state, backend additive. One LOW deferred: on an `at_target` plan the engine emits `target_weights={}` (populated only on `deploy`), so the x-ray shows no per-class comparison in that no-action state — a small engine follow-up (populate the resolved target on `at_target`), recorded in `deferred-work.md`.
