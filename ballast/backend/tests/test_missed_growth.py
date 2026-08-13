@@ -555,8 +555,8 @@ async def test_negative_window_parked_avoided_framing_never_cost():
 
 @pytest.mark.asyncio
 async def test_default_apy_constant_is_documented_placeholder():
-    """The disclosed default APY is a named 4% constant (tunable placeholder)."""
-    assert DEFAULT_MONEY_MARKET_APY == Decimal("0.04")
+    """The disclosed default APY is a named 3.5% constant (tunable placeholder)."""
+    assert DEFAULT_MONEY_MARKET_APY == Decimal("0.035")
 
 
 # --- Story 9.2 review patches: honesty of market-DIRECTION wording -----------
@@ -709,6 +709,6 @@ async def test_yield_aware_estimate_is_deterministic():
         for key in ("settlement_cash", "parked", "reserved", "investable_base"):
             assert "E" not in d[key] and "e" not in d[key]
         assert d["investable_base"] == "8000.00"
-        assert d["forgone_growth"] == "1000.00"
+        assert d["forgone_growth"] == "1015.00"  # 700 + 3000·(0.14−0.035)
     finally:
         _clean([SYM_RISING])

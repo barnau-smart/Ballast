@@ -99,7 +99,8 @@ export function reserveLine(estimate) {
  * The disclosed money-market yield note (Story 9.2), shown ONLY when parked
  * money is actually in the calc (`parked > 0`). States the assumption out loud
  * so the figure is never a lie by omission — e.g. "Counting your parked
- * money-market cash as already earning about 4% a year." Returns `null` when
+ * money-market cash as already earning about 3.5% a year." The rate is taken
+ * from the backend `money_market_apy` (never hardcoded here). Returns `null` when
  * there is no parked money or no apy to disclose.
  */
 export function yieldNote(estimate) {
