@@ -65,7 +65,7 @@ from brokers.schwab_adapter import (
     SchwabAccountSelectionError,
     SchwabNotConfiguredError,
 )
-from brokers.portfolio import get_portfolio
+from brokers.portfolio import debit_cash, get_portfolio
 from brokers.session import BrokerageSession
 from coach.decision_record import (
     claim_for_cosign,
@@ -795,6 +795,42 @@ async def recommend(
     return _to_recommend_response(blessed, decision_id=str(record.id))
 
 
+async def _maybe_debit_cash_for_buy(
+    intent: OrderIntent,
+    outcome,
+    *,
+    scope: Scope,
+    session: AsyncSession,
+) -> None:
+    """Debit cached settled cash by a placed BUY's executed cost (Story 10.12).
+
+    Keeps the Story-10.9 cover gate honest across SEQUENTIAL buys: the cached
+    ``portfolio_balance.cash`` isn't refreshed after a fill, so a second buy could pass
+    the gate against pre-buy cash and overdraw. After a GENUINELY-placed BUY
+    (:func:`_is_placed`) with an executed cost (``filled_qty`` × ``avg_price`` > 0), debit
+    that cost so the NEXT buy's gate sees the reduced cash. BUY-only, executed-cost-only —
+    a SELL (proceeds unsettled) and a ``rejected``/``pending``/``timeout`` (nothing spent)
+    debit nothing. BEST-EFFORT: called AFTER the cosign commit and wrapped so a debit
+    failure can NEVER fail the already-placed + co-signed order (mirrors
+    :func:`_maybe_queue_switch_buy`). A no-balance-row user is a no-op inside ``debit_cash``.
+    """
+    try:
+        if intent.side != OrderSide.BUY or not _is_placed(outcome):
+            return
+        qty = outcome.filled_qty
+        price = outcome.avg_price
+        if qty is None or price is None:
+            return
+        if not qty.is_finite() or not price.is_finite() or qty <= 0 or price <= 0:
+            return
+        await debit_cash(scope, session, qty * price)
+    except Exception:  # pragma: no cover - defensive; never disturb the placed order
+        logger.warning(
+            "approve_debit_cash_failed decision placed+cosigned; cache debit skipped",
+            exc_info=True,
+        )
+
+
 @router.post("/approve", response_model=ApproveResponse)
 async def approve(
     body: ApproveRequest,
@@ -1064,6 +1100,10 @@ async def approve(
             scope=scope,
             session=session,
         )
+        # Story 10.12: keep the cached cash fresh for the next buy (best-effort).
+        await _maybe_debit_cash_for_buy(
+            intent, outcome, scope=scope, session=session
+        )
         return _to_approve_response(outcome, linked_buy_queued=linked)
     cosign(record, order_intent=intent, outcome=outcome, idempotency_key=key)
     await session.commit()
@@ -1081,6 +1121,10 @@ async def approve(
         scope=scope,
         session=session,
     )
+    # Story 10.12: after a genuinely-placed BUY, debit the cached settled cash by the
+    # executed cost so a subsequent buy's cover gate (10.9) sees the reduced cash — no
+    # sequential-buy overdraw. Best-effort AFTER the cosign commit; never fails the order.
+    await _maybe_debit_cash_for_buy(intent, outcome, scope=scope, session=session)
     return _to_approve_response(outcome, linked_buy_queued=linked_buy_queued)
 
 

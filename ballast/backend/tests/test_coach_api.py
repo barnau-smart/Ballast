@@ -4546,3 +4546,91 @@ def test_placed_order_matches_proposal_guardrail():
     assert not _placed_order_matches_proposal(
         intent("SWVXX", OrderSide.SELL, "500.00"), {"symbol": "SWVXX", "side": "sell", "amount": None}
     )
+
+
+# =============================================================================
+# Story 10.12 — keep settled cash fresh across sequential buys (debit-after-fill)
+# =============================================================================
+
+
+def _seed_balance_sync(owner: uuid.UUID, cash: str) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO portfolio_balance (id, owner_id, cash, as_of) "
+                "VALUES (%s, %s, %s, %s)",
+                (str(uuid.uuid4()), str(owner), cash, datetime.now(timezone.utc)),
+            )
+        conn.commit()
+
+
+def _cash_of(owner: uuid.UUID) -> Decimal:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cash FROM portfolio_balance WHERE owner_id = %s", (str(owner),)
+            )
+            (cash,) = cur.fetchone()
+    return Decimal(str(cash))
+
+
+def _approve_buy(client, headers, *, amount: str, side: str = "buy", symbol: str = "VTI"):
+    decision_id = _recommend_decision_id(client, headers)
+    return client.post(
+        "/api/coach/approve",
+        json={
+            "decision_id": decision_id,
+            "order_intent": {"symbol": symbol, "side": side, "amount": amount},
+        },
+        headers=headers,
+    )
+
+
+def test_filled_buy_debits_cached_cash_and_blocks_the_next_overdraw(client):
+    """AC1 — a filled $500 buy debits cached cash $750→$250, so a SECOND $500 buy is
+    refused by the 10-9 cover gate (only ~$250 left) — no sequential-buy overdraw."""
+    email = _unique_email()
+    client.app.dependency_overrides[get_broker] = lambda: FakeBrokerAdapter()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        _seed_balance_sync(uid, "750.00")
+
+        # First buy fills (500 <= 750) and debits the executed cost ($500).
+        r1 = _approve_buy(client, headers, amount="500")
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["status"] == "filled"
+        assert _cash_of(uid) == Decimal("250.00")  # debited by the executed cost
+
+        # Second buy for $500 now exceeds the fresh $250 → refused (no margin).
+        r2 = _approve_buy(client, headers, amount="500")
+        assert r2.status_code == 422, r2.text
+        assert r2.json()["error"]["type"]  # app error envelope
+        assert "settled cash" in r2.text.lower()  # the 10-9 cover-gate refusal
+        assert _cash_of(uid) == Decimal("250.00")  # unchanged by the refused buy
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
+
+
+def test_sell_never_credits_cached_cash(client):
+    """A SELL raises cash only after T+1 settlement — Ballast never credits the cached
+    settled cash on a SELL (crediting unsettled proceeds would reopen the margin hole)."""
+    email = _unique_email()
+    client.app.dependency_overrides[get_broker] = lambda: FakeBrokerAdapter()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _insert_token_sync(uid, _live())
+        _seed_balance_sync(uid, "750.00")
+
+        r = _approve_buy(client, headers, amount="500", side="sell")
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "filled"
+        assert _cash_of(uid) == Decimal("750.00")  # SELL never credited
+    finally:
+        client.app.dependency_overrides.pop(get_broker, None)
+        _delete_user(email)
