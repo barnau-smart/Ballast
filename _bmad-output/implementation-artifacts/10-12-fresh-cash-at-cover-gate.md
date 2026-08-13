@@ -1,9 +1,9 @@
 # Story 10.12: Keep settled cash fresh across sequential buys
 
-Status: draft-awaiting-approval
+Status: ready-for-dev
 baseline_commit: 6f37e66
 
-<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): DRAFT — AWAITING MasterB
+<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB 2026-08-13 —
      approval of the design (Option 1 recommended). MONEY-PATH: the Story-10.9 cover gate reads
      a CACHED balance that isn't refreshed after a fill, so sequential in-session buys can
      overdraw on stale cash. Mandatory independent review before merge. -->
