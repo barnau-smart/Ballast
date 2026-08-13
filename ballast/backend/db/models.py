@@ -200,6 +200,12 @@ class PortfolioBalance(OwnedEntityMixin, Base):
         DateTime(timezone=True), nullable=False
     )
 
+    # The broker's account type, normalized upper (``"MARGIN"`` / ``"CASH"``) or
+    # NULL when unreported (Story 10.10). NULLABLE + purely informational — used only
+    # to gently warn a margin-account user; never feeds the cash figure or any money
+    # math. Written by the single writer alongside cash/as_of.
+    account_type: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # EXACTLY ONE balance row per user — the DB-level backstop for the single
     # writer's upsert (a concurrent double-insert raises IntegrityError instead
     # of silently duplicating and stranding a stale-cash row). Same discipline as

@@ -74,6 +74,10 @@ class PortfolioView:
     holdings: list[PortfolioCache]
     cash: Decimal
     as_of: datetime | None
+    # The broker's account type (``"MARGIN"``/``"CASH"``/``None``) from the balance
+    # row — informational only (Story 10.10). Additive with a default so every
+    # existing consumer of the fixed shape is unaffected; NEVER used in money math.
+    account_type: str | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -92,7 +96,10 @@ def _to_view(
     dedicated balance row (0 / None when the user has never imported)."""
     cash = balance.cash if balance is not None else Decimal("0")
     as_of = _normalize_as_of(balance.as_of) if balance is not None else None
-    return PortfolioView(holdings=rows, cash=cash, as_of=as_of)
+    account_type = balance.account_type if balance is not None else None
+    return PortfolioView(
+        holdings=rows, cash=cash, as_of=as_of, account_type=account_type
+    )
 
 
 async def _read_balance(
@@ -180,7 +187,11 @@ async def reconcile_portfolio(
                 PortfolioBalance.owner_id == scope.user_id,
                 PortfolioBalance.as_of < incoming_as_of,
             )
-            .values(cash=snap.cash, as_of=incoming_as_of),
+            .values(
+                cash=snap.cash,
+                as_of=incoming_as_of,
+                account_type=snap.account_type,
+            ),
         )
         if not won:
             # A stale/equal snapshot (or a concurrent newer reconcile already won):
@@ -205,7 +216,11 @@ async def reconcile_portfolio(
         # never a crash / duplicate row.
         balance_repo = ScopedRepository(PortfolioBalance, scope, session)
         try:
-            await balance_repo.add(cash=snap.cash, as_of=incoming_as_of)
+            await balance_repo.add(
+                cash=snap.cash,
+                as_of=incoming_as_of,
+                account_type=snap.account_type,
+            )
             await session.flush()
         except IntegrityError as exc:
             # Only the owner-uniqueness backstop (a concurrent first-insert that lost

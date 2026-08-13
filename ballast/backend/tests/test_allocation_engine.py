@@ -1012,3 +1012,50 @@ def test_plan_exposes_money_market_funding_split(client):
         ) == Decimal(body["investable_cash"])
     finally:
         _delete_user(email)
+
+
+def _set_account_type(uid: uuid.UUID, account_type: str) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE portfolio_balance SET account_type = %s WHERE owner_id = %s",
+                (account_type, str(uid)),
+            )
+        conn.commit()
+
+
+def test_plan_exposes_margin_account_type(client):
+    """Story 10.10 — GET /plan surfaces account_type so the deploy card can show the
+    calm margin note. Informational only; no money-math change."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "5000")
+        _set_account_type(uid, "MARGIN")
+        _seed_holding(uid, "VTI", "6000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(uid, reserve_amount="0", reserve_decided=True)
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["account_type"] == "MARGIN"
+        # Cash math unaffected — investable is the settled cash, not buying power.
+        assert body["investable_cash"] == "5000.00"
+    finally:
+        _delete_user(email)
+
+
+def test_plan_account_type_null_when_unset(client):
+    """No account-type on the balance row → null → no warning (fail-open)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "5000")  # account_type left NULL
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(uid, reserve_amount="0", reserve_decided=True)
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["account_type"] is None
+    finally:
+        _delete_user(email)

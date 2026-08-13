@@ -93,6 +93,9 @@ class PlanOut(BaseModel):
     from_money_market: str
     reserve: str
     money_market_symbols: list[str]
+    # Story 10.10 — the broker's account type ("MARGIN"/"CASH"/null); the frontend
+    # shows a gentle margin note when this is "MARGIN". Informational only.
+    account_type: str | None = None
     reason: str
     as_of: datetime.datetime | None = None
 
@@ -200,6 +203,7 @@ def _plan_out(plan: Plan) -> PlanOut:
         from_money_market=format_money(plan.from_money_market),
         reserve=format_money(plan.reserve),
         money_market_symbols=list(plan.money_market_symbols),
+        account_type=plan.account_type,
         reason=plan.reason,
         as_of=plan.as_of,
     )

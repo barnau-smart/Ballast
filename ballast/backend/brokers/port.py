@@ -74,6 +74,11 @@ class PortfolioSnapshot:
     as_of: datetime
     cash: Decimal
     holdings: list[Holding] = field(default_factory=list)
+    # The broker's account type, normalized upper (``"MARGIN"`` / ``"CASH"``) or
+    # ``None`` when the broker doesn't report it (Story 10.10). Informational only —
+    # used to gently warn a user their account is a margin account; NEVER changes the
+    # cash figure or any money math (the engine still anchors to ``cashBalance``).
+    account_type: str | None = None
 
 
 class OrderStatus(str, Enum):

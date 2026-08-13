@@ -127,6 +127,14 @@ COLUMN_STATEMENTS: list[tuple[str, str]] = [
         "ALTER TABLE decision_record "
         "ADD COLUMN IF NOT EXISTS cosigning_at TIMESTAMPTZ",
     ),
+    (
+        # Story 10.10: the broker's account type on the balance row (nullable,
+        # informational only — gently warns a margin-account user; never feeds the
+        # cash figure). Additive/idempotent; a carried-over row stays NULL → no warning.
+        "add_portfolio_balance_account_type",
+        "ALTER TABLE portfolio_balance "
+        "ADD COLUMN IF NOT EXISTS account_type VARCHAR",
+    ),
 ]
 
 # (2) Backfill NULL ``idempotency_key`` on carried-over ``proposed`` rows with a

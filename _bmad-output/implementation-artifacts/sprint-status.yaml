@@ -173,6 +173,10 @@ development_status:
   # margin). Pre-existing + cross-cutting; drafted via create-story, AWAITING MasterB
   # spec-approval (money-path hard gate) before dev.
   10-9-backend-cash-cover-safety: done
+  # 10-10 opened from the real-money-readiness Gate-1 follow-up (2026-08-13): detect a
+  # MARGIN Schwab account and gently warn (read-only/informational; no money-math change).
+  # Drafted via create-story; AWAITING MasterB approval of the two product knobs.
+  10-10-margin-account-detect-warn: done
   epic-10-retrospective: done
 
 action_items:
