@@ -1,10 +1,9 @@
 # Story 10.13: Align the deploy engine's margin-debit clamp with the liquidator
 
-Status: draft-awaiting-approval
+Status: done
 baseline_commit: f6c01b0
 
-<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): DRAFT — AWAITING MasterB
-     go-ahead. MONEY-PATH (analysis honesty). Low-severity + near-zero blast radius (only
+<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB 2026-08-13. MONEY-PATH (analysis honesty). Low-severity + near-zero blast radius (only
      margin-DEBIT accounts change; normal accounts identical). Independent review before merge. -->
 
 ## Story
@@ -108,3 +107,59 @@ _(to be filled by dev)_
 ### Completion Notes List
 
 ### File List
+
+## Dev Agent Record
+
+### Agent Model Used
+
+claude-opus-4-8[1m] (bmad-dev-story, in-chat)
+
+### Completion Notes List
+
+- **`allocation/engine.py:build_plan`** — the investable base is now the RAW `view.cash`
+  (`investable = view.cash + min(largest_parked, parked_total − reserve)`), so a negative
+  margin-debit balance correctly reduces investable (aligns with the raw-cash 9-3
+  `plan_liquidation`; the engine's `max(0, …)` clamp was the overstatement bug). The funding
+  split stays honest + never-negative: `settlement_cash = max(0, view.cash)`,
+  `from_money_market = investable − settlement_cash` (invariant `settlement + from_mm ==
+  investable` preserved). Stale "a negative margin balance is not investable" comment corrected.
+- **No change** to `cash/liquidation.py` (already raw/correct) or `coach/execution.py` (10-9 gate
+  reads the real cached cash independently).
+- **Normal accounts (`view.cash ≥ 0`) are byte-identical** (raw == the clamp) — the entire
+  existing suite is unaffected. Only margin-DEBIT accounts change. Backend 888 passed (885 + 3).
+- `followup_review_recommended: true` — money-path (analysis honesty); mandatory independent review.
+
+### File List
+
+- `ballast/backend/allocation/engine.py` — raw-`view.cash` investable base; honest never-negative split; comment fix.
+- `ballast/backend/tests/test_allocation_engine.py` — +3 margin-debit tests (investable reduced + honest split; coverable by liquidation; deep debit → no_cash).
+
+## Change Log
+
+- 2026-08-13 — Story 10.13 implemented: the deploy engine now uses the RAW settlement balance
+  as the investable base (aligning with the raw-cash 9-3 liquidation), so a margin-DEBIT account's
+  investable is reduced by the debt and never over-promises a deploy the liquidation can't cover.
+  The funding split stays honest + never-negative (`settlement_cash = max(0, view.cash)`). Normal
+  accounts unchanged (byte-identical). +3 tests, backend 888 passed. Money-path → awaiting
+  mandatory independent review before merge.
+
+## Independent Review (2026-08-13) — 1 must-fix applied → MERGE-READY
+
+Two fresh-context reviewers (Blind Hunter + Edge/Acceptance). Both initially **NOT MERGE-READY**
+on the SAME real bug, then converged on the same two-line fix (applied).
+
+- [x] [Review][HIGH] The new `from_money_market = investable − settlement_cash` could go NEGATIVE
+  (and `settlement_cash` exceed `investable`) on an orthogonal path: a NORMAL positive-cash account
+  whose reserve EXCEEDS its parked value (`liquidatable_parked < 0`). My "byte-identical for
+  cash ≥ 0" claim was false there; the old `... if > 0 else 0` clamp had protected it. **FIXED:**
+  `from_money_market = max(_ZERO, investable − settlement_cash); settlement_cash = investable −
+  from_money_market` — both stay ≥ 0, the sum invariant holds on EVERY path, margin-debit and
+  normal-MM-deploy cases unchanged. +regression test (`test_reserve_exceeds_parked_normal_account_split_stays_nonnegative`).
+- [Review][MED][defer] On a margin-debit deploy the "$X from selling SWVXX" copy states the NET
+  deployable while the actual liquidation sale is GROSS (net + the debit). Not invented, money-safe
+  (10-9/10-10), margin-debit-only — logged to `deferred-work.md` as a narration honesty-nuance.
+
+Verified clean by both: margin-debit investable is correct + coverable by the (unchanged) raw-cash
+liquidation (real end-to-end `/liquidation-plan` test); normal accounts byte-identical; `no_cash`
+boundary + non-finite guard; reserve-out-of-total not double-counted; 10-9 gate + 10-12 debit
+unaffected. Backend 889 passed.

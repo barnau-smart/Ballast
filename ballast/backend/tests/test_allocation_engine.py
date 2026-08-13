@@ -1059,3 +1059,115 @@ def test_plan_account_type_null_when_unset(client):
         assert body["account_type"] is None
     finally:
         _delete_user(email)
+
+
+# --- Story 10.13: margin-debit clamp alignment (negative view.cash) -----------
+
+
+def test_margin_debit_reduces_investable_and_split_is_honest(client):
+    """A margin-DEBIT balance (view.cash < 0) reduces investable by the debt (aligns
+    with the raw-cash 9-3 liquidation), and the split stays honest + never-negative."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "-5000")  # owes $5k margin
+        _seed_holding(uid, "SWVXX", "50000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="10000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        # -5000 + min(50000, 50000-10000) = -5000 + 40000 = 35000 (NOT 40000).
+        assert body["investable_cash"] == "35000.00"
+        assert body["settlement_cash"] == "0.00"        # clamped ≥ 0 (never negative)
+        assert body["from_money_market"] == "35000.00"  # all nets from the money-market
+        assert body["money_market_symbols"] == ["SWVXX"]
+        # Split invariant holds.
+        assert Decimal(body["settlement_cash"]) + Decimal(
+            body["from_money_market"]
+        ) == Decimal(body["investable_cash"])
+    finally:
+        _delete_user(email)
+
+
+def test_margin_debit_deploy_is_coverable_by_liquidation(client):
+    """The reduced investable is fully coverable by the 9-3 liquidation — the plan no
+    longer over-promises what the (raw-cash) liquidation can free."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "-5000")
+        _seed_holding(uid, "SWVXX", "50000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="10000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        plan = client.get("/api/allocation/plan", headers=headers).json()
+        primary = plan["primary_order"]
+        assert primary is not None
+        liq = client.post(
+            "/api/cash/liquidation-plan",
+            headers=headers,
+            json={"symbol": primary["symbol"], "amount": primary["amount"]},
+        ).json()
+        assert liq["needs_liquidation"] is True
+        assert liq["coverable"] is True  # reduced investable is genuinely coverable
+        assert liq["sell_symbol"] == "SWVXX"
+    finally:
+        _delete_user(email)
+
+
+def test_deep_margin_debit_is_no_cash(client):
+    """A debit large enough that investable ≤ 0 → no_cash (never a negative deploy)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "-45000")  # owes more than the deployable parked headroom
+        _seed_holding(uid, "SWVXX", "50000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="10000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        # -45000 + min(50000, 40000) = -5000 ≤ 0 → no_cash.
+        assert body["status"] == "no_cash"
+        assert body["investable_cash"] == "0"
+    finally:
+        _delete_user(email)
+
+
+def test_reserve_exceeds_parked_normal_account_split_stays_nonnegative(client):
+    """Regression (10-13 review): a NORMAL positive-cash account whose reserve EXCEEDS its
+    parked value → liquidatable_parked < 0 (excess reserve drawn from settlement). The
+    split must stay non-negative: from_money_market == 0, settlement_cash == investable
+    (never a negative from_money_market or a settlement_cash > investable)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "20000")           # positive settled cash
+        _seed_holding(uid, "SWVXX", "5000")   # parked $5k
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="8000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        # 20000 + min(5000, 5000-8000=-3000) = 20000 - 3000 = 17000.
+        assert body["investable_cash"] == "17000.00"
+        assert body["from_money_market"] == "0"        # nothing nets from the money-market
+        assert body["settlement_cash"] == "17000.00"   # all from settled cash; ≤ investable
+        assert body["money_market_symbols"] == []
+        assert Decimal(body["settlement_cash"]) + Decimal(
+            body["from_money_market"]
+        ) == Decimal(body["investable_cash"])
+    finally:
+        _delete_user(email)
