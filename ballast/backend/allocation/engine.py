@@ -200,8 +200,8 @@ def classify_holdings(holdings, parked_set: frozenset[str] = frozenset()) -> Cla
 
 def _deployable_parked(
     holdings, parked_set: frozenset[str]
-) -> tuple[Decimal, Decimal]:
-    """Return ``(total, largest_single)`` of the DEPLOYABLE parked cash-equivalents.
+) -> tuple[Decimal, Decimal, str | None]:
+    """Return ``(total, largest_value, largest_symbol)`` of the DEPLOYABLE parked cash.
 
     A holding is deployable parked cash iff its symbol is declared parked AND it is
     unclassified (``asset_class_for`` is ``None``) — i.e. a genuine money-market-style
@@ -209,14 +209,19 @@ def _deployable_parked(
     never double-counted as cash). Mirrors the liquidation filter: an unpriced /
     non-finite / ≤0 ``market_value`` is skipped.
 
-    ``total`` = Σ of all such holdings; ``largest_single`` = the biggest ONE of them.
-    The Story-9.3 just-in-time liquidation sells only the SINGLE largest parked fund,
-    so ``largest_single`` is the cap on what one liquidation can free — the caller uses
-    it so the deploy plan never promises more cash than a single settle-then-buy can
-    actually cover (the Story-10.8 review's multi-fund over-proposal fix).
+    ``total`` = Σ of all such holdings; ``largest_value`` = the biggest ONE of them and
+    ``largest_symbol`` = ITS symbol (``None`` when nothing qualifies). The Story-9.3
+    just-in-time liquidation sells ONLY the single largest parked fund, so
+    ``largest_value`` caps what one liquidation can free (the deploy plan never promises
+    more than a single settle-then-buy can cover), and ``largest_symbol`` is the ONE
+    fund the narration/UI may honestly name as being sold — never the whole parked list
+    (Story-10.8 review: naming every parked fund when only one is sold is a
+    never-invent-a-fact violation). Ties break on the LOWEST symbol, matching the 9-3
+    liquidation's ``_largest_parked_holding`` so the named fund is the one actually sold.
     """
     total = _ZERO
     largest = _ZERO
+    largest_symbol: str | None = None
     for h in holdings or []:
         symbol = (h.symbol or "").strip().upper()
         if symbol not in parked_set or asset_class_for(symbol) is not None:
@@ -225,27 +230,10 @@ def _deployable_parked(
         if mv is None or not mv.is_finite() or mv <= _ZERO:
             continue
         total += mv
-        if mv > largest:
+        if mv > largest or (mv == largest and (largest_symbol is None or symbol < largest_symbol)):
             largest = mv
-    return total, largest
-
-
-def _deployable_parked_symbols(holdings, parked_set: frozenset[str]) -> list[str]:
-    """Return the de-duplicated, sorted symbols of the DEPLOYABLE parked funds present.
-
-    The same filter as :func:`_deployable_parked` (declared parked AND unclassified AND
-    priced), returned as a stable symbol list so the narration/UI can honestly name the
-    money-market fund(s) the deploy will sell (Story 10.8 AC5)."""
-    found: set[str] = set()
-    for h in holdings or []:
-        symbol = (h.symbol or "").strip().upper()
-        if symbol not in parked_set or asset_class_for(symbol) is not None:
-            continue
-        mv = h.market_value
-        if mv is None or not mv.is_finite() or mv <= _ZERO:
-            continue
-        found.add(symbol)
-    return sorted(found)
+            largest_symbol = symbol
+    return total, largest, largest_symbol
 
 
 def plan_deployment(
@@ -475,7 +463,9 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     # and — as of Story 10.9 — ``execute_approved_order`` REFUSES any buy exceeding real
     # settled cash, so a buy ALWAYS places against real cash, never margin.
     ready_to_trade = max(_ZERO, view.cash)
-    parked_total, largest_parked = _deployable_parked(view.holdings, parked_set)
+    parked_total, largest_parked, largest_parked_symbol = _deployable_parked(
+        view.holdings, parked_set
+    )
     if not reserve.is_finite() or reserve < _ZERO:
         reserve = _ZERO
     parked_after_reserve = parked_total - reserve
@@ -506,7 +496,13 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     # cash, or when the reserve fully absorbs parked); the remainder is settled cash.
     from_money_market = liquidatable_parked if liquidatable_parked > _ZERO else _ZERO
     settlement_cash = investable - from_money_market
-    money_market_symbols = _deployable_parked_symbols(view.holdings, parked_set)
+    # Name ONLY the single fund the 9-3 liquidation actually sells (the largest) —
+    # never the whole parked list, which would misstate what's being sold.
+    money_market_symbols = (
+        [largest_parked_symbol]
+        if from_money_market > _ZERO and largest_parked_symbol is not None
+        else []
+    )
 
     # (4)/(5) Deterministic cash-only rebalance.
     deployment = plan_deployment(
@@ -545,7 +541,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         settlement_cash=settlement_cash,
         from_money_market=from_money_market,
         reserve=reserve,
-        money_market_symbols=money_market_symbols if from_money_market > _ZERO else [],
+        money_market_symbols=money_market_symbols,
         reason="",
         as_of=as_of,
     )

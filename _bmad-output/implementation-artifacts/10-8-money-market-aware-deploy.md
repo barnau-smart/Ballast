@@ -129,3 +129,19 @@ _All 3 layers converged on the load-bearing gap: my "Task 2 — no new Phase-2 c
 - [x] [Review][MED] `parked_market_value` sums `h.market_value` with NO None/finite/≤0 guard. **FIXED 2026-08-13:** guard added to `parked_market_value` (all callers) AND `_deployable_parked` mirrors the liquidation filter. (NB: `market_value` is NOT NULL at the DB, so a NULL is unreachable — the guard is defense-in-depth and also skips a reachable ≤0 row; +test.)
 - [x] [Review][MED] Negative-settlement clamp asymmetry. **ADDRESSED 2026-08-13:** engine clamps `max(0, view.cash)` and takes reserve out of TOTAL via `min(largest_parked, parked_total − reserve)` (excess reserve correctly draws from settlement). Full alignment with `plan_liquidation`'s raw-`view.cash` on a margin-DEBIT account is deferred (covered by the 10-9 execution backstop + the margin-account detect-warn follow-up).
 - [x] [Review][MED] parked/unclassified double-report: SWVXX shows in BOTH the unclassified sleeve AND investable. **FIXED 2026-08-13:** `classify_holdings` excludes parked+unclassified symbols from the sleeve (they're cash). +test (`SWVXX` not in `unclassified.symbols`, sleeve value 0).
+
+## Independent Review — full rework (2026-08-13)
+
+3-layer parallel adversarial pass in fresh contexts (Blind Hunter + Edge Case Hunter +
+Acceptance Auditor) over the complete rework diff. Blind Hunter + Acceptance Auditor:
+MERGE-READY, all 6 findings closed, money-math + split identity + never-invent gate verified.
+**Edge Case Hunter caught 1 HIGH the other two missed** (orthogonal method): in the
+MULTI-fund case `money_market_symbols` named EVERY parked fund, but 9-3 sells only the single
+largest and `from_money_market` is capped to it — so the narration/x-ray could name a fund
+that isn't sold (a qualitative never-invent-a-fact violation the number gate can't catch).
+
+**FIXED 2026-08-13:** `_deployable_parked` now returns the single `largest_symbol` (deterministic
+tie-break on lowest symbol, matching the 9-3 `_largest_parked_holding`); `build_plan` sets
+`money_market_symbols = [largest_symbol]` — only the ONE fund actually sold is ever named.
++tests (single-fund named, tie-break lowest-symbol, multi-fund names only the largest via `/plan`).
+Backend 866 + frontend 199 green. Rework COMPLETE and merge-ready.

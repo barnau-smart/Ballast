@@ -822,24 +822,39 @@ def test_deployable_parked_excludes_classified_symbols():
         _holding("SWVXX", "5000"),  # unclassified money-market → deployable
         _holding("VTI", "6000"),    # classified (US) → NOT deployable cash
     ]
-    total, largest = _deployable_parked(holdings, frozenset({"SWVXX", "VTI"}))
+    total, largest, largest_symbol = _deployable_parked(
+        holdings, frozenset({"SWVXX", "VTI"})
+    )
     assert total == Decimal("5000")
     assert largest == Decimal("5000")
+    assert largest_symbol == "SWVXX"
 
 
 def test_deployable_parked_single_fund_cap_returns_largest():
-    """``largest_single`` is the biggest ONE parked fund — the cap on what one 9-3
-    liquidation can free."""
+    """``largest_value``/``largest_symbol`` is the biggest ONE parked fund — the cap on
+    what one 9-3 liquidation can free AND the only fund the narration may name."""
     holdings = [
         _holding("SWVXX", "5000"),
         _holding("VMFXX", "4000"),
         _holding("SNVXX", "1000"),
     ]
-    total, largest = _deployable_parked(
+    total, largest, largest_symbol = _deployable_parked(
         holdings, frozenset({"SWVXX", "VMFXX", "SNVXX"})
     )
     assert total == Decimal("10000")
     assert largest == Decimal("5000")
+    assert largest_symbol == "SWVXX"  # the single fund actually sold
+
+
+def test_deployable_parked_tie_breaks_on_lowest_symbol():
+    """On an exact market_value tie, the LOWEST symbol wins — matching the 9-3
+    liquidation's choice so the named fund is the one actually sold."""
+    holdings = [_holding("SWVXX", "5000"), _holding("SNVXX", "5000")]
+    _total, largest, largest_symbol = _deployable_parked(
+        holdings, frozenset({"SWVXX", "SNVXX"})
+    )
+    assert largest == Decimal("5000")
+    assert largest_symbol == "SNVXX"  # lowest symbol on a tie
 
 
 def test_deployable_parked_skips_unpriced_holding():
@@ -849,11 +864,12 @@ def test_deployable_parked_skips_unpriced_holding():
         SimpleNamespace(symbol="VMFXX", market_value=None),
         SimpleNamespace(symbol="SNVXX", market_value=Decimal("0")),
     ]
-    total, largest = _deployable_parked(
+    total, largest, largest_symbol = _deployable_parked(
         holdings, frozenset({"SWVXX", "VMFXX", "SNVXX"})
     )
     assert total == Decimal("5000")
     assert largest == Decimal("5000")
+    assert largest_symbol == "SWVXX"
 
 
 def test_classify_routes_parked_unclassified_out_of_sleeve():
@@ -917,6 +933,10 @@ def test_multi_fund_parked_capped_to_single_largest(client):
         body = client.get("/api/allocation/plan", headers=headers).json()
         # settlement 1000 + min(largest 5000, total 9000 − reserve 0) = 1000 + 5000.
         assert body["investable_cash"] == "6000.00"  # NOT 10,000 (uncapped)
+        assert body["from_money_market"] == "5000.00"
+        # Names ONLY the single largest fund actually sold — never the whole parked
+        # list (VMFXX is not sold, so it must not be named).
+        assert body["money_market_symbols"] == ["SWVXX"]
     finally:
         _delete_user(email)
 
