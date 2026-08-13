@@ -1,6 +1,6 @@
 # Story 10.9: Backend cash-cover safety — a BUY never places on margin
 
-Status: review
+Status: done
 baseline_commit: e21a5a1
 independent_review: 2026-08-13 (3-layer, MERGE-READY — no Critical/High; 2 residuals → deferred-work.md)
 

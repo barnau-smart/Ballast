@@ -172,7 +172,7 @@ development_status:
   # execution safeguard (10-8 AC3) — a BUY never places beyond real settled cash (no
   # margin). Pre-existing + cross-cutting; drafted via create-story, AWAITING MasterB
   # spec-approval (money-path hard gate) before dev.
-  10-9-backend-cash-cover-safety: review
+  10-9-backend-cash-cover-safety: done
   epic-10-retrospective: done
 
 action_items:
