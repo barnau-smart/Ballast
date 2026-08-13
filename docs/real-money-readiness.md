@@ -4,41 +4,34 @@ The money PATH is proven (Epic 7 placed a real SCHB buy end-to-end). But the Epi
 9/10 deploy / cost-switch / liquidation logic has only ever run against the FAKE
 broker. Close the gates below before a real-money deploy exercise.
 
-## Gate 1 (CRITICAL) — settled / deployable cash
+## Gate 1 — deployable cash ✅ RESOLVED (keep `cashBalance`)
 
-**Finding.** The deploy engine's `ready_to_trade` is Schwab
-`securitiesAccount.currentBalances.cashBalance` (`ballast/backend/brokers/schwab_adapter/adapter.py:272`),
-and the engine treats it as fully spendable. But **`cashBalance` is the TOTAL cash
-balance** — on a cash account it can include **unsettled** proceeds (a recent sale
-that hasn't cleared, T+1). Deploying against unsettled cash risks a good-faith /
-settlement rejection. Epic 9's "genuinely spendable" premise wanted *deployable*
-cash. (This is Epic 9 action item #2a.)
+**RESOLVED 2026-08-13 — keep `cashBalance`.** A live diagnostic against the real
+account (a **margin** account) returned:
 
-**Recommendation (grounded in Schwab Trader API semantics).** For a cash account
-the field that reflects what is actually available to place new trades — net of
-unsettled funds and holds — is `currentBalances.cashAvailableForTrading`, not
-`cashBalance`. Likely fix: source cash from `cashAvailableForTrading` (or
-`min(cashBalance, cashAvailableForTrading)` to be conservative). **Caveat:** on a
-MARGIN account `cashAvailableForTrading` can include margin buying power (which would
-OVER-state settled cash). Ballast targets cash accounts, but we confirm against the
-real payload before changing it.
+- `cashBalance` = **$12,182.82** (the field the deploy engine uses)
+- `cashAvailableForTrading` = **absent** — not a field Schwab returns for this account
+- `availableFunds` / `availableFundsNonMarginableTrade` = **$45,302.54** — these include
+  **margin buying power**, far exceeding cash.
 
-**Verify against YOUR account (needs your live Schwab connection):**
-1. Run in real-broker mode: `BALLAST_REAL_BROKER=1 ./scripts/dev.sh`. ⚠️ Real path —
-   but a portfolio READ places no orders; connecting + reading is safe.
-2. Connect Schwab (OAuth). The app reconciles your portfolio read-only.
-3. Capture your account's `currentBalances` fields — specifically the values of:
-   `cashBalance`, `cashAvailableForTrading`, `availableFunds`,
-   `availableFundsNonMarginableTrade`.
-4. Share those 4 numbers. If `cashBalance` exceeds the available/settled figure, I
-   switch the adapter to the correct field (a ~1-line change) + a regression test.
+**Conclusion: `cashBalance` is correct — no adapter change.** It is the conservative
+*cash* anchor. Every other candidate Schwab exposes is a *buying-power* figure
+(margin / SMA) — sourcing cash from one would let the deploy coach suggest buying on
+**borrowed money**, contrary to Ballast's no-leverage ethos. There is no settled-cash
+field to switch to, and the larger ones are the wrong direction. The earlier worry
+("`cashBalance` overstates via unsettled") is second-order on a margin account
+(margin covers unsettled — no good-faith violation). The one-time diagnostic log has
+been removed; the adapter comment records the rationale.
 
-*Mechanism for step 3 (NOW IN PLACE):* the adapter logs a
-`schwab_currentBalances_diagnostic` line on every real portfolio read (figures only —
-no tokens/PII), listing the returned field names + `cashBalance` /
-`cashAvailableForTrading` / `availableFunds` / `availableFundsNonMarginableTrade`. So:
-connect once in real-broker mode, find that line in the app log, and paste it. (I
-remove the diagnostic once we confirm the correct field and switch the adapter.)
+**Two residual notes (not blocking):**
+- **The real account is a MARGIN account.** The engine is already margin-safe (anchors
+  on `cashBalance`, never buying power; clamps negative cash to 0). But Ballast is
+  designed for conservative cash-account investors — a product decision worth making:
+  *detect + gently warn* about a margin account rather than silently treat its cash as
+  deployable. (New Epic 10 follow-up.)
+- **Cash-account generalization:** for a future *cash*-account user, `cashBalance` could
+  include unsettled funds and Schwab may expose no cleaner field — revisit the
+  settled-cash question if/when a cash-account user is onboarded.
 
 ## Gate 2 — tune the disclosed placeholder
 
