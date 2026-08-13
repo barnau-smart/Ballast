@@ -1,7 +1,8 @@
 # Story 10.6: Unit-tagged (context-aware) never-invent number gate
 
-Status: review
+Status: done
 baseline_commit: 1cb73fa
+followup_review_recommended: false  # human-requested independent review done 2026-08-13; 1 High fixed (money-axis laundering)
 
 <!-- HARD GATE (docs/dev-loop-policy.md, adopted 2026-08-12): governing spec APPROVED by
      MasterB 2026-08-12. Bare-number strictness settled: option (a) STRICT — a bare token
@@ -103,4 +104,5 @@ claude-opus-4-8[1m] (dev-story)
 
 ## Change Log
 
-- 2026-08-13 — Story 10.6 implemented: unit-tagged (context-aware) never-invent number gate. `check_no_invented_numbers` now matches on `(value, unit)`; closes the value-only laundering where a fabricated bare count / `$` figure equal to a real weight-percent passed. +4 tests, backend 835 passed. Ready for independent review (money-path/guardrail → mandatory review before merge).
+- 2026-08-13 — Story 10.6 implemented: unit-tagged (context-aware) never-invent number gate. `check_no_invented_numbers` now matches on `(value, unit)`; closes the value-only laundering where a fabricated bare count / `$` figure equal to a real weight-percent passed. +4 tests, backend 835 passed.
+- 2026-08-13 — Independent review (3-layer) — 1 HIGH fixed. The first pass admitted amounts as BOTH MONEY and BARE (so the `format_money` fallback would self-cite), which REOPENED the laundering on the money axis: a fabricated bare count equal to a real dollar amount (e.g. "3000 companies" when the plan deploys $3,000) passed. Fix (both hunters' recommendation): amounts are now MONEY-only, and the deterministic fallback + LLM request + evidence statements cite amounts WITH a `$` (`format_money` → `${format_money(...)}`). Bare integers ≥1 now match only fraction weights (0–1), fully closing both laundering axes. The `/plan` wire serialization (`"3000.00"`, no `$`) is untouched. +1 regression test; backend 836 + frontend 196 green.

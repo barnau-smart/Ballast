@@ -440,14 +440,14 @@ def build_review_facts(finding: ReviewFinding) -> tuple[EvidenceRecord, ...]:
             f"Your {finding.symbol} charges a {format_money(finding.expense_ratio)}% "
             f"yearly fee versus {format_money(finding.cheaper_expense_ratio)}% for the "
             f"broad {finding.switch_to} index fund — selling "
-            f"{format_money(finding.amount)} of {finding.symbol} lets you switch to the "
+            f"${format_money(finding.amount)} of {finding.symbol} lets you switch to the "
             "cheaper same-class fund."
         )
     else:
         weight_pct = (finding.weight * _HUNDRED).quantize(_CENT)
         statement = (
             f"Your {finding.symbol} is {format_money(weight_pct)}% of your portfolio — "
-            f"trimming {format_money(finding.amount)} brings it back toward the "
+            f"trimming ${format_money(finding.amount)} brings it back toward the "
             f"{format_money(CONCENTRATION_CEILING * _HUNDRED)}% single-position ceiling "
             "and into your diversified index core."
         )
@@ -463,13 +463,11 @@ def build_review_facts(finding: ReviewFinding) -> tuple[EvidenceRecord, ...]:
 
 
 def _add_money(allowed: set[tuple[Decimal, str]], value: Decimal) -> None:
-    """Admit a money amount as BOTH a ``$``-prefixed (:data:`UNIT_MONEY`) and a
-    bare-digits (:data:`UNIT_BARE`) citation (pure, in-place) — the fallback renders
-    amounts via ``format_money`` (no ``$``) while the LLM is told to write ``$``.
-    Mirrors :func:`allocation.narrate._add_money`; the bare form does not reopen the
-    weight-percent laundering (percents are tagged :data:`UNIT_PERCENT`, never bare)."""
+    """Admit a money amount as :data:`UNIT_MONEY` ONLY (pure, in-place). Mirrors
+    :func:`allocation.narrate._add_money`: amounts are cited WITH a ``$`` in both the
+    fallback and the LLM narration, so a bare integer equal to a real amount is not
+    admitted — closing the money-magnitude laundering axis (Story 10.6)."""
     allowed.add((value, UNIT_MONEY))
-    allowed.add((value, UNIT_BARE))
 
 
 def _add_weight_forms(allowed: set[tuple[Decimal, str]], weight: Decimal) -> None:
@@ -548,7 +546,7 @@ def _fallback_review_narration(
             "compounds against you over decades. The principle here is to minimize "
             "fund fees: paying less for the same broad exposure keeps more of your "
             "money working for you. This is a two-step switch: step one is to sell "
-            f"{format_money(finding.amount)} of {finding.symbol} now; step two, the "
+            f"${format_money(finding.amount)} of {finding.symbol} now; step two, the "
             f"follow-up buy of the cheaper {finding.switch_to}, is queued and linked "
             "to this sell so it is ready for you to review the moment the cash "
             "settles — you are never left stranded in cash if you step away. It is a "
@@ -570,7 +568,7 @@ def _fallback_review_narration(
             "on one company. The principle here is diversification: a single stock is "
             "speculative, while your broad index core spreads the same money across "
             "the whole market. This plan trims "
-            f"{format_money(finding.amount)} of {finding.symbol} back toward that "
+            f"${format_money(finding.amount)} of {finding.symbol} back toward that "
             "ceiling and into the diversified core — de-speculating, not chasing a "
             "winner. The tradeoff is real: you cap the upside of this one name, but "
             "you cut the single-name risk of holding so much in it."
@@ -640,8 +638,8 @@ def compose_review_request(
         "the why/tradeoff/principle, do not change or invent any number.",
         f"- finding kind: {finding.kind}",
         f"- holding to sell: {finding.symbol}",
-        f"- sell amount: {format_money(finding.amount)}",
-        f"- holding market value: {format_money(finding.holding_value)}",
+        f"- sell amount: ${format_money(finding.amount)}",
+        f"- holding market value: ${format_money(finding.holding_value)}",
         f"- single-position ceiling: "
         f"{format_money(CONCENTRATION_CEILING * _HUNDRED)}%",
     ]

@@ -266,7 +266,7 @@ def build_narration_facts(plan: Plan) -> tuple[EvidenceRecord, ...]:
                 kind=EvidenceKind.STRATEGY,
                 statement=(
                     f"You're underweight {label} versus your target mix — buying "
-                    f"{format_money(item.amount)} of {item.symbol} moves you toward "
+                    f"${format_money(item.amount)} of {item.symbol} moves you toward "
                     "that balance."
                 ),
                 stats=stats,
@@ -290,7 +290,7 @@ def build_narration_facts(plan: Plan) -> tuple[EvidenceRecord, ...]:
             id=make_id(EvidenceKind.STRATEGY, "PORTFOLIO", as_of, summary_stats),
             kind=EvidenceKind.STRATEGY,
             statement=(
-                f"You have {format_money(plan.investable_cash)} of investable cash; "
+                f"You have ${format_money(plan.investable_cash)} of investable cash; "
                 "this plan puts the underweight classes back toward your chosen "
                 "target mix and leaves any leftover cash undeployed."
             ),
@@ -303,14 +303,12 @@ def build_narration_facts(plan: Plan) -> tuple[EvidenceRecord, ...]:
 
 
 def _add_money(allowed: set[tuple[Decimal, str]], value: Decimal) -> None:
-    """Admit a money amount as BOTH a ``$``-prefixed citation (:data:`UNIT_MONEY`)
-    and a bare-digits citation (:data:`UNIT_BARE`) (pure, in-place). The deterministic
-    fallback renders amounts via ``format_money`` (no ``$``: ``"3000.00"``) while the
-    LLM is instructed to write ``"$3,000.00"`` — both are legitimate citations of the
-    same engine amount. Admitting the bare form does NOT reopen the weight-percent
-    laundering (weight percents are tagged :data:`UNIT_PERCENT`, never bare)."""
+    """Admit a money amount as :data:`UNIT_MONEY` ONLY (pure, in-place). Amounts are
+    cited WITH a ``$`` in BOTH the deterministic fallback and the LLM narration, so a
+    bare integer that merely equals a real dollar amount is NOT admitted — this closes
+    the money-magnitude laundering axis (a fabricated "3000 companies" when the plan
+    deploys $3,000 no longer passes), the mirror of the percent axis (Story 10.6)."""
     allowed.add((value, UNIT_MONEY))
-    allowed.add((value, UNIT_BARE))
 
 
 def _add_weight_forms(allowed: set[tuple[Decimal, str]], weight: Decimal) -> None:
@@ -465,7 +463,7 @@ def _fallback_narration(
         classes_phrase = labels[0] if labels else "your underweight classes"
 
     buys_phrase = ", ".join(
-        f"{format_money(item.amount)} of {item.symbol}" for item in plan.action_items
+        f"${format_money(item.amount)} of {item.symbol}" for item in plan.action_items
     )
 
     action_label = "Put your idle cash to work toward your target mix"
@@ -476,7 +474,7 @@ def _fallback_narration(
         "diversification and rebalancing toward your target, not a bet on any hot "
         "pick or a guess about where the market is headed. The tradeoff: it "
         "doesn't try to time the market, and any cash beyond what closes the gaps "
-        f"is left undeployed ({format_money(plan.undeployed_cash)}) rather than "
+        f"is left undeployed (${format_money(plan.undeployed_cash)}) rather than "
         "stretched past your target."
     )
     uncertainties = (
@@ -510,7 +508,7 @@ def compose_narration_request(
     for item in plan.action_items:
         label = ASSET_CLASS_LABEL.get(item.asset_class, item.asset_class)
         item_lines.append(
-            f"- buy {format_money(item.amount)} of {item.symbol} ({label})"
+            f"- buy ${format_money(item.amount)} of {item.symbol} ({label})"
         )
 
     weight_lines = []
@@ -538,8 +536,8 @@ def compose_narration_request(
         + "\n".join(item_lines)
         + "\nCurrent vs target mix:\n"
         + "\n".join(weight_lines)
-        + f"\nInvestable cash: {format_money(plan.investable_cash)}\n"
-        f"Undeployed (leftover) cash: {format_money(plan.undeployed_cash)}\n"
+        + f"\nInvestable cash: ${format_money(plan.investable_cash)}\n"
+        f"Undeployed (leftover) cash: ${format_money(plan.undeployed_cash)}\n"
         "Cite ONLY these evidence IDs, exactly as given:\n"
         + evidence_json
     )

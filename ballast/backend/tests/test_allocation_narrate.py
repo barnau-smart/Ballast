@@ -406,6 +406,17 @@ def test_check_no_invented_numbers_accepts_percent_cited_with_its_unit():
     check_no_invented_numbers("Your stock target is 30%.", allowed)
 
 
+def test_check_no_invented_numbers_rejects_bare_count_matching_a_dollar_amount():
+    """The MONEY axis of the fix: a bare count equal to a real dollar AMOUNT (not just
+    a weight-percent) is also rejected — amounts are MONEY-only, so "3000 companies"
+    when the plan deploys $3,000 into VXUS degrades to the honest template. The `$`
+    citation of the same amount still passes."""
+    allowed = allowed_facts(_growth_deploy_plan())  # deploys $3,000.00 into VXUS
+    check_no_invented_numbers("This buys $3,000.00 of a broad index fund.", allowed)
+    with pytest.raises(NarrationValidationError):
+        check_no_invented_numbers("A basket of 3000 companies.", allowed)
+
+
 def test_narrate_plan_gates_a_forecast_hidden_in_an_uncertainty():
     """An LLM-authored uncertainty is surfaced to the user, so a FORECAST hiding in
     it must still degrade to the deterministic template (the uncertainties field is
