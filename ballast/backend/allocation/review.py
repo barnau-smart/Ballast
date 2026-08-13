@@ -51,6 +51,9 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from allocation.narrate import (
+    UNIT_BARE,
+    UNIT_MONEY,
+    UNIT_PERCENT,
     AllocationNarration,
     check_no_forecast,
     check_no_invented_numbers,
@@ -459,35 +462,46 @@ def build_review_facts(finding: ReviewFinding) -> tuple[EvidenceRecord, ...]:
     return (record,)
 
 
-def _add_weight_forms(allowed: set[Decimal], weight: Decimal) -> None:
-    """Admit a weight in BOTH the fraction (``0.55``) and 0–100 percent (``55``)
-    forms the narration might use (pure, in-place). The percent form is admitted at
-    both full precision and cent-quantized so a rounded render (``55.00``) is
-    citable too."""
-    allowed.add(weight)
+def _add_money(allowed: set[tuple[Decimal, str]], value: Decimal) -> None:
+    """Admit a money amount as BOTH a ``$``-prefixed (:data:`UNIT_MONEY`) and a
+    bare-digits (:data:`UNIT_BARE`) citation (pure, in-place) — the fallback renders
+    amounts via ``format_money`` (no ``$``) while the LLM is told to write ``$``.
+    Mirrors :func:`allocation.narrate._add_money`; the bare form does not reopen the
+    weight-percent laundering (percents are tagged :data:`UNIT_PERCENT`, never bare)."""
+    allowed.add((value, UNIT_MONEY))
+    allowed.add((value, UNIT_BARE))
+
+
+def _add_weight_forms(allowed: set[tuple[Decimal, str]], weight: Decimal) -> None:
+    """Admit a weight as the fraction (``0.55`` → :data:`UNIT_BARE`) AND the 0–100
+    percent (``55`` → :data:`UNIT_PERCENT`) forms the narration might use (pure,
+    in-place). The percent form is admitted at both full precision and cent-quantized
+    so a rounded render (``55.00%``) is citable too (Story 10.6 unit-tagged)."""
+    allowed.add((weight, UNIT_BARE))
     pct = weight * _HUNDRED
-    allowed.add(pct)
-    allowed.add(pct.quantize(_CENT))
+    allowed.add((pct, UNIT_PERCENT))
+    allowed.add((pct.quantize(_CENT), UNIT_PERCENT))
 
 
-def allowed_review_facts(finding: ReviewFinding) -> frozenset[Decimal]:
+def allowed_review_facts(finding: ReviewFinding) -> frozenset[tuple[Decimal, str]]:
     """The engine-provided numeric allow-set for :func:`check_no_invented_numbers`.
 
-    Every number the narration may legitimately state (compared by ``Decimal``
-    value): the SELL amount, the holding market value, the holding weight (fraction
-    AND percent), the concentration ceiling (fraction AND percent), and — for a cost
-    switch — BOTH expense ratios (as percents). The fee values come ONLY from the
-    expense-ratio table; a wrong-but-plausible ER the LLM invents is not admitted, so
-    the never-invent gate rejects it. Pure."""
-    allowed: set[Decimal] = set()
-    allowed.add(finding.amount)
-    allowed.add(finding.holding_value)
+    Every number the narration may legitimately state, tagged by UNIT as a
+    ``(Decimal, unit)`` pair (Story 10.6): the SELL amount + the holding market value
+    as :data:`UNIT_MONEY`; the holding weight and the concentration ceiling as BOTH
+    the fraction (:data:`UNIT_BARE`) and percent (:data:`UNIT_PERCENT`); and — for a
+    cost switch — BOTH expense ratios as percents (cited "0.61%"). The fee values come
+    ONLY from the expense-ratio table; a wrong-but-plausible ER the LLM invents is not
+    admitted, so the never-invent gate rejects it. Pure."""
+    allowed: set[tuple[Decimal, str]] = set()
+    _add_money(allowed, finding.amount)
+    _add_money(allowed, finding.holding_value)
     _add_weight_forms(allowed, finding.weight)
     _add_weight_forms(allowed, CONCENTRATION_CEILING)
     if finding.expense_ratio is not None:
-        allowed.add(finding.expense_ratio)
+        allowed.add((finding.expense_ratio, UNIT_PERCENT))
     if finding.cheaper_expense_ratio is not None:
-        allowed.add(finding.cheaper_expense_ratio)
+        allowed.add((finding.cheaper_expense_ratio, UNIT_PERCENT))
     return frozenset(allowed)
 
 

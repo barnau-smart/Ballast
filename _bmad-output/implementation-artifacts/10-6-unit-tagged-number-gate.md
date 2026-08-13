@@ -1,6 +1,7 @@
 # Story 10.6: Unit-tagged (context-aware) never-invent number gate
 
-Status: ready-for-dev
+Status: review
+baseline_commit: 1cb73fa
 
 <!-- HARD GATE (docs/dev-loop-policy.md, adopted 2026-08-12): governing spec APPROVED by
      MasterB 2026-08-12. Bare-number strictness settled: option (a) STRICT — a bare token
@@ -39,14 +40,14 @@ The never-invent numeric gate (`allocation/narrate.py:check_no_invented_numbers`
 
 ## Tasks / Subtasks
 
-- [ ] Task 1 — Unit tag + token extraction (AC: 1, 5)
-  - [ ] Add a small `Unit` tag (`MONEY | PERCENT | BARE`). Extend token extraction (`_NUMBER_TOKEN_RE` / a companion of `_normalize_number_token`) to emit `(Decimal value, Unit)` from a token's `$`/`%` signal, sign preserved.
-- [ ] Task 2 — Unit-aware compare (AC: 1, 2)
-  - [ ] Change `check_no_invented_numbers` to accept a set of `(value, unit)` pairs and match token unit → allowed unit (BARE strictness per the approved sub-decision).
-- [ ] Task 3 — Tagged allow-sets, both sides (AC: 4)
-  - [ ] Update `narrate.py:allowed_facts` + `_add_weight_forms` and `review.py:allowed_review_facts` + `review.py:_add_weight_forms` (its own copy) to emit `(value, unit)` pairs: amounts/cash/market values/holding_value → MONEY; percent weight form → PERCENT; fraction form → BARE.
-- [ ] Task 4 — Tests (AC: all)
-  - [ ] Reject the laundering cases: bare count == a target-weight percent; `$X` == a percent value. Accept: real `$` amounts + `X%` weights + fraction citations; the narration + review fallback templates still pass their own gate; sign-flip still rejected. Cover BOTH `narrate` and `review` sides.
+- [x] Task 1 — Unit tag + token extraction (AC: 1, 5)
+  - [x] Added `UNIT_MONEY`/`UNIT_PERCENT`/`UNIT_BARE` constants + `_classify_number_token` emitting `(Decimal value, unit)` from a token's `$`/`%` signal, sign preserved (replaced `_normalize_number_token`).
+- [x] Task 2 — Unit-aware compare (AC: 1, 2)
+  - [x] `check_no_invented_numbers` now takes `frozenset[tuple[Decimal, str]]` and rejects unless the `(value, unit)` PAIR is admitted (BARE strict).
+- [x] Task 3 — Tagged allow-sets, both sides (AC: 4)
+  - [x] `narrate.py:allowed_facts`/`_add_weight_forms` + `review.py:allowed_review_facts`/`_add_weight_forms` (own copy) emit tagged pairs; `review.py` imports the `UNIT_*` constants. Added `_add_money` (both files): a money amount is admitted as BOTH MONEY and BARE — the deterministic fallback renders amounts via `format_money` (bare, no `$`) while the LLM is told to use `$`. This does NOT reopen the laundering (weight percents stay PERCENT-only, never BARE).
+- [x] Task 4 — Tests (AC: all)
+  - [x] +4 tests (3 narrate, 1 review): reject bare-count == weight-percent and `$X` == weight-percent; accept the percent cited with its unit; both narrate + review sides. Updated the two allow-set membership tests to the tagged shape. Full backend suite 835 passed.
 
 ## Dev Notes
 
@@ -78,8 +79,28 @@ The never-invent numeric gate (`allocation/narrate.py:check_no_invented_numbers`
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (dev-story)
+
 ### Debug Log References
+
+- RED confirmed: the 2 new reject tests failed on the value-only gate (bare `30` and `$30` were accepted).
+- GREEN in one iteration after one correction: the deterministic fallback renders amounts via `format_money` (bare `"3000.00"`, no `$`), so money amounts must be admitted as BOTH MONEY and BARE (`_add_money`) — 5 fallback self-citation tests caught the MONEY-only tagging; fixed → 835 passed.
 
 ### Completion Notes List
 
+- Made `check_no_invented_numbers` unit-aware: tokens classified `$`→MONEY / `%`→PERCENT / bare→BARE, matched on the `(value, unit)` pair. Bare-token strictness = option (a): a bare integer equal to a weight-percent (the "30 companies" case) no longer matches the PERCENT entry → degrades to the honest template.
+- Single-sourced: the gate stays in `narrate.py`; `review.py` imports it + the `UNIT_*` constants. Both allow-set builders (+ their own `_add_weight_forms`) moved to tagged pairs in lockstep.
+- Key nuance discovered in dev: amounts are cited bare by the fallback (`format_money`) but `$`-prefixed by the LLM, so `_add_money` admits both units. Weight percents remain PERCENT-only (never BARE), so the laundering fix holds.
+- Degrade-safe + sign-awareness preserved; no endpoints/DB/frontend touched. Backend 835 passed; frontend unaffected (backend-only).
+- Out of scope (unchanged 10-3 residuals): spelled-out numbers, `3k`-scale suffixes, number-free forecasts.
+
 ### File List
+
+- `ballast/backend/allocation/narrate.py` — UNIT_* constants, `_add_money`, tagged `_add_weight_forms`/`allowed_facts`, `_classify_number_token` (replaces `_normalize_number_token`), unit-aware `check_no_invented_numbers`.
+- `ballast/backend/allocation/review.py` — import UNIT_*, `_add_money`, tagged `_add_weight_forms`/`allowed_review_facts`.
+- `ballast/backend/tests/test_allocation_narrate.py` — +3 tests; updated 2 membership tests to tagged shape.
+- `ballast/backend/tests/test_allocation_review.py` — +1 test; updated 1 membership test; import UNIT_*.
+
+## Change Log
+
+- 2026-08-13 — Story 10.6 implemented: unit-tagged (context-aware) never-invent number gate. `check_no_invented_numbers` now matches on `(value, unit)`; closes the value-only laundering where a fabricated bare count / `$` figure equal to a real weight-percent passed. +4 tests, backend 835 passed. Ready for independent review (money-path/guardrail → mandatory review before merge).

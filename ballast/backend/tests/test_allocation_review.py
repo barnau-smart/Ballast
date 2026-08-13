@@ -26,6 +26,7 @@ from decimal import Decimal
 import pytest
 
 from allocation.narrate import NarrationValidationError
+from allocation.narrate import UNIT_BARE, UNIT_MONEY, UNIT_PERCENT
 from allocation.review import (
     CONCENTRATION_CEILING,
     KIND_CONCENTRATION,
@@ -336,15 +337,27 @@ def test_facts_one_strategy_record_content_addressed():
 def test_allowed_facts_admits_amount_value_weights_ceiling_and_ers():
     conc = _conc_finding()
     allowed = allowed_review_facts(conc)
-    assert Decimal("1500.00") in allowed  # sell amount
-    assert Decimal("5500") in allowed  # holding value
-    assert Decimal("0.55") in allowed and Decimal("55") in allowed  # weight both forms
-    assert Decimal("0.40") in allowed and Decimal("40") in allowed  # ceiling both forms
+    # Story 10.6 — tagged (value, unit) pairs.
+    assert (Decimal("1500.00"), UNIT_MONEY) in allowed  # sell amount
+    assert (Decimal("5500"), UNIT_MONEY) in allowed  # holding value
+    assert (Decimal("0.55"), UNIT_BARE) in allowed and (Decimal("55"), UNIT_PERCENT) in allowed
+    assert (Decimal("0.40"), UNIT_BARE) in allowed and (Decimal("40"), UNIT_PERCENT) in allowed
 
     cost = _cost_finding()
     callowed = allowed_review_facts(cost)
-    assert Decimal("0.61") in callowed and Decimal("0.03") in callowed  # both ERs
-    assert Decimal("3000.00") in callowed
+    # Expense ratios cited "0.61%"/"0.03%" → PERCENT.
+    assert (Decimal("0.61"), UNIT_PERCENT) in callowed and (Decimal("0.03"), UNIT_PERCENT) in callowed
+    assert (Decimal("3000.00"), UNIT_MONEY) in callowed
+
+
+def test_review_gate_rejects_bare_count_matching_the_ceiling_percent():
+    """Story 10.6 unit-aware gate on the review side: the concentration ceiling is
+    40%, so a fabricated bare "40 stocks" (40 is a PERCENT, not a bare fact) must be
+    rejected, while "40%" cited with its unit still passes."""
+    allowed = allowed_review_facts(_conc_finding())
+    check_no_invented_numbers("Back toward the 40% single-position ceiling.", allowed)
+    with pytest.raises(NarrationValidationError):
+        check_no_invented_numbers("Spread across 40 stocks instead.", allowed)
 
 
 def test_allowed_facts_rejects_wrong_er():

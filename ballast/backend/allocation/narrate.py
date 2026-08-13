@@ -179,6 +179,16 @@ _NARRATION_SYSTEM = (
 # same-magnitude engine weight (a false-ACCEPT the never-invent gate must stop).
 _NUMBER_TOKEN_RE = re.compile(r"-?\$?\d[\d,]*(?:\.\d+)?%?")
 
+#: Unit tags for the never-invent gate (Story 10.6). A number token is classified by
+#: its surface form — a ``$`` → :data:`UNIT_MONEY`, a trailing ``%`` → :data:`UNIT_PERCENT`,
+#: otherwise a bare count → :data:`UNIT_BARE` — and matched ONLY against an allow-set
+#: entry of the SAME unit. This closes the value-only laundering hole where a
+#: fabricated bare count or dollar figure passed just because its magnitude coincided
+#: with a real weight-percent (e.g. "30 companies" when 30% is a target weight).
+UNIT_MONEY = "money"
+UNIT_PERCENT = "percent"
+UNIT_BARE = "bare"
+
 
 class NarrationValidationError(ValueError):
     """Raised by the never-invent-a-fact / no-forecast gates on a violation.
@@ -292,37 +302,51 @@ def build_narration_facts(plan: Plan) -> tuple[EvidenceRecord, ...]:
     return tuple(records)
 
 
-def _add_weight_forms(allowed: set[Decimal], weight: Decimal) -> None:
-    """Admit a weight in BOTH the fraction (``0.60``) and 0–100 percent (``60``)
-    forms the narration might use (pure, in-place)."""
-    allowed.add(weight)
-    allowed.add(weight * _HUNDRED)
+def _add_money(allowed: set[tuple[Decimal, str]], value: Decimal) -> None:
+    """Admit a money amount as BOTH a ``$``-prefixed citation (:data:`UNIT_MONEY`)
+    and a bare-digits citation (:data:`UNIT_BARE`) (pure, in-place). The deterministic
+    fallback renders amounts via ``format_money`` (no ``$``: ``"3000.00"``) while the
+    LLM is instructed to write ``"$3,000.00"`` — both are legitimate citations of the
+    same engine amount. Admitting the bare form does NOT reopen the weight-percent
+    laundering (weight percents are tagged :data:`UNIT_PERCENT`, never bare)."""
+    allowed.add((value, UNIT_MONEY))
+    allowed.add((value, UNIT_BARE))
 
 
-def allowed_facts(plan: Plan) -> frozenset[Decimal]:
+def _add_weight_forms(allowed: set[tuple[Decimal, str]], weight: Decimal) -> None:
+    """Admit a weight as the fraction (``0.60`` → :data:`UNIT_BARE`) AND the 0–100
+    percent (``60`` → :data:`UNIT_PERCENT`) forms the narration might use (pure,
+    in-place). Tagging keeps a bare integer that merely equals the percent form from
+    matching the percent entry (Story 10.6)."""
+    allowed.add((weight, UNIT_BARE))
+    allowed.add((weight * _HUNDRED, UNIT_PERCENT))
+
+
+def allowed_facts(plan: Plan) -> frozenset[tuple[Decimal, str]]:
     """The engine-provided numeric allow-set for :func:`check_no_invented_numbers`.
 
-    Every number the AI may legitimately state (compared by ``Decimal`` value):
-    each action-item amount, the investable + undeployed cash, each current sleeve
-    market value, and each current & target weight expressed BOTH as the fraction
-    (e.g. ``Decimal("0.60")``) AND as a 0–100 percent (``Decimal("60")``). The
-    target weights come from ``plan.target_weights`` — the user's OWN resolved model
-    (never a cross-model union): admitting another model's share would let the AI
-    state a wrong-but-plausible target as a fact, exactly the false-accept the
+    Every number the AI may legitimately state, tagged by UNIT as a ``(Decimal,
+    unit)`` pair (Story 10.6): each action-item amount + the investable/undeployed
+    cash + each current sleeve market value as :data:`UNIT_MONEY`; each current &
+    target weight as BOTH the fraction (``Decimal("0.60")`` → :data:`UNIT_BARE`) and
+    the 0–100 percent (``Decimal("60")`` → :data:`UNIT_PERCENT`). The target weights
+    come from ``plan.target_weights`` — the user's OWN resolved model (never a
+    cross-model union): admitting another model's share would let the AI state a
+    wrong-but-plausible target as a fact, exactly the false-accept the
     never-invent-a-fact gate exists to stop. The recognized stock/bond SPLIT (sum of
     the equity classes vs the bond weight) is also admitted so the natural framing
     "90% stocks, 10% bonds" is citable rather than needlessly degraded. Pure."""
-    allowed: set[Decimal] = set()
+    allowed: set[tuple[Decimal, str]] = set()
 
     for item in plan.action_items:
-        allowed.add(item.amount)
+        _add_money(allowed, item.amount)
 
-    allowed.add(plan.investable_cash)
-    allowed.add(plan.undeployed_cash)
+    _add_money(allowed, plan.investable_cash)
+    _add_money(allowed, plan.undeployed_cash)
 
     for vals in plan.current.values():
         market_value = vals.get("market_value", _ZERO)
-        allowed.add(market_value)
+        _add_money(allowed, market_value)
         _add_weight_forms(allowed, vals.get("weight", _ZERO))
 
     # The user's OWN target weights (per class) + the recognized stock/bond split.
@@ -338,39 +362,54 @@ def allowed_facts(plan: Plan) -> frozenset[Decimal]:
     return frozenset(allowed)
 
 
-def _normalize_number_token(token: str) -> Decimal | None:
-    """Normalize a regex-extracted money-ish token to a ``Decimal``, or ``None``.
+def _classify_number_token(token: str) -> tuple[Decimal, str] | None:
+    """Classify a regex-extracted money-ish token as ``(Decimal value, unit)`` or
+    ``None`` (Story 10.6).
 
-    Strips ``$`` and thousands commas and a trailing ``%`` (the ``%`` face value is
-    KEPT as-is, e.g. ``"60%"`` → ``Decimal("60")``) while PRESERVING a leading sign,
-    so ``"-5%"`` → ``Decimal("-5")`` and is compared signed (a sign-flipped value is
-    never laundered into its unsigned magnitude). Returns ``None`` for a bare-sign /
-    pure-punctuation / empty / unparseable token so it is ignored (never a false
-    reject on stray text)."""
-    cleaned = token.strip().replace(",", "").replace("$", "").rstrip("%")
+    The UNIT is read from the surface form: a ``$`` anywhere → :data:`UNIT_MONEY`, a
+    trailing ``%`` → :data:`UNIT_PERCENT`, otherwise a bare count → :data:`UNIT_BARE`.
+    The value strips ``$``/thousands-commas/trailing-``%`` while PRESERVING a leading
+    sign (so ``"-$1,200"`` → ``(-1200, money)``, ``"30%"`` → ``(30, percent)``,
+    ``"30"`` → ``(30, bare)``, ``"-5%"`` → ``(-5, percent)`` — a sign-flip is never
+    laundered). Returns ``None`` for a bare-sign / pure-punctuation / empty /
+    unparseable token so it is ignored (never a false reject on stray text)."""
+    raw = token.strip()
+    if "$" in raw:
+        unit = UNIT_MONEY
+    elif raw.endswith("%"):
+        unit = UNIT_PERCENT
+    else:
+        unit = UNIT_BARE
+    cleaned = raw.replace(",", "").replace("$", "").rstrip("%")
     if cleaned in ("", "-", "+"):
         return None
     try:
-        return Decimal(cleaned)
+        return (Decimal(cleaned), unit)
     except (InvalidOperation, ValueError):
         return None
 
 
-def check_no_invented_numbers(text: str, allowed: frozenset[Decimal]) -> None:
+def check_no_invented_numbers(
+    text: str, allowed: frozenset[tuple[Decimal, str]]
+) -> None:
     """Raise :class:`NarrationValidationError` if ``text`` states a non-engine number.
 
-    Regex-extracts money-ish tokens (``$``/comma/decimal/``%``), normalizes each,
-    and rejects if any normalized ``Decimal`` value is not numerically equal to a
-    member of ``allowed``. Ignores pure-punctuation / empty matches. Pure — a false
-    positive is SAFE (the caller degrades to the honest template)."""
+    Regex-extracts money-ish tokens, classifies each as ``(value, unit)`` — money
+    (``$``), percent (``%``), or a bare count — and rejects if that PAIR is not in
+    ``allowed``. UNIT-AWARE (Story 10.6): a bare count or dollar figure whose
+    magnitude merely coincides with a real weight-percent is rejected, closing the
+    value-only laundering hole. Bare tokens match ONLY bare/fraction allow entries
+    (STRICT), so a fabricated "30 companies" (30 is a target percent, not a bare fact)
+    degrades to the honest template. Ignores pure-punctuation / empty matches. Pure —
+    a false positive is SAFE (the caller degrades to the honest template)."""
     for match in _NUMBER_TOKEN_RE.findall(text or ""):
-        value = _normalize_number_token(match)
-        if value is None:
+        classified = _classify_number_token(match)
+        if classified is None:
             continue
-        if not any(value == a for a in allowed):
+        if classified not in allowed:
             raise NarrationValidationError(
                 f"Narration stated a number not in the engine-provided set: "
-                f"{match!r} ({value})."
+                f"{match!r} ({classified[0]} {classified[1]})."
             )
 
 

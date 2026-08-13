@@ -31,6 +31,9 @@ from allocation.engine import (
     STATUS_NO_TARGET,
 )
 from allocation.narrate import (
+    UNIT_BARE,
+    UNIT_MONEY,
+    UNIT_PERCENT,
     AllocationNarration,
     FORECAST_TERMS,
     NarrationValidationError,
@@ -125,23 +128,25 @@ def test_facts_deterministic_ids_same_plan():
 def test_allowed_facts_contains_amounts_cash_and_weights_both_forms():
     plan = _growth_deploy_plan()
     allowed = allowed_facts(plan)
-    # Amounts + cash.
-    assert Decimal("3000.00") in allowed
-    assert Decimal("1000.00") in allowed
-    assert Decimal("4000.00") in allowed  # investable
-    assert Decimal("0.00") in allowed  # undeployed
-    # Current sleeve market value + weight (fraction AND 0–100 percent).
-    assert Decimal("6000.00") in allowed
-    assert Decimal("1.0000") in allowed
-    assert Decimal("100") in allowed  # 1.0000 * 100
-    # Target weights as BOTH fraction and percent (growth 0.60/0.30/0.10 among them).
-    assert Decimal("0.60") in allowed and Decimal("60") in allowed
-    assert Decimal("0.30") in allowed and Decimal("30") in allowed
-    assert Decimal("0.10") in allowed and Decimal("10") in allowed
+    # Amounts + cash — tagged MONEY (Story 10.6).
+    assert (Decimal("3000.00"), UNIT_MONEY) in allowed
+    assert (Decimal("1000.00"), UNIT_MONEY) in allowed
+    assert (Decimal("4000.00"), UNIT_MONEY) in allowed  # investable
+    assert (Decimal("0.00"), UNIT_MONEY) in allowed  # undeployed
+    # Current sleeve market value (MONEY) + weight (fraction=BARE AND percent=PERCENT).
+    assert (Decimal("6000.00"), UNIT_MONEY) in allowed
+    assert (Decimal("1.0000"), UNIT_BARE) in allowed
+    assert (Decimal("100"), UNIT_PERCENT) in allowed  # 1.0000 * 100
+    # Target weights as BOTH fraction (BARE) and percent (PERCENT) — growth 60/30/10.
+    assert (Decimal("0.60"), UNIT_BARE) in allowed and (Decimal("60"), UNIT_PERCENT) in allowed
+    assert (Decimal("0.30"), UNIT_BARE) in allowed and (Decimal("30"), UNIT_PERCENT) in allowed
+    assert (Decimal("0.10"), UNIT_BARE) in allowed and (Decimal("10"), UNIT_PERCENT) in allowed
     # The recognized stock/bond split (equity sum 0.90 vs bond 0.10) is citable.
-    assert Decimal("90") in allowed and Decimal("0.90") in allowed
-    # Comparison is by Decimal value (scale-insensitive).
-    assert any(v == Decimal("3000") for v in allowed)
+    assert (Decimal("90"), UNIT_PERCENT) in allowed and (Decimal("0.90"), UNIT_BARE) in allowed
+    # Story 10.6 — a weight-percent value (30) is NOT admitted as MONEY, so a
+    # fabricated "$30" cannot match the 30% target weight.
+    assert (Decimal("3000.00"), UNIT_MONEY) in allowed
+    assert (Decimal("30"), UNIT_MONEY) not in allowed
 
 
 def test_allowed_facts_uses_users_model_not_cross_model_union():
@@ -151,8 +156,8 @@ def test_allowed_facts_uses_users_model_not_cross_model_union():
     plan = _growth_deploy_plan()  # growth = 60/30/10
     allowed = allowed_facts(plan)
     # 20% and 65% are legitimate for OTHER models but not growth → not in the set.
-    assert Decimal("20") not in allowed and Decimal("0.20") not in allowed
-    assert Decimal("65") not in allowed and Decimal("0.35") not in allowed
+    assert (Decimal("20"), UNIT_PERCENT) not in allowed and (Decimal("0.20"), UNIT_BARE) not in allowed
+    assert (Decimal("65"), UNIT_PERCENT) not in allowed and (Decimal("0.35"), UNIT_BARE) not in allowed
     # And the gate rejects a wrong-but-plausible target percentage.
     with pytest.raises(NarrationValidationError):
         check_no_invented_numbers("Your international target is 20%.", allowed)
@@ -371,6 +376,34 @@ def test_check_no_invented_numbers_rejects_sign_flipped_value():
     check_no_invented_numbers("Your international target is 30%.", allowed)  # ok
     with pytest.raises(NarrationValidationError):
         check_no_invented_numbers("You could be down -30% here.", allowed)
+
+
+# --- Story 10.6: unit-tagged (context-aware) numeric gate --------------------
+
+
+def test_check_no_invented_numbers_rejects_bare_count_matching_a_weight_percent():
+    """Unit-aware gate: a BARE count whose magnitude merely equals a real
+    weight-percent is a fabrication, not an engine fact. "30 companies" — 30 is a
+    target PERCENT (30%), never a bare count the engine provided — must be rejected,
+    not laundered by the value-only compare."""
+    allowed = allowed_facts(_growth_deploy_plan())  # 30 is a legit target percent
+    with pytest.raises(NarrationValidationError):
+        check_no_invented_numbers("A diversified basket of 30 companies.", allowed)
+
+
+def test_check_no_invented_numbers_rejects_dollar_figure_matching_a_weight_percent():
+    """A MONEY token whose magnitude equals a weight-percent is likewise rejected:
+    "$30" is not the same fact as "30%"."""
+    allowed = allowed_facts(_growth_deploy_plan())  # 30 is a legit target percent
+    with pytest.raises(NarrationValidationError):
+        check_no_invented_numbers("Set aside $30 for this move.", allowed)
+
+
+def test_check_no_invented_numbers_accepts_percent_cited_with_its_unit():
+    """The real weight cited WITH its percent unit still passes (regression guard —
+    the unit tagging must not over-reject a correct citation)."""
+    allowed = allowed_facts(_growth_deploy_plan())  # 30 is a legit target percent
+    check_no_invented_numbers("Your stock target is 30%.", allowed)
 
 
 def test_narrate_plan_gates_a_forecast_hidden_in_an_uncertainty():
