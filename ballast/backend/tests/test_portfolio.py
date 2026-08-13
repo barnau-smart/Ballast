@@ -817,3 +817,71 @@ def test_refresh_multi_account_selection_is_calm_422_not_500(client):
     finally:
         app.dependency_overrides.pop(get_reading_broker, None)
         _delete_user(email)
+
+
+# --- Story 10.10: account-type (margin) detect + persist + view --------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_persists_account_type_and_view_exposes_it(two_owner_ids):
+    a, _b = two_owner_ids
+    snap = PortfolioSnapshot(
+        as_of=FAKE_AS_OF_BASE, cash=Decimal("100.00"), holdings=[], account_type="MARGIN"
+    )
+    async with async_session_maker() as session:
+        await reconcile_portfolio(Scope.for_user(a), session, FakeBrokerAdapter(), snapshot=snap)
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.account_type == "MARGIN"
+    assert view.cash == Decimal("100.00")  # cash unchanged by the account-type read
+
+
+@pytest.mark.asyncio
+async def test_reconcile_none_account_type_stays_none(two_owner_ids):
+    a, _b = two_owner_ids
+    snap = PortfolioSnapshot(
+        as_of=FAKE_AS_OF_BASE, cash=Decimal("100.00"), holdings=[], account_type=None
+    )
+    async with async_session_maker() as session:
+        await reconcile_portfolio(Scope.for_user(a), session, FakeBrokerAdapter(), snapshot=snap)
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.account_type is None  # no type → no warning (fail-open)
+
+
+@pytest.mark.asyncio
+async def test_never_imported_has_no_account_type(two_owner_ids):
+    a, _b = two_owner_ids
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.account_type is None
+
+
+@pytest.mark.asyncio
+async def test_newer_reconcile_updates_account_type(two_owner_ids):
+    a, _b = two_owner_ids
+    async with async_session_maker() as session:
+        await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=PortfolioSnapshot(
+                as_of=FAKE_AS_OF_BASE, cash=Decimal("100.00"), holdings=[], account_type="CASH"
+            ),
+        )
+        await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=PortfolioSnapshot(
+                as_of=FAKE_AS_OF_BASE + timedelta(hours=1),
+                cash=Decimal("200.00"),
+                holdings=[],
+                account_type="MARGIN",
+            ),
+        )
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.account_type == "MARGIN"
+
+
+def test_fake_adapter_reports_non_margin_account():
+    """The fake broker never trips the margin warning (real-broker-only by design)."""
+    assert FakeBrokerAdapter().fetch_portfolio().account_type == "CASH"

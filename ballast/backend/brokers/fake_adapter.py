@@ -139,6 +139,9 @@ class FakeBrokerAdapter(BrokerPort):
             as_of=FAKE_AS_OF_BASE + self._as_of_offset,
             cash=FAKE_CASH,
             holdings=list(FAKE_HOLDINGS),
+            # A non-margin account by default (Story 10.10) so dev/demo/tests never
+            # trip the margin warning — the warning is real-broker-only by construction.
+            account_type="CASH",
         )
 
     async def place_order(

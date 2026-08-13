@@ -244,3 +244,25 @@
   margin-top: var(--ballast-space-4);
   margin-bottom: 0;
 }
+
+/* Story 10.10 — calm, informational margin-account note (never red/alarm). */
+.ballast-consult__margin-note {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--ballast-border, #d8dee9);
+  border-radius: 8px;
+  background: var(--ballast-surface-muted, #f4f6fb);
+  color: var(--ballast-text, #2b3440);
+  font-size: 0.9rem;
+}
+.ballast-consult__margin-note p {
+  margin: 0 0 0.5rem;
+}
+.ballast-consult__margin-note button {
+  border: 1px solid var(--ballast-border, #d8dee9);
+  background: transparent;
+  border-radius: 6px;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+  color: inherit;
+}

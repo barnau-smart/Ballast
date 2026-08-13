@@ -149,6 +149,50 @@ function AllocationXray({ plan }) {
   )
 }
 
+// Story 10.10 — a calm, one-time-dismissible note when the linked account is a
+// MARGIN account. Ballast is already margin-safe (it deploys only settled cash and
+// never buys on margin), so this is purely informational — no red, no alarm, no
+// behavior change. Dismissal persists in localStorage (mirrors the Dashboard
+// set-or-decline prompts) so it surfaces once, not every deploy.
+function MarginAccountNote({ plan }) {
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem('ballast.marginNoteDismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+  if (!plan || plan.account_type !== 'MARGIN' || dismissed) return null
+  function dismiss() {
+    setDismissed(true)
+    try {
+      window.localStorage.setItem('ballast.marginNoteDismissed', '1')
+    } catch {
+      // Memory-only dismissal is fine if storage is unavailable.
+    }
+  }
+  return (
+    <div
+      className="ballast-consult__margin-note"
+      data-testid="coach-margin-note"
+      role="note"
+    >
+      <p>
+        This looks like a margin account. Ballast only ever deploys the settled cash
+        in your account and never buys on margin — your buying power isn’t treated as
+        spendable cash.
+      </p>
+      <button
+        type="button"
+        onClick={dismiss}
+        data-testid="coach-margin-note-dismiss"
+      >
+        Got it
+      </button>
+    </div>
+  )
+}
+
 export function CoachConsult() {
   const [question, setQuestion] = useState('')
   const [symbol, setSymbol] = useState('')
@@ -1126,6 +1170,7 @@ export function CoachConsult() {
           {/* Story 10.3 — the fiduciary-advisor narration (why/tradeoff/cited
               data/uncertainty) beside the populated controls. */}
           {deployNarration ? <CoachCard recommendation={deployNarration} /> : null}
+          <MarginAccountNote plan={deployPlan} />
           {/* Story 10.7 — the current-vs-target x-ray beside the populated buy. */}
           <AllocationXray plan={deployPlan} />
         </div>
@@ -1140,6 +1185,7 @@ export function CoachConsult() {
           >
             {deployMessage}
           </p>
+          <MarginAccountNote plan={deployPlan} />
           {/* Story 10.7 — even with nothing to deploy, show where you stand. */}
           <AllocationXray plan={deployPlan} />
         </div>

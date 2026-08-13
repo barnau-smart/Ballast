@@ -278,6 +278,15 @@ class SchwabAdapter(BrokerPort):
             cash = self._decimal_or_zero(
                 (acct.get("currentBalances") or {}).get("cashBalance")
             )
+            # Story 10.10: the account type ("MARGIN"/"CASH") — informational ONLY (to
+            # gently warn a margin-account user); it NEVER feeds the cash figure. A
+            # missing/blank/non-string type → None (no false "margin"). Normalized upper.
+            raw_type = acct.get("type")
+            account_type = (
+                raw_type.strip().upper()
+                if isinstance(raw_type, str) and raw_type.strip()
+                else None
+            )
 
             holdings: list[Holding] = []
             for position in acct.get("positions") or []:
@@ -326,6 +335,7 @@ class SchwabAdapter(BrokerPort):
             as_of=datetime.now(timezone.utc),
             cash=cash,
             holdings=holdings,
+            account_type=account_type,
         )
 
     async def place_order(

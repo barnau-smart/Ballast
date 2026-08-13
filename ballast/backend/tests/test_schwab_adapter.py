@@ -1493,3 +1493,42 @@ def test_only_schwab_adapter_imports_schwab_sdk():
         "Only brokers/schwab_adapter/ may import the schwab SDK (AD-8). "
         f"Offending files: {offenders}"
     )
+
+
+# --- Story 10.10: account-type (margin) detection ----------------------------
+
+
+def _account_body(account_type):
+    body = {"securitiesAccount": {"currentBalances": {"cashBalance": 100}}}
+    if account_type is not _MISSING:
+        body["securitiesAccount"]["type"] = account_type
+    return body
+
+
+_MISSING = object()
+
+
+def test_fetch_portfolio_reads_margin_type(monkeypatch):
+    client = _FakeClient(account=_account_body("MARGIN"))
+    _install_client(monkeypatch, client)
+    snap = _adapter().fetch_portfolio()
+    assert snap.account_type == "MARGIN"
+    assert snap.cash == Decimal("100")  # cash anchor unchanged
+
+
+def test_fetch_portfolio_reads_cash_type(monkeypatch):
+    client = _FakeClient(account=_account_body("cash"))  # normalized upper
+    _install_client(monkeypatch, client)
+    assert _adapter().fetch_portfolio().account_type == "CASH"
+
+
+def test_fetch_portfolio_missing_type_is_none(monkeypatch):
+    client = _FakeClient(account=_account_body(_MISSING))
+    _install_client(monkeypatch, client)
+    assert _adapter().fetch_portfolio().account_type is None  # no false margin
+
+
+def test_fetch_portfolio_blank_type_is_none(monkeypatch):
+    client = _FakeClient(account=_account_body("   "))
+    _install_client(monkeypatch, client)
+    assert _adapter().fetch_portfolio().account_type is None

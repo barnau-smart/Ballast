@@ -144,6 +144,10 @@ class Plan:
     from_money_market: Decimal = _ZERO
     reserve: Decimal = _ZERO
     money_market_symbols: list[str] = field(default_factory=list)
+    # The broker's account type (Story 10.10), carried from the portfolio view for a
+    # gentle margin-account warning on the deploy card. Informational only — never
+    # used in the deploy math. Present on every status.
+    account_type: str | None = None
     reason: str = ""
     as_of: datetime | None = None
 
@@ -387,6 +391,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     """
     view = await get_portfolio(scope, session)
     as_of = view.as_of
+    account_type = view.account_type  # Story 10.10 — margin-account warning (info only)
 
     # (1) Resolved target — undecided → no_target (never a fabricated target).
     target_config = await get_target_config(scope, session)
@@ -416,6 +421,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
                 "Pick a target mix first, and I'll show you how to move your cash "
                 "toward it."
             ),
+            account_type=account_type,
             as_of=as_of,
         )
 
@@ -438,6 +444,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
                 "Set your cash cushion first — how much you'd like to keep on hand "
                 "— and I'll only ever deploy what's above it."
             ),
+            account_type=account_type,
             as_of=as_of,
         )
 
@@ -486,6 +493,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
                 "ready-to-trade cash is already at or below your cushion. Nothing "
                 "to do here."
             ),
+            account_type=account_type,
             as_of=as_of,
         )
 
@@ -524,6 +532,7 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
                 "that's free right now — what's investable is too small to move "
                 "your mix. Nothing to do here."
             ),
+            account_type=account_type,
             as_of=as_of,
         )
 
@@ -543,5 +552,6 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         reserve=reserve,
         money_market_symbols=money_market_symbols,
         reason="",
-        as_of=as_of,
+        account_type=account_type,
+            as_of=as_of,
     )

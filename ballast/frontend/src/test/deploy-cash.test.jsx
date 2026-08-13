@@ -199,6 +199,47 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2/10.3)', () => {
     expectCalm(funding.textContent)
   })
 
+  it('shows a dismissible margin-account note when account_type is MARGIN (Story 10.10)', async () => {
+    try {
+      window.localStorage.removeItem('ballast.marginNoteDismissed')
+    } catch {
+      /* ignore */
+    }
+    stubFetch({
+      plan: { ...XRAY_PLAN, account_type: 'MARGIN' },
+      narration: DEPLOY_NARRATION,
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+
+    const note = await screen.findByTestId('coach-margin-note')
+    expect(note).toHaveTextContent(/margin account/i)
+    expect(note).toHaveTextContent(/never buys on margin/i)
+    expectCalm(note.textContent)
+    // Dismiss it — it disappears and stays dismissed (persisted).
+    fireEvent.click(screen.getByTestId('coach-margin-note-dismiss'))
+    expect(screen.queryByTestId('coach-margin-note')).not.toBeInTheDocument()
+    expect(window.localStorage.getItem('ballast.marginNoteDismissed')).toBe('1')
+  })
+
+  it('shows no margin note for a CASH / unknown account', async () => {
+    try {
+      window.localStorage.removeItem('ballast.marginNoteDismissed')
+    } catch {
+      /* ignore */
+    }
+    stubFetch({
+      plan: { ...XRAY_PLAN, account_type: 'CASH' },
+      narration: DEPLOY_NARRATION,
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+    await screen.findByTestId('coach-deploy-xray')
+    expect(screen.queryByTestId('coach-margin-note')).not.toBeInTheDocument()
+  })
+
   it('omits the money-market split when the deploy is pure settled cash (from_money_market 0)', async () => {
     // XRAY_PLAN has no funding-split fields → from_money_market is undefined/0.
     stubFetch({ plan: XRAY_PLAN, narration: DEPLOY_NARRATION })
