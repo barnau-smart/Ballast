@@ -1,12 +1,49 @@
 # Story 10.11: Close the human-coach no-balance cash-cover gap
 
-Status: draft-awaiting-approval
+Status: paused-needs-decision
 baseline_commit: 29983a2
 
-<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): DRAFT — AWAITING MasterB
-     approval of the load-bearing approach (A vs B below). MONEY-PATH: this closes the one
-     reachable margin path the 10-9 known-cash refinement left open. Mandatory independent
-     review before merge. -->
+<!-- HARD GATE (docs/dev-loop-policy.md): Approach A approved 2026-08-13, but PAUSED during
+     dev — implementation revealed a 53-test blast radius + the gap is only reachable in a
+     degraded state. Needs a MasterB re-decision (defer / root-cause / push through). See
+     "Dev finding" below. -->
+
+## Dev finding (2026-08-13) — PAUSED, needs a re-decision
+
+Implementing Approach A (fail-closed a hand-entered BUY at `/approve` when `view.as_of is
+None`) surfaced two facts that change the calculus:
+
+1. **53 existing tests break.** The entire approve-BUY test harness (`test_coach_api` +
+   the reconcile/cancel tests that place a BUY as setup) drives a human-coach BUY via
+   `_recommend_decision_id` and **never seeds a `portfolio_balance`** — so "no balance" is
+   the test *default*, not a rare edge. Every such test would now be refused. Closing the
+   gap this way needs ~53 tests updated to seed a realistic balance (FAKE_CASH=$750.25;
+   some buys exceed it) — heavy and error-prone.
+2. **The gap is barely reachable in production.** `/approve` requires a live broker session
+   (`require_live_broker_session`), and LINKING imports the portfolio — `api/brokerage.py:274`
+   calls `reconcile_portfolio`, which writes the `portfolio_balance` row. So a linked user
+   normally HAS a balance (`as_of` not `None`) and the Story-10.9 gate already covers their
+   hand-entered BUYs. The no-balance state is only reachable in a DEGRADED edge (the link-time
+   import failed, e.g. `test_relink_import_failure_leaves_empty_projection`), leaving a live
+   session with no balance row.
+
+**Options for MasterB:**
+- **(defer) — RECOMMENDED.** Leave it in `deferred-work.md`. 10-9 (execution gate) + 10-10
+  (margin warn) cover the realistic path; the residual needs a degraded import-failure state.
+  Spend the effort on higher-value items (10-12 staleness, the attended real-money deploy).
+- **(root-cause) —** open a smaller story to harden the link/import-failure path so a linked
+  user is never left with a live session but no balance row (fixes the cause, not the symptom;
+  no approve-path refusal, minimal test churn).
+- **(push through A) —** implement the refusal AND update ~53 tests to seed a balance (making
+  them production-realistic). Correct but the largest effort; some buys > FAKE_CASH need
+  per-test amounts/seed sizing.
+
+_Original Approach-A design retained below for reference._
+
+<!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB
+     2026-08-13 — **Approach A** (fail-closed the hand-entered BUY at /approve when the
+     account's balance is unknown). MONEY-PATH: closes the one reachable margin path the
+     10-9 known-cash refinement left open. Mandatory independent review before merge. -->
 
 ## Story
 

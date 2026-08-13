@@ -181,7 +181,7 @@ development_status:
   # + independent review before merge. 10-11 is drafted (awaiting approval); 10-12/10-13
   # are backlog stubs (get a full spec via create-story when picked).
   # 10-11: close the 10-9 human-coach no-balance BUY margin gap (drafted, awaiting approval).
-  10-11-human-coach-cash-cover-completion: draft
+  10-11-human-coach-cash-cover-completion: paused  # dev finding: 53-test blast radius + gap only reachable in degraded state — needs re-decision
   # 10-12: reconcile-before-gate at /approve so the cash-cover check uses fresh, not cached,
   # settled cash (narrows the residual margin window; merges Epic 9 #2a settled-cash confirm).
   10-12-fresh-cash-at-cover-gate: backlog
