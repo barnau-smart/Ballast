@@ -1,6 +1,6 @@
 # Story 10.12: Keep settled cash fresh across sequential buys
 
-Status: review
+Status: done
 baseline_commit: 6f37e66
 
 <!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB 2026-08-13 —
@@ -157,3 +157,25 @@ claude-opus-4-8[1m] (bmad-dev-story, in-chat)
   sequential-buy overdraw/margin gap. One-way (never credits a SELL — proceeds unsettled),
   clamped ≥ 0, no network read, no-op without a balance row. +7 tests, backend 884 passed.
   Money-path → awaiting mandatory independent review before merge.
+
+## Independent Review (2026-08-13) — MERGE-READY
+
+Two fresh-context reviewers (Blind Hunter + Edge/Acceptance). Both: **MERGE-READY, no
+Critical/High.** All 5 ACs MET with real code + test evidence, including a genuine
+buy→debit→second-buy-refused end-to-end test (AC1) and SELL-never-credits (AC2). Verified:
+executed-cost debit is correct (partial fills debit only the filled cost); `_is_placed`-True-
+but-0-fill (`pending`/`timeout`+broker_ref) is guarded → no spurious debit; idempotent
+re-approve does NOT re-debit (cosigned short-circuit precedes the debit); both `/approve`
+return paths debit exactly once per placement (mutually exclusive); AD-14 single-writer
+preserved; per-user scoped `UPDATE`; `GREATEST(...,0)` clamp all-Decimal/Numeric(20,2), no
+float; a later reconcile still overwrites the debit with broker truth.
+
+- [x] [Review][Low] AC5 (reconcile overwrites a prior debit) had no dedicated test — **ADDED**
+  `test_reconcile_overwrites_a_prior_debit_with_broker_truth`.
+- [Review][Low][defer] A resting/pending LIMIT (GTC) BUY isn't debited until it fills — a
+  pre-existing cached-cash-model limitation, out of 10-12's sequential-market-buy scope; the
+  next reconcile corrects it. Noted.
+- [Review][Low][defer] Fractional-cent rounding on store (Numeric(20,2)) — negligible,
+  conservative-neutral. Noted.
+- [Review][Low][defer] Concurrent DIFFERENT-decision approves (TOCTOU) — pre-existing, out of
+  the sequential scope this story targets, strictly improved vs main. Noted.

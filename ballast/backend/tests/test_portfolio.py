@@ -955,3 +955,29 @@ async def test_debit_cash_is_per_user_scoped(two_owner_ids):
     async with async_session_maker() as session:
         assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("250.00")
         assert (await get_portfolio(Scope.for_user(b), session)).cash == Decimal("750.00")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_overwrites_a_prior_debit_with_broker_truth(two_owner_ids):
+    """AC5 — the debit is a between-refreshes approximation; a newer authoritative
+    reconcile still wins and overwrites the debited cash with broker truth."""
+    a, _b = two_owner_ids
+    await _reconcile_cash(a, "750.00")
+    async with async_session_maker() as session:
+        await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    async with async_session_maker() as session:
+        assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("250.00")
+    # A newer broker snapshot (later as_of) reconciles and overwrites the debit.
+    async with async_session_maker() as session:
+        await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=PortfolioSnapshot(
+                as_of=FAKE_AS_OF_BASE + timedelta(hours=1),
+                cash=Decimal("900.00"),
+                holdings=[],
+            ),
+        )
+    async with async_session_maker() as session:
+        assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("900.00")
