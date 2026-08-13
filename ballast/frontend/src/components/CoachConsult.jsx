@@ -91,7 +91,15 @@ function AllocationXray({ plan }) {
   const showUnclassified =
     unclassifiedSymbols.length > 0 ||
     (Number.isFinite(unclassifiedValue) && unclassifiedValue > 0)
-  if (!hasTarget && !showUnclassified) return null
+  // Story 10.8 AC5 — honest money-market funding split: shown only when the deploy
+  // actually draws on the parked money-market (engine-sourced strings; no client math).
+  const fromMoneyMarket = Number(plan.from_money_market)
+  const showFunding = Number.isFinite(fromMoneyMarket) && fromMoneyMarket > 0
+  const moneyMarketSymbols = Array.isArray(plan.money_market_symbols)
+    ? plan.money_market_symbols
+    : []
+  const hasReserve = Number(plan.reserve) > 0
+  if (!hasTarget && !showUnclassified && !showFunding) return null
   return (
     <div className="ballast-consult__xray" data-testid="coach-deploy-xray">
       {hasTarget ? (
@@ -119,6 +127,22 @@ function AllocationXray({ plan }) {
             ? ` (${unclassifiedSymbols.join(', ')})`
             : ''}
           .
+        </p>
+      ) : null}
+      {showFunding ? (
+        <p
+          className="ballast-consult__xray-funding"
+          data-testid="coach-deploy-funding"
+        >
+          This deploys ${plan.settlement_cash} of settled cash plus $
+          {plan.from_money_market} from selling your money-market fund
+          {moneyMarketSymbols.length > 0
+            ? ` (${moneyMarketSymbols.join(', ')})`
+            : ''}
+          , which settles first.
+          {hasReserve
+            ? ` Your $${plan.reserve} reserve stays untouched.`
+            : ''}
         </p>
       ) : null}
     </div>

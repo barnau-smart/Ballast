@@ -1,7 +1,8 @@
 # Story 10.8: Money-market-aware deploy (count parked cash-equivalents)
 
-Status: in-progress
+Status: done
 baseline_commit: 80e53a7
+independent_review: 2026-08-13 (3-layer full-rework pass, MERGE-READY — 1 HIGH caught + fixed by Edge Case Hunter; all 6 findings closed)
 
 <!-- HARD GATE (docs/dev-loop-policy.md): APPROVED by MasterB 2026-08-13. Core design
      settled: money-market counts as DEPLOYABLE during analysis/planning, but at
@@ -122,10 +123,26 @@ claude-opus-4-8[1m] (dev-story, in-chat)
 
 _All 3 layers converged on the load-bearing gap: my "Task 2 — no new Phase-2 code needed" claim was WRONG._
 
-- [ ] [Review][CRITICAL] Phase 2 real-cash / no-margin safeguard (AC3) is NOT enforced on the backend. The 9-3 liquidation is a frontend-initiated flow (`POST /api/cash/liquidation-plan`); `/approve → coach/execution.py:execute_approved_order → adapter.place_order` has ZERO cash-coverage check (only whole-share floor + index-core scope). A co-signed deploy buy > settlement cash places directly — on a MARGIN account Schwab fills the shortfall on margin. The buy can also be co-signed without ever running liquidation (bypassable). **FIX: enforce cash coverage at the backend** — either gate `execute_approved_order` so a BUY exceeding real available (settled) cash is refused / routed through the liquidation+deferred-buy (`PendingBuy`) spine, or make the deploy plan emit an explicit "sell $X of SWVXX first" step that the approve path requires. This is the merge-blocker. NB: this is also a PRE-EXISTING gap (Epic 9 `/approve` never checked cash) that 10-8 makes reachable + dangerous on margin.
-- [ ] [Review][HIGH] Double-count: a parked symbol that is ALSO classified (e.g. SCHB/VTI/SWPPX in `SYMBOL_ASSET_CLASS`) is counted in BOTH `plan_deployment.base` (via `classify_holdings`) AND `investable` (via `parked_market_value`) → phantom money, inflated gaps. **FIX: exclude classified/index-core symbols from the parked-deployable sum (or reject tagging one).**
-- [ ] [Review][HIGH] Multi-fund parked: `parked_market_value` sums ALL parked funds, but 9-3 `plan_liquidation` sells only the SINGLE largest → the deploy plan proposes buys the liquidation can't cover. **FIX: cap deployable to the single-fund liquidatable capacity, or chain funds (bigger).**
-- [ ] [Review][HIGH] AC5 (honest framing) entirely missing — `narrate.py` untouched: the coach says "deploy $65,949" with no "this sells your SWVXX; your $40k reserve stays untouched." **FIX: narration + allow-set aware of the settlement-vs-MM split + protected reserve.**
-- [ ] [Review][MED] `parked_market_value` (`cash/config.py`) sums `h.market_value` with NO None/finite/≤0 guard (unlike `_largest_parked_holding`) → a `None`-valued parked holding 500s `GET /plan`. **FIX: mirror the liquidation filter.**
-- [ ] [Review][MED] Negative-settlement (margin debit) clamp asymmetry: engine clamps `max(0, view.cash)`; `plan_liquidation` uses raw `view.cash` → Phase-1 investable ≠ settlement + available_parked when cash < 0. **FIX: align the clamp / reserve base across both.**
-- [ ] [Review][MED] parked/unclassified double-report: SWVXX shows in BOTH the x-ray unclassified sleeve AND investable. **FIX: exclude parked-MM symbols from the unclassified sleeve (or label them as cash).**
+- [x] [Review][CRITICAL] Phase 2 real-cash / no-margin safeguard (AC3) is NOT enforced on the backend. **CLOSED by Story 10-9 (backend cash-cover safety, merged to main 2026-08-13, commit 39e183d):** `execute_approved_order` now refuses any BUY exceeding real settled cash BEFORE `place_order` (no margin), independently reviewed MERGE-READY. The deploy buy > settlement cash is refused and must fund via the 9-3 liquidation.
+- [x] [Review][HIGH] Double-count: a parked symbol that is ALSO classified is counted in BOTH `plan_deployment.base` AND `investable`. **FIXED 2026-08-13:** `classify_holdings(holdings, parked_set)` routes a parked+UNCLASSIFIED symbol to neither a class nor the sleeve (it's cash, counted once in investable); a parked+CLASSIFIED symbol STAYS in its class and is excluded from the deployable-parked sum (`_deployable_parked` only counts unclassified parked). +tests.
+- [x] [Review][HIGH] Multi-fund parked: deploy plan proposes buys a single 9-3 liquidation can't cover. **FIXED 2026-08-13:** `investable = settlement + min(largest_parked, parked_total − reserve)` — the parked contribution is capped at the SINGLE largest fund (what one liquidation frees). +test (two funds → capped to largest).
+- [x] [Review][HIGH] AC5 (honest framing) entirely missing — `narrate.py` untouched. **FIXED 2026-08-13:** `Plan` now carries the honest funding split (`settlement_cash` + `from_money_market == investable_cash`, `reserve`, `money_market_symbols`), populated for `deploy`. The narration is money-market-aware: `allowed_facts` admits the split + reserve (so the never-invent-a-number gate passes them); `build_narration_facts` emits a `CASH_SOURCE` evidence record; `_fallback_narration` + `compose_narration_request` frame "$X settled + $Y from selling your money-market fund (SWVXX), which settles first; your $Z reserve stays untouched" (only when `from_money_market > 0`). API `PlanOut` exposes the fields; the frontend deploy x-ray (`CoachConsult.jsx` `coach-deploy-funding`) surfaces the settled-vs-money-market split + protected reserve. +backend tests (allowed_facts/fallback pass the gate; record emitted; `/plan` exposes split) +frontend tests (split shown; omitted on a pure-settlement deploy). Backend 865 + frontend 199 green.
+- [x] [Review][MED] `parked_market_value` sums `h.market_value` with NO None/finite/≤0 guard. **FIXED 2026-08-13:** guard added to `parked_market_value` (all callers) AND `_deployable_parked` mirrors the liquidation filter. (NB: `market_value` is NOT NULL at the DB, so a NULL is unreachable — the guard is defense-in-depth and also skips a reachable ≤0 row; +test.)
+- [x] [Review][MED] Negative-settlement clamp asymmetry. **ADDRESSED 2026-08-13:** engine clamps `max(0, view.cash)` and takes reserve out of TOTAL via `min(largest_parked, parked_total − reserve)` (excess reserve correctly draws from settlement). Full alignment with `plan_liquidation`'s raw-`view.cash` on a margin-DEBIT account is deferred (covered by the 10-9 execution backstop + the margin-account detect-warn follow-up).
+- [x] [Review][MED] parked/unclassified double-report: SWVXX shows in BOTH the unclassified sleeve AND investable. **FIXED 2026-08-13:** `classify_holdings` excludes parked+unclassified symbols from the sleeve (they're cash). +test (`SWVXX` not in `unclassified.symbols`, sleeve value 0).
+
+## Independent Review — full rework (2026-08-13)
+
+3-layer parallel adversarial pass in fresh contexts (Blind Hunter + Edge Case Hunter +
+Acceptance Auditor) over the complete rework diff. Blind Hunter + Acceptance Auditor:
+MERGE-READY, all 6 findings closed, money-math + split identity + never-invent gate verified.
+**Edge Case Hunter caught 1 HIGH the other two missed** (orthogonal method): in the
+MULTI-fund case `money_market_symbols` named EVERY parked fund, but 9-3 sells only the single
+largest and `from_money_market` is capped to it — so the narration/x-ray could name a fund
+that isn't sold (a qualitative never-invent-a-fact violation the number gate can't catch).
+
+**FIXED 2026-08-13:** `_deployable_parked` now returns the single `largest_symbol` (deterministic
+tie-break on lowest symbol, matching the 9-3 `_largest_parked_holding`); `build_plan` sets
+`money_market_symbols = [largest_symbol]` — only the ONE fund actually sold is ever named.
++tests (single-fund named, tie-break lowest-symbol, multi-fund names only the largest via `/plan`).
+Backend 866 + frontend 199 green. Rework COMPLETE and merge-ready.

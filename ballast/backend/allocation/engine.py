@@ -45,7 +45,7 @@ from allocation.config import get_config as get_target_config, resolve as resolv
 from brokers.portfolio import get_portfolio
 from cash.config import (
     get_config as get_cash_config,
-    parked_market_value,
+    normalize_symbols,
     resolve_reserve,
 )
 from db.scope import Scope
@@ -132,6 +132,18 @@ class Plan:
     unclassified_symbols: list[str] = field(default_factory=list)
     investable_cash: Decimal = _ZERO
     undeployed_cash: Decimal = _ZERO
+    # The honest funding split of ``investable_cash`` (Story 10.8 AC5), populated for
+    # ``deploy``: ``settlement_cash`` is the part already settled + spendable now;
+    # ``from_money_market`` is the part that comes from selling the user's parked
+    # money-market fund (which settles first, via the 9-3 liquidation) —
+    # ``settlement_cash + from_money_market == investable_cash``. ``reserve`` is the
+    # user's PROTECTED cushion (never deployed, never sold). These let the narrator
+    # honestly frame "$X is settled cash, $Y comes from selling your money-market;
+    # your $Z reserve stays untouched" without inventing a number.
+    settlement_cash: Decimal = _ZERO
+    from_money_market: Decimal = _ZERO
+    reserve: Decimal = _ZERO
+    money_market_symbols: list[str] = field(default_factory=list)
     reason: str = ""
     as_of: datetime | None = None
 
@@ -139,13 +151,24 @@ class Plan:
 # --- Pure engine (no I/O) ----------------------------------------------------
 
 
-def classify_holdings(holdings) -> Classification:
+def classify_holdings(holdings, parked_set: frozenset[str] = frozenset()) -> Classification:
     """Group ``holdings`` by asset class via ``SYMBOL_ASSET_CLASS`` (case-insensitive).
 
     Pure. Sums ``market_value`` per class; every asset class is present (0 when the
     user holds none of it). A holding whose symbol doesn't map to exactly one class
     (unmapped — VT whole-world, single stocks, non-index ETFs) accrues to the
     ``unclassified`` sleeve (total value + the de-duplicated, upper-cased symbols).
+
+    ``parked_set`` (normalized upper symbols the user declared as parked money-market)
+    routes a GENUINE cash-equivalent — a parked holding that is ALSO unclassified
+    (``asset_class_for`` is ``None``, e.g. SWVXX) — to NEITHER a class NOR the
+    unclassified sleeve: it is deployable CASH (counted once in ``investable`` via
+    :func:`_deployable_parked`), not a holding. This closes the Story-10.8 review
+    double-report (SWVXX appearing in both the unclassified sleeve AND investable). A
+    parked symbol that IS classified (e.g. VTI tagged parked) STAYS in its asset class
+    and is NOT treated as cash — so it is never double-counted in ``plan_deployment``'s
+    ``base`` (classified) AND ``investable`` (parked); the parked tag is simply ignored
+    for an index fund that belongs to a class.
     """
     by_class: dict[str, Decimal] = {cls: _ZERO for cls in ASSET_CLASSES}
     unclassified_value = _ZERO
@@ -157,6 +180,10 @@ def classify_holdings(holdings) -> Classification:
         value = h.market_value if h.market_value is not None else _ZERO
         cls = asset_class_for(symbol)
         if cls is None:
+            if symbol in parked_set:
+                # Genuine parked cash-equivalent (unclassified + declared parked) —
+                # counted as investable cash, never as an unclassified holding.
+                continue
             unclassified_value += value
             if symbol and symbol not in seen_unclassified:
                 seen_unclassified.add(symbol)
@@ -169,6 +196,44 @@ def classify_holdings(holdings) -> Classification:
         unclassified_value=unclassified_value,
         unclassified_symbols=unclassified_symbols,
     )
+
+
+def _deployable_parked(
+    holdings, parked_set: frozenset[str]
+) -> tuple[Decimal, Decimal, str | None]:
+    """Return ``(total, largest_value, largest_symbol)`` of the DEPLOYABLE parked cash.
+
+    A holding is deployable parked cash iff its symbol is declared parked AND it is
+    unclassified (``asset_class_for`` is ``None``) — i.e. a genuine money-market-style
+    fund, NOT an index fund that belongs to an asset class (those stay in their class,
+    never double-counted as cash). Mirrors the liquidation filter: an unpriced /
+    non-finite / ≤0 ``market_value`` is skipped.
+
+    ``total`` = Σ of all such holdings; ``largest_value`` = the biggest ONE of them and
+    ``largest_symbol`` = ITS symbol (``None`` when nothing qualifies). The Story-9.3
+    just-in-time liquidation sells ONLY the single largest parked fund, so
+    ``largest_value`` caps what one liquidation can free (the deploy plan never promises
+    more than a single settle-then-buy can cover), and ``largest_symbol`` is the ONE
+    fund the narration/UI may honestly name as being sold — never the whole parked list
+    (Story-10.8 review: naming every parked fund when only one is sold is a
+    never-invent-a-fact violation). Ties break on the LOWEST symbol, matching the 9-3
+    liquidation's ``_largest_parked_holding`` so the named fund is the one actually sold.
+    """
+    total = _ZERO
+    largest = _ZERO
+    largest_symbol: str | None = None
+    for h in holdings or []:
+        symbol = (h.symbol or "").strip().upper()
+        if symbol not in parked_set or asset_class_for(symbol) is not None:
+            continue
+        mv = h.market_value
+        if mv is None or not mv.is_finite() or mv <= _ZERO:
+            continue
+        total += mv
+        if mv > largest or (mv == largest and (largest_symbol is None or symbol < largest_symbol)):
+            largest = mv
+            largest_symbol = symbol
+    return total, largest, largest_symbol
 
 
 def plan_deployment(
@@ -326,7 +391,17 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     # (1) Resolved target — undecided → no_target (never a fabricated target).
     target_config = await get_target_config(scope, session)
     resolved = resolve_target_config(target_config)
-    classification = classify_holdings(view.holdings)
+    # Read the cash config up front so classification is parked-aware: a genuine
+    # parked cash-equivalent (declared + unclassified, e.g. SWVXX) is routed to
+    # NEITHER a class NOR the unclassified sleeve — it is deployable cash, counted
+    # once in ``investable`` (Story-10.8 review: no double-report / double-count).
+    cash_config = await get_cash_config(scope, session)
+    parked_set = (
+        frozenset(normalize_symbols(cash_config.parked_symbols))
+        if cash_config is not None
+        else frozenset()
+    )
+    classification = classify_holdings(view.holdings, parked_set)
     current = _current_breakdown(classification.by_class)
 
     if resolved is None:
@@ -350,7 +425,6 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     # (2) Reserve honesty — never-decided (no config row OR resolve_reserve None)
     # is decide_reserve, NOT silently 0. A declined reserve resolves to 0 and
     # proceeds normally.
-    cash_config = await get_cash_config(scope, session)
     reserve = resolve_reserve(cash_config) if cash_config is not None else None
     if reserve is None:
         return Plan(
@@ -367,27 +441,38 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
-    # (3) Investable cash = ready_to_trade + parked money-market − reserve (Story 10.8).
-    # ``ready_to_trade`` is settlement cash (``view.cash``, the balance row). Parked
-    # money-market — the user's DECLARED ``parked_symbols`` (e.g. SWVXX) — is a
-    # cash-equivalent they hold INSTEAD of idle cash, so it IS deployable and is
-    # counted here. The reserve is a cushion out of the TOTAL available (settlement +
-    # parked MM), never settlement alone. Clamp settlement to zero (a negative margin
-    # balance is not investable). ``reserve`` is re-validated (finite, non-negative),
-    # and the final ``investable`` is finiteness-checked, so a stored NaN cannot slip
-    # past the ``investable <= 0`` guard (NaN compares False) nor a negative inflate it.
+    # (3) Investable cash = settlement + single-fund-liquidatable parked − reserve
+    # (Story 10.8, hardened by its 2026-08-13 review). ``ready_to_trade`` is settlement
+    # cash (``view.cash``, clamped ≥ 0 — a negative margin balance is not investable).
+    # Parked money-market — the user's DECLARED, unclassified ``parked_symbols`` (e.g.
+    # SWVXX) — is a cash-equivalent they hold instead of idle cash, so it IS deployable.
+    # The reserve is a cushion out of the TOTAL available (settlement + parked).
     #
-    # EXECUTION SAFETY (Phase 2): counting parked MM here is ANALYSIS only. A deploy
-    # buy beyond settlement cash is funded at co-sign by liquidating parked MM first
-    # (Epic 9 ``cash.liquidation.plan_liquidation``, which frees ``max(parked − reserve,
-    # 0)`` and never touches the reserve), so a buy ALWAYS places against REAL settled
-    # cash — never margin. This ``investable`` therefore exactly equals settlement +
-    # the liquidatable parked (the reserve is subtracted exactly once, consistently).
+    # SINGLE-FUND CAP (review fix): the Story-9.3 just-in-time liquidation sells only the
+    # SINGLE largest parked fund, so the deployable parked contribution is capped at
+    # ``largest_parked`` — the plan never promises more cash than one settle-then-buy can
+    # actually free. The identity ``investable = settlement + min(largest_parked,
+    # parked_total − reserve)`` yields, per the derivation, ``min(cash_on_hand_after_one
+    # _liquidation, settlement + parked − reserve)`` — i.e. reserve out of total AND never
+    # more than a single liquidation frees. (``min`` term may go negative when reserve
+    # exceeds parked, correctly drawing the excess reserve from settlement → possibly
+    # ``no_cash``.)
+    #
+    # EXECUTION SAFETY: counting parked here is ANALYSIS only. A deploy buy beyond
+    # settlement is funded at co-sign by liquidating the parked fund first (Story 9.3),
+    # and — as of Story 10.9 — ``execute_approved_order`` REFUSES any buy exceeding real
+    # settled cash, so a buy ALWAYS places against real cash, never margin.
     ready_to_trade = max(_ZERO, view.cash)
-    parked = parked_market_value(view.holdings, cash_config)
+    parked_total, largest_parked, largest_parked_symbol = _deployable_parked(
+        view.holdings, parked_set
+    )
     if not reserve.is_finite() or reserve < _ZERO:
         reserve = _ZERO
-    investable = ready_to_trade + parked - reserve
+    parked_after_reserve = parked_total - reserve
+    liquidatable_parked = (
+        largest_parked if largest_parked < parked_after_reserve else parked_after_reserve
+    )
+    investable = ready_to_trade + liquidatable_parked
     if not investable.is_finite() or investable <= _ZERO:
         return Plan(
             status=STATUS_NO_CASH,
@@ -403,6 +488,21 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             ),
             as_of=as_of,
         )
+
+    # Honest funding split (Story 10.8 AC5): the part of ``investable`` that comes
+    # from selling the parked money-market (``from_money_market``) vs settled cash
+    # already spendable now (``settlement_cash``). ``from_money_market`` is the
+    # POSITIVE liquidatable-parked contribution (0 when the deploy is pure settlement
+    # cash, or when the reserve fully absorbs parked); the remainder is settled cash.
+    from_money_market = liquidatable_parked if liquidatable_parked > _ZERO else _ZERO
+    settlement_cash = investable - from_money_market
+    # Name ONLY the single fund the 9-3 liquidation actually sells (the largest) —
+    # never the whole parked list, which would misstate what's being sold.
+    money_market_symbols = (
+        [largest_parked_symbol]
+        if from_money_market > _ZERO and largest_parked_symbol is not None
+        else []
+    )
 
     # (4)/(5) Deterministic cash-only rebalance.
     deployment = plan_deployment(
@@ -438,6 +538,10 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         unclassified_symbols=classification.unclassified_symbols,
         investable_cash=investable,
         undeployed_cash=deployment.undeployed_cash,
+        settlement_cash=settlement_cash,
+        from_money_market=from_money_market,
+        reserve=reserve,
+        money_market_symbols=money_market_symbols,
         reason="",
         as_of=as_of,
     )

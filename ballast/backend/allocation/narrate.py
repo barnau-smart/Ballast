@@ -299,6 +299,38 @@ def build_narration_facts(plan: Plan) -> tuple[EvidenceRecord, ...]:
             as_of=as_of,
         )
     )
+
+    # Story 10.8 AC5 — money-market funding split (only when the deploy draws on it):
+    # the honest "$X settled + $Y from selling your money-market; $Z reserve protected"
+    # picture, as a citable fact with the raw Decimals in ``stats``.
+    if plan.from_money_market > _ZERO:
+        split_stats = {
+            "settlement_cash": plan.settlement_cash,
+            "from_money_market": plan.from_money_market,
+            "reserve": plan.reserve,
+        }
+        mm_funds = ", ".join(plan.money_market_symbols)
+        fund_phrase = (
+            f"your money-market fund ({mm_funds})"
+            if mm_funds
+            else "your money-market fund"
+        )
+        records.append(
+            EvidenceRecord(
+                id=make_id(EvidenceKind.STRATEGY, "CASH_SOURCE", as_of, split_stats),
+                kind=EvidenceKind.STRATEGY,
+                statement=(
+                    f"Of your ${format_money(plan.investable_cash)} investable, "
+                    f"${format_money(plan.settlement_cash)} is settled cash and "
+                    f"${format_money(plan.from_money_market)} comes from selling "
+                    f"{fund_phrase}, which settles first; your "
+                    f"${format_money(plan.reserve)} reserve stays untouched."
+                ),
+                stats=split_stats,
+                source=_EVIDENCE_SOURCE,
+                as_of=as_of,
+            )
+        )
     return tuple(records)
 
 
@@ -341,6 +373,12 @@ def allowed_facts(plan: Plan) -> frozenset[tuple[Decimal, str]]:
 
     _add_money(allowed, plan.investable_cash)
     _add_money(allowed, plan.undeployed_cash)
+    # Story 10.8 AC5: the honest funding split + protected reserve so the narration can
+    # frame "$X settled cash, $Y from selling your money-market; your $Z reserve stays
+    # untouched" without any figure tripping the never-invent-a-number gate.
+    _add_money(allowed, plan.settlement_cash)
+    _add_money(allowed, plan.from_money_market)
+    _add_money(allowed, plan.reserve)
 
     for vals in plan.current.values():
         market_value = vals.get("market_value", _ZERO)
@@ -466,13 +504,28 @@ def _fallback_narration(
         f"${format_money(item.amount)} of {item.symbol}" for item in plan.action_items
     )
 
+    # Story 10.8 AC5 — honest money-market framing: only when the deploy actually draws
+    # on the parked money-market (else it would misdescribe a pure settled-cash deploy).
+    funding_phrase = ""
+    if plan.from_money_market > 0:
+        funding_phrase = (
+            f" Of that, ${format_money(plan.settlement_cash)} is settled cash you can "
+            f"use now, and about ${format_money(plan.from_money_market)} comes from "
+            "selling your money-market fund, which settles first before those buys go "
+            "in."
+        )
+        if plan.reserve > 0:
+            funding_phrase += (
+                f" Your ${format_money(plan.reserve)} reserve stays untouched."
+            )
+
     action_label = "Put your idle cash to work toward your target mix"
     reasoning = (
         f"Compared with the target mix you chose, you're light on {classes_phrase}, "
         f"so this plan buys {buys_phrase} — the broad, low-cost index funds for "
-        "those classes — to move you back toward that balance. This is plain "
-        "diversification and rebalancing toward your target, not a bet on any hot "
-        "pick or a guess about where the market is headed. The tradeoff: it "
+        f"those classes — to move you back toward that balance.{funding_phrase} This "
+        "is plain diversification and rebalancing toward your target, not a bet on "
+        "any hot pick or a guess about where the market is headed. The tradeoff: it "
         "doesn't try to time the market, and any cash beyond what closes the gaps "
         f"is left undeployed (${format_money(plan.undeployed_cash)}) rather than "
         "stretched past your target."
@@ -538,7 +591,21 @@ def compose_narration_request(
         + "\n".join(weight_lines)
         + f"\nInvestable cash: ${format_money(plan.investable_cash)}\n"
         f"Undeployed (leftover) cash: ${format_money(plan.undeployed_cash)}\n"
-        "Cite ONLY these evidence IDs, exactly as given:\n"
+        + (
+            # Story 10.8 AC5: the honest funding split, fed as facts to explain (only
+            # when the deploy actually draws on the parked money-market).
+            (
+                f"Funding split: ${format_money(plan.settlement_cash)} is settled cash; "
+                f"${format_money(plan.from_money_market)} comes from selling the "
+                "money-market fund "
+                f"({', '.join(plan.money_market_symbols) or 'money-market'}), which "
+                "settles first; the protected reserve "
+                f"${format_money(plan.reserve)} is never sold.\n"
+            )
+            if plan.from_money_market > _ZERO
+            else ""
+        )
+        + "Cite ONLY these evidence IDs, exactly as given:\n"
         + evidence_json
     )
     return LLMRequest(

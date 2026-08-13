@@ -753,3 +753,76 @@ def test_narration_per_user_isolation(client):
     finally:
         _delete_user(email_a)
         _delete_user(email_b)
+
+
+# --- Story 10.8 AC5: honest money-market funding framing ---------------------
+
+
+def _mm_deploy_plan() -> Plan:
+    """MasterB's shape: $65,949.08 investable = $12,182.82 settled + $53,766.26 from
+    selling SWVXX; $40,000 reserve protected."""
+    return Plan(
+        status=STATUS_DEPLOY,
+        action_items=[
+            ActionItem("intl_equity", "VXUS", Decimal("53766.26")),
+            ActionItem("bonds", "BND", Decimal("12182.82")),
+        ],
+        primary_order=ActionItem("intl_equity", "VXUS", Decimal("53766.26")),
+        current={
+            "us_equity": {"market_value": Decimal("0"), "weight": Decimal("0")},
+            "intl_equity": {"market_value": Decimal("0"), "weight": Decimal("0")},
+            "bonds": {"market_value": Decimal("0"), "weight": Decimal("0")},
+        },
+        target_weights={
+            "us_equity": Decimal("0.60"),
+            "intl_equity": Decimal("0.30"),
+            "bonds": Decimal("0.10"),
+        },
+        investable_cash=Decimal("65949.08"),
+        undeployed_cash=Decimal("0.00"),
+        settlement_cash=Decimal("12182.82"),
+        from_money_market=Decimal("53766.26"),
+        reserve=Decimal("40000.00"),
+        money_market_symbols=["SWVXX"],
+        reason="",
+        as_of=datetime.datetime(2026, 8, 13, tzinfo=datetime.timezone.utc),
+    )
+
+
+def test_allowed_facts_admits_funding_split_and_reserve():
+    allowed = allowed_facts(_mm_deploy_plan())
+    assert (Decimal("12182.82"), UNIT_MONEY) in allowed   # settled portion
+    assert (Decimal("53766.26"), UNIT_MONEY) in allowed   # from money-market
+    assert (Decimal("40000.00"), UNIT_MONEY) in allowed   # protected reserve
+
+
+def test_fallback_frames_money_market_split_and_passes_gates():
+    plan = _mm_deploy_plan()
+    narration = _fallback_narration(plan, build_narration_facts(plan))
+    text = narration.reasoning
+    # Honest framing present.
+    assert "money-market" in text
+    assert "settled cash" in text
+    assert "stays untouched" in text
+    assert "$53766.26" in text and "$12182.82" in text and "$40000.00" in text
+    # And every number is engine-provided (no invented figure) + no forecast.
+    check_no_invented_numbers(text, allowed_facts(plan))
+    check_no_forecast(text)
+
+
+def test_fallback_omits_money_market_when_pure_settlement_deploy():
+    """A deploy funded entirely by settled cash (from_money_market == 0) must NOT
+    mention selling a money-market fund (that would misdescribe it)."""
+    plan = _growth_deploy_plan()  # no split fields → from_money_market == 0
+    text = _fallback_narration(plan, build_narration_facts(plan)).reasoning
+    assert "money-market" not in text
+    assert "stays untouched" not in text
+    check_no_invented_numbers(text, allowed_facts(plan))
+
+
+def test_build_narration_facts_emits_cash_source_record_only_when_mm_used():
+    with_mm = build_narration_facts(_mm_deploy_plan())
+    assert any("money-market" in r.statement for r in with_mm)
+    assert any(r.stats.get("from_money_market") == Decimal("53766.26") for r in with_mm)
+    without_mm = build_narration_facts(_growth_deploy_plan())
+    assert not any("money-market" in r.statement for r in without_mm)
