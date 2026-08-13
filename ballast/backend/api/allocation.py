@@ -82,6 +82,7 @@ class PlanOut(BaseModel):
     action_items: list[ActionItemOut]
     primary_order: PrimaryOrderOut | None = None
     current: dict[str, CurrentSleeveOut]
+    target_weights: dict[str, str]
     unclassified: dict[str, object]
     investable_cash: str
     undeployed_cash: str
@@ -178,6 +179,9 @@ def _plan_out(plan: Plan) -> PlanOut:
                 weight=format_money(vals["weight"]),
             )
             for cls, vals in plan.current.items()
+        },
+        target_weights={
+            cls: format_money(weight) for cls, weight in plan.target_weights.items()
         },
         unclassified={
             "market_value": format_money(plan.unclassified_value),

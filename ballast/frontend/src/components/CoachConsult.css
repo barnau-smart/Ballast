@@ -219,3 +219,28 @@
   padding: var(--ballast-space-4) var(--ballast-space-12);
   margin: 0;
 }
+
+/* Story 10.7 — the "where you are vs your target" x-ray beside a deploy /
+ * no-action result. Calm, muted, secondary to the recommended move. */
+.ballast-consult__xray {
+  margin-top: var(--ballast-space-12);
+  padding: var(--ballast-space-12);
+  background-color: var(--ballast-color-surface-2);
+  border-radius: var(--ballast-radius-base);
+}
+
+.ballast-consult__xray-title {
+  margin-top: 0;
+  margin-bottom: var(--ballast-space-4);
+  font-weight: 600;
+}
+
+.ballast-consult__xray-list {
+  margin: 0;
+  padding-left: var(--ballast-space-20);
+}
+
+.ballast-consult__xray-unclassified {
+  margin-top: var(--ballast-space-4);
+  margin-bottom: 0;
+}

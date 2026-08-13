@@ -97,6 +97,19 @@ const DEPLOY_NARRATION = {
   ],
 }
 
+// Story 10.7 — a deploy plan carrying the full current-vs-target x-ray + an
+// unclassified holding.
+const XRAY_PLAN = {
+  ...DEPLOY_PLAN,
+  current: {
+    us_equity: { market_value: '6000.00', weight: '0.6000' },
+    intl_equity: { market_value: '0.00', weight: '0.0000' },
+    bonds: { market_value: '0.00', weight: '0.0000' },
+  },
+  target_weights: { us_equity: '0.60', intl_equity: '0.30', bonds: '0.10' },
+  unclassified: { market_value: '500.00', symbols: ['TSLA'] },
+}
+
 describe('CoachConsult — deploy-my-cash affordance (Story 10.2/10.3)', () => {
   it('populates the order controls + renders the advisor narration on a deploy plan, no submit', async () => {
     const fetchMock = stubFetch({ plan: DEPLOY_PLAN, narration: DEPLOY_NARRATION })
@@ -138,6 +151,30 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2/10.3)', () => {
     const opts = narrationCall[1] ?? {}
     expect(opts.method ?? 'GET').toBe('GET')
     expect(opts.body).toBeUndefined()
+  })
+
+  it('renders the current-vs-target x-ray + unclassified sleeve on a deploy plan (Story 10.7)', async () => {
+    stubFetch({ plan: XRAY_PLAN, narration: DEPLOY_NARRATION })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+
+    const xray = await screen.findByTestId('coach-deploy-xray')
+    expect(xray).toBeInTheDocument()
+    expect(screen.getByTestId('coach-xray-us_equity')).toHaveTextContent(
+      /US stocks.*60% now.*target 60%/i,
+    )
+    expect(screen.getByTestId('coach-xray-intl_equity')).toHaveTextContent(
+      /International.*0% now.*target 30%/i,
+    )
+    expect(screen.getByTestId('coach-xray-bonds')).toHaveTextContent(
+      /Bonds.*0% now.*target 10%/i,
+    )
+    // Unclassified holdings surfaced honestly (excluded from the target math).
+    expect(screen.getByTestId('coach-xray-unclassified')).toHaveTextContent(
+      /Not counted toward your target mix: \$500\.00 \(TSLA\)/i,
+    )
+    expectCalm(xray.textContent)
   })
 
   it('shows the calm reason and populates NOTHING on a no-action status', async () => {

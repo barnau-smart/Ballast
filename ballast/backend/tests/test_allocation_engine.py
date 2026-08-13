@@ -664,6 +664,49 @@ def test_per_user_isolation(client):
         _delete_user(email_b)
 
 
+def test_plan_serializes_target_weights(client):
+    """Story 10.7 — `target_weights` is on the wire (fixed-point fraction strings) so
+    the UI can show current-vs-target, matching the user's chosen model (growth = 60/30/10)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "4000")
+        _seed_holding(uid, "VTI", "6000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(uid, reserve_amount="0", reserve_decided=True)
+
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        tw = body["target_weights"]
+        assert tw and sum(Decimal(v) for v in tw.values()) == Decimal("1.00")
+        assert sorted(Decimal(v) for v in tw.values()) == [
+            Decimal("0.10"),
+            Decimal("0.30"),
+            Decimal("0.60"),
+        ]
+    finally:
+        _delete_user(email)
+
+
+def test_plan_target_weights_empty_when_no_target(client):
+    """A plan with no chosen model (no_target) carries an empty target_weights map —
+    the UI degrades calmly rather than rendering a phantom target."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "4000")
+
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "no_target"
+        assert body["target_weights"] == {}
+    finally:
+        _delete_user(email)
+
+
 # --- Calm-copy tone bar (mirrors test_digest_compose.FORBIDDEN) ---------------
 
 _FORBIDDEN = [

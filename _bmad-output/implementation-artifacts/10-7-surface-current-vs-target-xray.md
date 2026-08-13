@@ -1,7 +1,7 @@
 # Story 10.7: Surface the current-vs-target x-ray in the deploy card
 
-Status: ready-for-dev
-baseline_commit: TBD
+Status: review
+baseline_commit: 6df402f
 
 <!-- HARD GATE (docs/dev-loop-policy.md): scope APPROVED by MasterB 2026-08-13 (deferred
      UI-completeness item from the Epic 10 Group-C review). Display-only over
@@ -27,12 +27,12 @@ The deploy engine already computes the full x-ray (`Plan.current` per-class weig
 
 ## Tasks / Subtasks
 
-- [ ] Task 1 — Serialize `target_weights` (AC: 1, 4)
-  - [ ] Add `target_weights: dict[str, str]` to `PlanOut`; populate in `_plan_out` from `plan.target_weights` (fixed-point strings). Backend test: `/plan` + `/narration` carry `target_weights` for a deploy plan; empty for `no_target`.
-- [ ] Task 2 — Render the x-ray strip (AC: 2, 3, 5)
-  - [ ] In `CoachConsult.jsx`, render current-vs-target per class + the unclassified sleeve from `data.plan`. Percents = fraction ×100 (guard non-finite → "—"). Calm copy. Degrade calmly when target/current absent.
-- [ ] Task 3 — Tests (AC: all)
-  - [ ] Backend: `PlanOut.target_weights` serialization (deploy + no_target). Frontend: the x-ray strip renders current-vs-target + unclassified from a stubbed plan; absent target degrades calmly; calm-copy assertion; nothing auto-submitted.
+- [x] Task 1 — Serialize `target_weights` (AC: 1, 4)
+  - [x] Added `target_weights: dict[str, str]` to `PlanOut`; populated in `_plan_out` from `plan.target_weights` (fixed-point strings). Covers `/plan` + `/narration` (both use `_plan_out`).
+- [x] Task 2 — Render the x-ray strip (AC: 2, 3, 5)
+  - [x] `AllocationXray` component in `CoachConsult.jsx` renders current-vs-target per class (`xrayPct` = fraction ×100, non-finite → "—") + the unclassified sleeve, held in `deployPlan` state, shown in the deployed + no-action blocks. Returns null when there's no target and no unclassified (calm degrade). Calm token-based CSS.
+- [x] Task 3 — Tests (AC: all)
+  - [x] Backend +2 (`target_weights` serialized for deploy; empty for `no_target`). Frontend +1 (the x-ray strip renders current-vs-target + unclassified from a stubbed deploy plan; calm-copy). Backend 838 + frontend 197 green.
 
 ## Dev Notes
 
@@ -60,8 +60,22 @@ The deploy engine already computes the full x-ray (`Plan.current` per-class weig
 
 ### Agent Model Used
 
-### Debug Log References
+claude-opus-4-8[1m] (dev-story, in-chat)
 
 ### Completion Notes List
 
+- Backend: `PlanOut` gains `target_weights` (fixed-point fraction strings), serialized in `_plan_out` — additive, both `/plan` and the deploy card's `/narration` source now carry it. The Group-B "wire-dead `Plan.target_weights`" is now consumed.
+- Frontend: `AllocationXray` renders "US stocks: 60% now · target 60%" per class + the unclassified sleeve ("Not counted toward your target mix: $500.00 (TSLA)"), from a new `deployPlan` state set on the deployed/no-action branches and cleared at fetch start. Percents are the only client math (fraction ×100); non-finite → "—"; no chosen target → renders nothing (calm degrade).
+- Display-only: no engine/`/approve`/order-control change; money-safety contracts (populate-don't-submit, scoping, no-XSS — React-escaped text, fixed-point strings) untouched. `/plan` wire is additive.
+
 ### File List
+
+- `ballast/backend/api/allocation.py` — `PlanOut.target_weights` + `_plan_out` serialization.
+- `ballast/backend/tests/test_allocation_engine.py` — +2 serialization tests.
+- `ballast/frontend/src/components/CoachConsult.jsx` — `AllocationXray` + `xrayPct` + `deployPlan` state + render in deployed/no-action blocks.
+- `ballast/frontend/src/components/CoachConsult.css` — calm token-based x-ray styles.
+- `ballast/frontend/src/test/deploy-cash.test.jsx` — +1 x-ray render test.
+
+## Change Log
+
+- 2026-08-13 — Story 10.7 implemented: surface the current-vs-target x-ray + unclassified sleeve in the deploy card. Added `target_weights` to `PlanOut`; `AllocationXray` renders the breakdown. Display-only; closes the Group-C deferred UI-completeness item. Backend 838 + frontend 197 green.

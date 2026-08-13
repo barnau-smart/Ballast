@@ -59,6 +59,72 @@ function parseOrder(symbol, amount, side) {
   return { symbol: s, side, amount: a }
 }
 
+// Story 10.7 — friendly labels + fixed order for the current-vs-target x-ray.
+const XRAY_CLASSES = [
+  ['us_equity', 'US stocks'],
+  ['intl_equity', 'International'],
+  ['bonds', 'Bonds'],
+]
+
+// Render a backend fixed-point fraction weight (e.g. "0.6000") as a calm percent
+// ("60%", "55.5%"); a non-finite/missing value degrades to an em dash.
+function xrayPct(fraction) {
+  const n = Number(fraction)
+  if (!Number.isFinite(n)) return '—'
+  return `${(n * 100).toFixed(1).replace(/\.0$/, '')}%`
+}
+
+// Story 10.7 — the "where you are vs your target" x-ray shown beside a deploy /
+// no-action plan. Display-only over engine-sourced fixed-point strings (percents
+// are the only client math: fraction × 100). Renders NOTHING when there is no
+// chosen target (a no_target plan) so the UI degrades calmly.
+function AllocationXray({ plan }) {
+  if (!plan) return null
+  const target = plan.target_weights || {}
+  const current = plan.current || {}
+  const hasTarget = Object.keys(target).length > 0
+  const unclassified = plan.unclassified || {}
+  const unclassifiedSymbols = Array.isArray(unclassified.symbols)
+    ? unclassified.symbols
+    : []
+  const unclassifiedValue = Number(unclassified.market_value)
+  const showUnclassified =
+    unclassifiedSymbols.length > 0 ||
+    (Number.isFinite(unclassifiedValue) && unclassifiedValue > 0)
+  if (!hasTarget && !showUnclassified) return null
+  return (
+    <div className="ballast-consult__xray" data-testid="coach-deploy-xray">
+      {hasTarget ? (
+        <>
+          <p className="ballast-consult__xray-title">
+            Where you are vs your target mix
+          </p>
+          <ul className="ballast-consult__xray-list">
+            {XRAY_CLASSES.filter(([key]) => key in target).map(([key, label]) => (
+              <li key={key} data-testid={`coach-xray-${key}`}>
+                {label}: {xrayPct(current[key]?.weight)} now · target{' '}
+                {xrayPct(target[key])}
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {showUnclassified ? (
+        <p
+          className="ballast-consult__xray-unclassified"
+          data-testid="coach-xray-unclassified"
+        >
+          Not counted toward your target mix: ${unclassified.market_value}
+          {unclassifiedSymbols.length > 0
+            ? ` (${unclassifiedSymbols.join(', ')})`
+            : ''}
+          .
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 export function CoachConsult() {
   const [question, setQuestion] = useState('')
   const [symbol, setSymbol] = useState('')
@@ -120,6 +186,9 @@ export function CoachConsult() {
   // controls so the human sees the why/tradeoff/uncertainty before co-signing.
   // Cleared on every fresh ask/decline/deploy alongside the other deploy resets.
   const [deployNarration, setDeployNarration] = useState(null)
+  // Story 10.7 — the deploy plan's current-vs-target breakdown + unclassified
+  // sleeve, held for the x-ray shown beside a deploy / no-action result.
+  const [deployPlan, setDeployPlan] = useState(null)
   const deployingRef = useRef(false) // synchronous double-click guard
 
   // Story 10.4 — "Review my portfolio". Fetches the SELL-side analysis buckets
@@ -573,6 +642,7 @@ export function CoachConsult() {
     deployingRef.current = true
     setDeploy('loading')
     setDeployMessage('')
+    setDeployPlan(null) // clear any prior x-ray until this fetch resolves
     // NOTE: we do NOT reset a shown recommendation here. A no-action / failed /
     // error deploy must leave any recommendation the user is viewing intact — we
     // only clear it on the successful populate branch, right before we repopulate.
@@ -642,6 +712,7 @@ export function CoachConsult() {
         // Story 10.3 — store the advisor narration for the CoachCard beside the
         // populated controls.
         setDeployNarration(narration ?? null)
+        setDeployPlan(plan) // Story 10.7 — the current-vs-target x-ray
         setDeployMessage('')
         setDeploy('deployed')
         return
@@ -658,6 +729,7 @@ export function CoachConsult() {
       // Any no-action status (at_target / no_cash / no_target / decide_reserve) —
       // show the calm narration reason (or the plan reason) and populate NOTHING.
       setDeployNarration(null)
+      setDeployPlan(plan ?? null) // Story 10.7 — x-ray for a no-action plan too
       setDeployMessage(
         narration?.reasoning ||
           plan?.reason ||
@@ -1030,17 +1102,23 @@ export function CoachConsult() {
           {/* Story 10.3 — the fiduciary-advisor narration (why/tradeoff/cited
               data/uncertainty) beside the populated controls. */}
           {deployNarration ? <CoachCard recommendation={deployNarration} /> : null}
+          {/* Story 10.7 — the current-vs-target x-ray beside the populated buy. */}
+          <AllocationXray plan={deployPlan} />
         </div>
       ) : null}
 
       {deploy === 'no-action' ? (
-        <p
-          className="ballast-consult__note"
-          data-testid="coach-deploy-no-action"
-          role="status"
-        >
-          {deployMessage}
-        </p>
+        <div className="ballast-consult__deploy-result">
+          <p
+            className="ballast-consult__note"
+            data-testid="coach-deploy-no-action"
+            role="status"
+          >
+            {deployMessage}
+          </p>
+          {/* Story 10.7 — even with nothing to deploy, show where you stand. */}
+          <AllocationXray plan={deployPlan} />
+        </div>
       ) : null}
 
       {deploy === 'signed-out' ? (
