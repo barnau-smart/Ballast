@@ -553,5 +553,5 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         money_market_symbols=money_market_symbols,
         reason="",
         account_type=account_type,
-            as_of=as_of,
+        as_of=as_of,
     )

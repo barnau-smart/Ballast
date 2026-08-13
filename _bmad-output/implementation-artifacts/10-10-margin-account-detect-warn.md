@@ -1,6 +1,6 @@
 # Story 10.10: Margin-account detect & gently warn
 
-Status: review
+Status: done
 baseline_commit: 4c1bb0a
 
 <!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB
@@ -131,3 +131,22 @@ claude-opus-4-8[1m] (bmad-dev-story, in-chat)
 ## Change Log
 
 - 2026-08-13 — Story 10.10 implemented: detect a MARGIN Schwab account (`securitiesAccount.type`) and gently, one-time-dismissibly warn on the deploy coach card that Ballast deploys only settled cash and never buys on margin. Read-only/informational — no money-math change (engine still anchors to `cashBalance`). Additive nullable `portfolio_balance.account_type` column + idempotent migration; threaded snapshot→view→plan→API→frontend. Backend 877 + frontend 201 green. Money-path-adjacent → awaiting mandatory independent review before merge.
+
+## Independent Review (2026-08-13) — MERGE-READY
+
+Two fresh-context reviewers (Blind Hunter + Edge-Case/Acceptance). Both: **MERGE-READY, no
+Critical/High.** The cardinal safety property is verified — `account_type` NEVER feeds any
+number (cash still anchors to `cashBalance`; no deploy/investable math touched); the Schwab
+normalization guard (`isinstance(str) and .strip()`) is airtight so a good read can never
+become a cache-wiping FAILED read; written on both reconcile write paths; per-user scoped;
+frontend gated strictly on `=== "MARGIN"` with fail-safe localStorage and no XSS; all 5 ACs
+MET with code+test evidence; Plan carries account_type on all 5 statuses.
+
+- [x] [Review][Low] cosmetic: `engine.py` final deploy return had `as_of` over-indented after
+  the scripted `account_type` insert — **FIXED** (re-aligned to 8 spaces).
+- [Review][Low][defer] a strictly-newer reconcile with `account_type=None` nulls a prior
+  "MARGIN" → fail-open (no warning), benign by design; the real Schwab always reports `type`.
+  Noted, not changed.
+- [Review][Low][defer] `allocation/review.py`'s internal `PortfolioView` aggregation helper
+  omits `account_type` (defaults None) — not the plan→PlanOut path, no margin note lost, no
+  money math affected. Noted, not changed.
