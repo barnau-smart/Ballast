@@ -981,3 +981,26 @@ async def test_reconcile_overwrites_a_prior_debit_with_broker_truth(two_owner_id
         )
     async with async_session_maker() as session:
         assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("900.00")
+
+
+# --- Demo portfolio flag (safe team demo — fake data only) -------------------
+
+
+def test_fake_demo_portfolio_flag_returns_demo_holdings(monkeypatch):
+    """DEMO_PORTFOLIO=1 → the richer presentation portfolio (all-US + single stocks
+    + a few thousand cash), so a team demo tells the deploy story on FAKE data."""
+    from brokers.fake_adapter import DEMO_CASH
+    monkeypatch.setenv("DEMO_PORTFOLIO", "1")
+    snap = FakeBrokerAdapter().fetch_portfolio()
+    symbols = {h.symbol for h in snap.holdings}
+    assert symbols == {"VTI", "AAPL", "NVDA"}          # all-US + unclassified singles
+    assert "VXUS" not in symbols and "BND" not in symbols  # underweight → deploy buys them
+    assert snap.cash == DEMO_CASH == Decimal("4000.00")
+    assert snap.account_type == "CASH"                  # never a margin warning in demo
+
+
+def test_fake_default_portfolio_unchanged_without_flag():
+    """Default (no flag) is the small 3-fund portfolio — tests/normal runs unaffected."""
+    snap = FakeBrokerAdapter().fetch_portfolio()
+    assert {h.symbol for h in snap.holdings} == {"VTI", "VXUS", "BND"}
+    assert snap.cash == FAKE_CASH == Decimal("750.25")

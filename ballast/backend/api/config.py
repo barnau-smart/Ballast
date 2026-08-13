@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # "schwab" when the three SCHWAB_* values below are set.
     BROKER_ADAPTER: str = "fake"
 
+    # Demo mode (fake broker only): when true, the FakeBrokerAdapter returns a
+    # richer, presentation-friendly PORTFOLIO (an all-US position + a couple single
+    # stocks + a few thousand cash) instead of its small default, so a team demo
+    # tells the clean "all-US → buy Bonds & International" deploy story WITHOUT any
+    # real account data. Ignored entirely on the real (schwab) path — this only
+    # shapes fake data. Default off, so tests/real runs are unaffected.
+    DEMO_PORTFOLIO: bool = False
+
     # Schwab developer app credentials. Empty by default — the SchwabAdapter is
     # code-complete but gated: using it without these raises a clear
     # "Schwab not configured" error (it never crashes at import).
