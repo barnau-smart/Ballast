@@ -1,6 +1,6 @@
 # Story 10.12: Keep settled cash fresh across sequential buys
 
-Status: ready-for-dev
+Status: done
 baseline_commit: 6f37e66
 
 <!-- HARD GATE (docs/dev-loop-policy.md, per-story-spec-approval): APPROVED by MasterB 2026-08-13 —
@@ -116,3 +116,66 @@ _(to be filled by dev)_
 ### Completion Notes List
 
 ### File List
+
+## Dev Agent Record
+
+### Agent Model Used
+
+claude-opus-4-8[1m] (bmad-dev-story, in-chat)
+
+### Completion Notes List
+
+- **`brokers/portfolio.py:debit_cash(scope, session, amount)`** — the sole balance writer's
+  new one-way debit: scoped `UPDATE portfolio_balance SET cash = GREATEST(cash - amount, 0)`
+  (clamps ≥ 0), commits, returns `True` iff a row was debited. No-op on system scope,
+  non-finite/≤0 amount, or no balance row (rowcount 0). AD-14 single-writer preserved
+  (`/approve` calls this; never writes the row itself).
+- **`api/coach.py`** — new best-effort `_maybe_debit_cash_for_buy` (BUY + `_is_placed` +
+  executed `filled_qty`×`avg_price` > 0 → `debit_cash`), called in BOTH `/approve` return
+  paths AFTER the cosign commit, wrapped so a debit failure never fails the placed/cosigned
+  order (mirrors `_maybe_queue_switch_buy`). SELLs never credit; rejected/pending/timeout
+  debit nothing.
+- **Money-safety:** the executed cost = the real spend (fake MARKET fills `amount/100 × 100`
+  = amount exactly). A second buy now sees the reduced cached cash and the 10-9 gate refuses
+  an overdraw. Conservative (one-way), no network read, no holdings replace.
+- **Zero blast radius:** no-op without a balance row → the existing approve-BUY harness (which
+  seeds no balance) is unaffected. Backend 884 passed (877 + 7 new).
+- `followup_review_recommended: true` — money-path; mandatory independent review before merge.
+
+### File List
+
+- `ballast/backend/brokers/portfolio.py` — `func` import; `debit_cash` sole-writer helper.
+- `ballast/backend/api/coach.py` — import `debit_cash`; `_maybe_debit_cash_for_buy`; call in both `/approve` return paths.
+- `ballast/backend/tests/test_portfolio.py` — +5 `debit_cash` unit tests (reduces / clamps-at-0 / no-row no-op / ignores ≤0 / per-user scope).
+- `ballast/backend/tests/test_coach_api.py` — +2 integration tests (sequential-buy overdraw blocked; SELL never credits) + helpers.
+
+## Change Log
+
+- 2026-08-13 — Story 10.12 implemented: after a co-signed BUY fills, debit the cached
+  `portfolio_balance.cash` by the executed cost (sole-writer `debit_cash`, best-effort after
+  cosign) so a subsequent buy's Story-10.9 cover gate sees the reduced cash — closing the
+  sequential-buy overdraw/margin gap. One-way (never credits a SELL — proceeds unsettled),
+  clamped ≥ 0, no network read, no-op without a balance row. +7 tests, backend 884 passed.
+  Money-path → awaiting mandatory independent review before merge.
+
+## Independent Review (2026-08-13) — MERGE-READY
+
+Two fresh-context reviewers (Blind Hunter + Edge/Acceptance). Both: **MERGE-READY, no
+Critical/High.** All 5 ACs MET with real code + test evidence, including a genuine
+buy→debit→second-buy-refused end-to-end test (AC1) and SELL-never-credits (AC2). Verified:
+executed-cost debit is correct (partial fills debit only the filled cost); `_is_placed`-True-
+but-0-fill (`pending`/`timeout`+broker_ref) is guarded → no spurious debit; idempotent
+re-approve does NOT re-debit (cosigned short-circuit precedes the debit); both `/approve`
+return paths debit exactly once per placement (mutually exclusive); AD-14 single-writer
+preserved; per-user scoped `UPDATE`; `GREATEST(...,0)` clamp all-Decimal/Numeric(20,2), no
+float; a later reconcile still overwrites the debit with broker truth.
+
+- [x] [Review][Low] AC5 (reconcile overwrites a prior debit) had no dedicated test — **ADDED**
+  `test_reconcile_overwrites_a_prior_debit_with_broker_truth`.
+- [Review][Low][defer] A resting/pending LIMIT (GTC) BUY isn't debited until it fills — a
+  pre-existing cached-cash-model limitation, out of 10-12's sequential-market-buy scope; the
+  next reconcile corrects it. Noted.
+- [Review][Low][defer] Fractional-cent rounding on store (Numeric(20,2)) — negligible,
+  conservative-neutral. Noted.
+- [Review][Low][defer] Concurrent DIFFERENT-decision approves (TOCTOU) — pre-existing, out of
+  the sequential scope this story targets, strictly improved vs main. Noted.

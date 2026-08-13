@@ -49,7 +49,7 @@ from db.atomic import conditional_claim
 from db.models import PortfolioBalance, PortfolioCache
 from db.repository import ScopedRepository
 from db.scope import Scope
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -129,6 +129,40 @@ async def get_portfolio(scope: Scope, session: AsyncSession) -> PortfolioView:
     rows = await repo.list()
     balance = await _read_balance(scope, session)
     return _to_view(rows, balance)
+
+
+async def debit_cash(scope: Scope, session: AsyncSession, amount: Decimal) -> bool:
+    """Debit the user's cached settled cash by ``amount`` after a filled BUY (Story 10.12).
+
+    The Story-10.9 cover gate reads the CACHED ``portfolio_balance.cash``, which
+    ``/approve`` did not refresh after a fill — so two sequential buys in one session
+    could both pass the gate against the SAME pre-buy cash and overdraw (dip into
+    margin). This applies the executed cost of a genuinely-placed BUY to the cached
+    balance so the NEXT buy's gate sees the reduced cash.
+
+    ONE-WAY + CONSERVATIVE: only ever DEBITS (called for a placed BUY's executed cost),
+    never credits — SELL proceeds are unsettled (T+1) and crediting them would let a
+    later buy spend unsettled money. Clamps at 0 (``GREATEST(cash - amount, 0)``) so the
+    cache never goes negative. Touches ONLY the cash column — no holdings replace, no
+    network. This keeps the portfolio module the SOLE writer of ``portfolio_balance``
+    (AD-14): ``/approve`` calls this helper, it never writes the row itself. Scoped to
+    the caller's own row (AD-10). A NO-OP when there is no balance row (0 rows updated),
+    a system scope, or a non-finite/≤0 ``amount``. Returns ``True`` iff a row was debited.
+
+    The debit is a between-refreshes approximation; the next authoritative
+    ``reconcile_portfolio`` (manual/link refresh) overwrites it with broker truth.
+    """
+    if scope.is_system:
+        return False
+    if amount is None or not amount.is_finite() or amount <= Decimal("0"):
+        return False
+    result = await session.execute(
+        update(PortfolioBalance)
+        .where(PortfolioBalance.owner_id == scope.user_id)
+        .values(cash=func.greatest(PortfolioBalance.cash - amount, 0))
+    )
+    await session.commit()
+    return bool(result.rowcount)
 
 
 async def reconcile_portfolio(

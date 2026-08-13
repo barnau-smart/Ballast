@@ -26,7 +26,7 @@ from brokers.fake_adapter import (
     FakeBrokerAdapter,
 )
 from brokers.port import BrokerPort, BrokerTokens, PortfolioSnapshot
-from brokers.portfolio import get_portfolio, reconcile_portfolio
+from brokers.portfolio import debit_cash, get_portfolio, reconcile_portfolio
 from db.connection import get_connection
 from db.models import BrokerageToken, PortfolioBalance, PortfolioCache
 from db.scope import Scope
@@ -885,3 +885,99 @@ async def test_newer_reconcile_updates_account_type(two_owner_ids):
 def test_fake_adapter_reports_non_margin_account():
     """The fake broker never trips the margin warning (real-broker-only by design)."""
     assert FakeBrokerAdapter().fetch_portfolio().account_type == "CASH"
+
+
+# --- Story 10.12: debit_cash (keep settled cash fresh across sequential buys) --
+
+
+async def _reconcile_cash(uid, cash: str):
+    async with async_session_maker() as session:
+        await reconcile_portfolio(
+            Scope.for_user(uid),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=PortfolioSnapshot(
+                as_of=FAKE_AS_OF_BASE, cash=Decimal(cash), holdings=[]
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_debit_cash_reduces_cached_cash(two_owner_ids):
+    a, _b = two_owner_ids
+    await _reconcile_cash(a, "750.00")
+    async with async_session_maker() as session:
+        did = await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    assert did is True
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("250.00")
+
+
+@pytest.mark.asyncio
+async def test_debit_cash_clamps_at_zero(two_owner_ids):
+    a, _b = two_owner_ids
+    await _reconcile_cash(a, "100.00")
+    async with async_session_maker() as session:
+        await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("0.00")  # never negative
+
+
+@pytest.mark.asyncio
+async def test_debit_cash_no_balance_row_is_noop(two_owner_ids):
+    a, _b = two_owner_ids  # never reconciled → no balance row
+    async with async_session_maker() as session:
+        did = await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    assert did is False  # nothing to debit; the existing approve harness relies on this
+
+
+@pytest.mark.asyncio
+async def test_debit_cash_ignores_nonpositive_amount(two_owner_ids):
+    a, _b = two_owner_ids
+    await _reconcile_cash(a, "750.00")
+    async with async_session_maker() as session:
+        assert await debit_cash(Scope.for_user(a), session, Decimal("0")) is False
+        assert await debit_cash(Scope.for_user(a), session, Decimal("-5")) is False
+    async with async_session_maker() as session:
+        view = await get_portfolio(Scope.for_user(a), session)
+    assert view.cash == Decimal("750.00")  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_debit_cash_is_per_user_scoped(two_owner_ids):
+    a, b = two_owner_ids
+    await _reconcile_cash(a, "750.00")
+    await _reconcile_cash(b, "750.00")
+    async with async_session_maker() as session:
+        await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    async with async_session_maker() as session:
+        assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("250.00")
+        assert (await get_portfolio(Scope.for_user(b), session)).cash == Decimal("750.00")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_overwrites_a_prior_debit_with_broker_truth(two_owner_ids):
+    """AC5 — the debit is a between-refreshes approximation; a newer authoritative
+    reconcile still wins and overwrites the debited cash with broker truth."""
+    a, _b = two_owner_ids
+    await _reconcile_cash(a, "750.00")
+    async with async_session_maker() as session:
+        await debit_cash(Scope.for_user(a), session, Decimal("500.00"))
+    async with async_session_maker() as session:
+        assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("250.00")
+    # A newer broker snapshot (later as_of) reconciles and overwrites the debit.
+    async with async_session_maker() as session:
+        await reconcile_portfolio(
+            Scope.for_user(a),
+            session,
+            FakeBrokerAdapter(),
+            snapshot=PortfolioSnapshot(
+                as_of=FAKE_AS_OF_BASE + timedelta(hours=1),
+                cash=Decimal("900.00"),
+                holdings=[],
+            ),
+        )
+    async with async_session_maker() as session:
+        assert (await get_portfolio(Scope.for_user(a), session)).cash == Decimal("900.00")
