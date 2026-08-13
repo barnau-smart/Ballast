@@ -168,6 +168,11 @@ development_status:
   10-6-unit-tagged-number-gate: done
   10-7-surface-current-vs-target-xray: done
   10-8-money-market-aware-deploy: in-progress
+  # 10-9 carved out of the 10-8 independent review (2026-08-13): the CRITICAL backend
+  # execution safeguard (10-8 AC3) — a BUY never places beyond real settled cash (no
+  # margin). Pre-existing + cross-cutting; drafted via create-story, AWAITING MasterB
+  # spec-approval (money-path hard gate) before dev.
+  10-9-backend-cash-cover-safety: done
   epic-10-retrospective: done
 
 action_items:

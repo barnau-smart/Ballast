@@ -80,6 +80,7 @@ from coach.decision_record import (
     release_claim,
 )
 from coach.execution import (
+    InsufficientSettledCashError,
     OrderNotSupportedError,
     OrderScopeError,
     SessionIntegrityError,
@@ -985,6 +986,15 @@ async def approve(
         # arm, this MUST sit above the trailing ``except Exception`` (which would
         # release + re-raise → 500). Release the claim (retryable) and surface a
         # calm 422 "not supported in this version", symmetric with the scope arm.
+        await release_claim(body.decision_id, scope=scope, session=session)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except InsufficientSettledCashError as exc:
+        # Cash-cover safety (Story 10.9): the BUY exceeds the account's real settled
+        # cash — refused BEFORE any broker call so it can never fill on margin.
+        # Release the claim (cosigning→proposed, retryable) and surface the calm
+        # 422 that routes the user to free up cash via the 9-3 liquidation, symmetric
+        # with the scope arm. Sits above the trailing ``except Exception`` (which
+        # would release + re-raise → 500).
         await release_claim(body.decision_id, scope=scope, session=session)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OrderScopeError as exc:

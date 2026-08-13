@@ -23,6 +23,14 @@ What this owner guarantees:
   (``side`` is already foreclosed to buy/sell by :class:`~coach.recommendation.OrderSide`).
   A blessed ``order_intent`` outside this scope raises :class:`OrderScopeError`
   BEFORE any broker call — the broker is never touched.
+- **Cash-cover safety / no margin (Story 10.9):** a **BUY** is placed only when its
+  dollar ``amount`` is covered by the account's KNOWN real settled cash
+  (``max(0, view.cash)`` — settlement cash, NOT parked money-market, and the reserve
+  is NOT subtracted). A shortfall raises :class:`InsufficientSettledCashError` BEFORE
+  ``place_order`` — the broker is NEVER touched, so it can never fill on margin. A
+  **SELL** raises cash and is never coverage-gated. Enforced only against a known
+  balance (a scope-less call or a never-imported account is not blocked); the
+  production ``/approve`` path always supplies the user scope.
 - **Idempotency key minting:** the client key is minted HERE at the single
   execution path and genuinely passed to the broker. It is reused verbatim on the
   reconciliation read so a timeout never double-places (4.7).
@@ -125,6 +133,27 @@ class OrderNotSupportedError(ValueError):
     API layer maps it to a calm 422 ("not supported in this version") and releases
     the atomic claim so the decision stays retryable, symmetric with
     :class:`OrderScopeError`.
+    """
+
+
+class InsufficientSettledCashError(ValueError):
+    """Raised when a BUY exceeds the account's real settled cash (Story 10.9).
+
+    The backend cash-cover safety gate: a **BUY** is placed only when its dollar
+    ``amount`` is covered by the account's KNOWN settled cash (``max(0, view.cash)``
+    — settlement cash, the same ``ready_to_trade`` the 9-3 liquidator anchors to).
+    Parked money-market does NOT count (it is deployable *on paper* in the 10-8
+    analysis but is not spendable until sold and settled) and the reserve is NOT
+    subtracted — the execution invariant is strictly *no-margin*: never place a buy
+    the account can't actually cover, so Schwab can never fill the shortfall on
+    margin. A **SELL** is never coverage-gated (it raises cash). Raised BEFORE any
+    ``place_order`` call — the broker is NEVER touched on a shortfall. The API layer
+    maps it to a calm 422 that routes the user to free up cash via the existing 9-3
+    liquidation (sell money-market → settle → the buy resumes as a ``PendingBuy``),
+    and releases the atomic claim so the decision stays retryable — symmetric with
+    :class:`OrderScopeError`. NB: this closes a PRE-EXISTING gap (the ``/approve``
+    path never checked cash) that Story 10-8 made reachable + dangerous on a margin
+    account.
     """
 
 
@@ -296,6 +325,57 @@ async def _scope_user_parked_symbols(
     return set(normalize_symbols(config.parked_symbols))
 
 
+async def _assert_buy_covered_by_settled_cash(
+    intent: OrderIntent,
+    *,
+    scope: "Scope | None",
+    session: "AsyncSession | None",
+) -> None:
+    """Refuse a BUY that exceeds the account's KNOWN real settled cash (Story 10.9).
+
+    The backend cash-cover safety gate. Enforced ONLY for a ``BUY`` (a SELL raises
+    cash and is never gated) and ONLY against a KNOWN settled-cash figure:
+
+    - No user ``scope``+``session`` (a scope-less direct engine/test call, or a
+      system scope) → we cannot read the caller's cash, so the gate does not fire.
+      The production ``/approve`` path ALWAYS supplies a user scope+session, so this
+      escape is unreachable in production (it preserves scope-less direct-call tests).
+    - No imported balance row (``view.as_of is None``) → the account has never
+      imported a balance, so there is NO settled-cash truth to assert an overdraw
+      against. The gate does not fire (pre-existing behavior; not reachable via the
+      deploy path, which needs a balance to produce a buy). ``get_portfolio`` reports
+      ``cash == 0`` for this case, so ``as_of`` (``None`` iff no row) is the honest
+      "no data" signal — never fabricate a $0 refusal from absent data.
+    - A KNOWN balance with settlement cash ``C`` → refuse when ``amount > max(0, C)``.
+      Parked money-market is NOT added (deployable on paper ≠ spendable) and the
+      reserve is NOT subtracted (the invariant is strictly no-margin). A non-finite
+      (``NaN``/``Inf``) cached cash is present-but-untrustworthy → treated as ``0``
+      (fail-closed), so a corrupt balance can never certify coverage.
+
+    ``get_portfolio`` is imported lazily (mirrors :func:`_scope_user_parked_symbols`)
+    to avoid an import cycle at startup. Read-only — reads ONLY the caller's own
+    scoped balance (AD-10); the owner keeps its no-persistence contract (Story 4.9).
+    """
+    if scope is None or session is None or scope.is_system:
+        return
+    # Lazy import (module-load cycle): decision_record imports this module very early.
+    from brokers.portfolio import get_portfolio
+
+    view = await get_portfolio(scope, session)
+    if view.as_of is None:
+        # No imported balance row → no settled-cash truth to enforce against.
+        return
+    cash = view.cash
+    available = max(Decimal("0"), cash) if cash.is_finite() else Decimal("0")
+    if intent.amount > available:
+        raise InsufficientSettledCashError(
+            f"This buy needs about ${intent.amount:.2f}, but only ${available:.2f} "
+            "of settled cash is available right now. Selling some of your "
+            "money-market fund frees up the difference — this buy can go through "
+            "once that cash settles."
+        )
+
+
 async def execute_approved_order(
     order_intent: OrderIntent,
     *,
@@ -391,6 +471,16 @@ async def execute_approved_order(
     # matrix + deferred-feature rejection. Runs after integrity + index-core/amount
     # so the broker is never touched on any rejection.
     validate_order_intent(canonical_intent)
+    # Cash-cover safety (Story 10.9): a BUY is placed only when its dollar amount is
+    # covered by the account's KNOWN real settled cash — never on margin. Parked
+    # money-market does NOT count (deployable on paper ≠ spendable) and the reserve
+    # is not subtracted. A SELL raises cash and is never gated. Raised BEFORE the key
+    # mint / place_order, so the broker is never touched on a shortfall. This is the
+    # last gate before placement.
+    if canonical_intent.side == OrderSide.BUY:
+        await _assert_buy_covered_by_settled_cash(
+            canonical_intent, scope=scope, session=session
+        )
     key = idempotency_key or mint_idempotency_key()
     placement = await broker.place_order(canonical_intent, idempotency_key=key)
     return await _reconcile(placement, broker=broker, idempotency_key=key)
