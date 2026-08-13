@@ -19,6 +19,7 @@ env vars and ``BROKER_ADAPTER=schwab``; nothing else changes (AD-8).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Callable
@@ -39,6 +40,8 @@ from brokers.port import (
 )
 from coach.recommendation import Duration, OrderIntent, OrderSide, OrderType
 from money import format_money
+
+logger = logging.getLogger(__name__)
 
 # Schwab's OAuth authorize endpoint (used only to reconstruct the received-url
 # for the code exchange; the actual authorization_url is built by schwab-py).
@@ -269,8 +272,22 @@ class SchwabAdapter(BrokerPort):
                 raise SchwabReadError(
                     "Schwab account body is missing the securitiesAccount envelope."
                 )
-            cash = self._decimal_or_zero(
-                (acct.get("currentBalances") or {}).get("cashBalance")
+            balances = acct.get("currentBalances") or {}
+            cash = self._decimal_or_zero(balances.get("cashBalance"))
+            # DIAGNOSTIC (real-money readiness — docs/real-money-readiness.md): log WHICH
+            # currentBalances fields Schwab returns for THIS account + the cash candidates,
+            # so we can confirm cashBalance is settled/available-for-trading vs total (incl.
+            # unsettled proceeds). FIGURES ONLY — never tokens/PII. REMOVE once the
+            # settled-cash field is confirmed and the adapter switched.
+            logger.info(
+                "schwab_currentBalances_diagnostic fields=%s cashBalance=%s "
+                "cashAvailableForTrading=%s availableFunds=%s "
+                "availableFundsNonMarginableTrade=%s",
+                sorted(balances.keys()),
+                balances.get("cashBalance"),
+                balances.get("cashAvailableForTrading"),
+                balances.get("availableFunds"),
+                balances.get("availableFundsNonMarginableTrade"),
             )
 
             holdings: list[Holding] = []

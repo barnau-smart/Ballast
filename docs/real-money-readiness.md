@@ -33,10 +33,12 @@ real payload before changing it.
 4. Share those 4 numbers. If `cashBalance` exceeds the available/settled figure, I
    switch the adapter to the correct field (a ~1-line change) + a regression test.
 
-*Mechanism for step 3:* the adapter has no balance logging today. When you're ready,
-I'll add a tiny reviewed diagnostic log of `currentBalances` (figures only, no
-tokens) so you just connect once and paste the line — rather than us guessing the
-field.
+*Mechanism for step 3 (NOW IN PLACE):* the adapter logs a
+`schwab_currentBalances_diagnostic` line on every real portfolio read (figures only —
+no tokens/PII), listing the returned field names + `cashBalance` /
+`cashAvailableForTrading` / `availableFunds` / `availableFundsNonMarginableTrade`. So:
+connect once in real-broker mode, find that line in the app log, and paste it. (I
+remove the diagnostic once we confirm the correct field and switch the adapter.)
 
 ## Gate 2 — tune the disclosed placeholder
 
