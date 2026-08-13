@@ -132,6 +132,18 @@ class Plan:
     unclassified_symbols: list[str] = field(default_factory=list)
     investable_cash: Decimal = _ZERO
     undeployed_cash: Decimal = _ZERO
+    # The honest funding split of ``investable_cash`` (Story 10.8 AC5), populated for
+    # ``deploy``: ``settlement_cash`` is the part already settled + spendable now;
+    # ``from_money_market`` is the part that comes from selling the user's parked
+    # money-market fund (which settles first, via the 9-3 liquidation) —
+    # ``settlement_cash + from_money_market == investable_cash``. ``reserve`` is the
+    # user's PROTECTED cushion (never deployed, never sold). These let the narrator
+    # honestly frame "$X is settled cash, $Y comes from selling your money-market;
+    # your $Z reserve stays untouched" without inventing a number.
+    settlement_cash: Decimal = _ZERO
+    from_money_market: Decimal = _ZERO
+    reserve: Decimal = _ZERO
+    money_market_symbols: list[str] = field(default_factory=list)
     reason: str = ""
     as_of: datetime | None = None
 
@@ -216,6 +228,24 @@ def _deployable_parked(
         if mv > largest:
             largest = mv
     return total, largest
+
+
+def _deployable_parked_symbols(holdings, parked_set: frozenset[str]) -> list[str]:
+    """Return the de-duplicated, sorted symbols of the DEPLOYABLE parked funds present.
+
+    The same filter as :func:`_deployable_parked` (declared parked AND unclassified AND
+    priced), returned as a stable symbol list so the narration/UI can honestly name the
+    money-market fund(s) the deploy will sell (Story 10.8 AC5)."""
+    found: set[str] = set()
+    for h in holdings or []:
+        symbol = (h.symbol or "").strip().upper()
+        if symbol not in parked_set or asset_class_for(symbol) is not None:
+            continue
+        mv = h.market_value
+        if mv is None or not mv.is_finite() or mv <= _ZERO:
+            continue
+        found.add(symbol)
+    return sorted(found)
 
 
 def plan_deployment(
@@ -469,6 +499,15 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
+    # Honest funding split (Story 10.8 AC5): the part of ``investable`` that comes
+    # from selling the parked money-market (``from_money_market``) vs settled cash
+    # already spendable now (``settlement_cash``). ``from_money_market`` is the
+    # POSITIVE liquidatable-parked contribution (0 when the deploy is pure settlement
+    # cash, or when the reserve fully absorbs parked); the remainder is settled cash.
+    from_money_market = liquidatable_parked if liquidatable_parked > _ZERO else _ZERO
+    settlement_cash = investable - from_money_market
+    money_market_symbols = _deployable_parked_symbols(view.holdings, parked_set)
+
     # (4)/(5) Deterministic cash-only rebalance.
     deployment = plan_deployment(
         classification.by_class, target_weights, funds, investable
@@ -503,6 +542,10 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
         unclassified_symbols=classification.unclassified_symbols,
         investable_cash=investable,
         undeployed_cash=deployment.undeployed_cash,
+        settlement_cash=settlement_cash,
+        from_money_market=from_money_market,
+        reserve=reserve,
+        money_market_symbols=money_market_symbols if from_money_market > _ZERO else [],
         reason="",
         as_of=as_of,
     )

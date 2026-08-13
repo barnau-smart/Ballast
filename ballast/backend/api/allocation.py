@@ -86,6 +86,13 @@ class PlanOut(BaseModel):
     unclassified: dict[str, object]
     investable_cash: str
     undeployed_cash: str
+    # Story 10.8 AC5 — honest funding split of ``investable_cash`` (deploy only):
+    # settled cash vs the part that comes from selling the parked money-market, plus
+    # the protected reserve and the money-market fund symbol(s) that would be sold.
+    settlement_cash: str
+    from_money_market: str
+    reserve: str
+    money_market_symbols: list[str]
     reason: str
     as_of: datetime.datetime | None = None
 
@@ -189,6 +196,10 @@ def _plan_out(plan: Plan) -> PlanOut:
         },
         investable_cash=format_money(plan.investable_cash),
         undeployed_cash=format_money(plan.undeployed_cash),
+        settlement_cash=format_money(plan.settlement_cash),
+        from_money_market=format_money(plan.from_money_market),
+        reserve=format_money(plan.reserve),
+        money_market_symbols=list(plan.money_market_symbols),
         reason=plan.reason,
         as_of=plan.as_of,
     )

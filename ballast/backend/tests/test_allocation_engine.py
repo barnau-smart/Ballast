@@ -963,3 +963,32 @@ def test_parked_money_market_not_in_unclassified_sleeve(client):
         assert Decimal(body["unclassified"]["market_value"]) == Decimal("0")
     finally:
         _delete_user(email)
+
+
+def test_plan_exposes_money_market_funding_split(client):
+    """Story 10.8 AC5 — GET /plan surfaces the honest funding split so the deploy card
+    can show settled vs money-market cash + the protected reserve (MasterB's case)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "12182.82")
+        _seed_holding(uid, "SWVXX", "93766.26")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="40000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        assert body["investable_cash"] == "65949.08"
+        assert body["settlement_cash"] == "12182.82"
+        assert body["from_money_market"] == "53766.26"
+        assert body["reserve"] == "40000.00"
+        assert body["money_market_symbols"] == ["SWVXX"]
+        # The split reconciles: settled + from-money-market == investable.
+        assert Decimal(body["settlement_cash"]) + Decimal(
+            body["from_money_market"]
+        ) == Decimal(body["investable_cash"])
+    finally:
+        _delete_user(email)

@@ -177,6 +177,39 @@ describe('CoachConsult — deploy-my-cash affordance (Story 10.2/10.3)', () => {
     expectCalm(xray.textContent)
   })
 
+  it('shows the honest money-market funding split + protected reserve (Story 10.8 AC5)', async () => {
+    const MM_PLAN = {
+      ...XRAY_PLAN,
+      investable_cash: '65949.08',
+      settlement_cash: '12182.82',
+      from_money_market: '53766.26',
+      reserve: '40000.00',
+      money_market_symbols: ['SWVXX'],
+    }
+    stubFetch({ plan: MM_PLAN, narration: DEPLOY_NARRATION })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+
+    const funding = await screen.findByTestId('coach-deploy-funding')
+    expect(funding).toHaveTextContent(
+      /\$12182\.82 of settled cash plus \$53766\.26 from selling your money-market fund \(SWVXX\)/i,
+    )
+    expect(funding).toHaveTextContent(/\$40000\.00 reserve stays untouched/i)
+    expectCalm(funding.textContent)
+  })
+
+  it('omits the money-market split when the deploy is pure settled cash (from_money_market 0)', async () => {
+    // XRAY_PLAN has no funding-split fields → from_money_market is undefined/0.
+    stubFetch({ plan: XRAY_PLAN, narration: DEPLOY_NARRATION })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-deploy-cash'))
+
+    await screen.findByTestId('coach-deploy-xray')
+    expect(screen.queryByTestId('coach-deploy-funding')).not.toBeInTheDocument()
+  })
+
   it('shows the calm reason and populates NOTHING on a no-action status', async () => {
     const NO_TARGET = {
       status: 'no_target',
