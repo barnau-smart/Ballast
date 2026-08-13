@@ -508,14 +508,18 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
-    # Honest funding split (Story 10.8 AC5 / 10.13): ``settlement_cash`` (computed above as
-    # ``max(0, view.cash)``, never negative) is what's spendable now; the REMAINDER of
-    # ``investable`` nets from selling the parked money-market. Invariant preserved:
-    # ``settlement_cash + from_money_market == investable``. On a normal account this equals
-    # the old ``liquidatable_parked``; on a margin-debit account ``settlement_cash`` is 0 and
-    # ``from_money_market`` is the whole (debt-reduced) ``investable`` — honest about the fact
-    # that all deployable cash comes from the money-market after the proceeds cover the debit.
-    from_money_market = investable - settlement_cash
+    # Honest funding split (Story 10.8 AC5 / 10.13): ``from_money_market`` is the part of
+    # ``investable`` that nets from selling the parked money-market; ``settlement_cash`` is the
+    # spendable-now remainder. Clamp ``from_money_market`` at 0 FIRST, then let settled cash
+    # absorb the rest, so BOTH stay ≥ 0 and the invariant ``settlement_cash + from_money_market
+    # == investable`` holds on EVERY path — including a normal account whose reserve EXCEEDS its
+    # parked value (``liquidatable_parked < 0``: the excess reserve is drawn from settlement, so
+    # nothing comes from the money-market → ``from_money_market == 0``, ``settlement_cash ==
+    # investable``). On a margin-debit account ``settlement_cash`` clamps to 0 and
+    # ``from_money_market == investable`` (all deployable cash nets from the money-market after
+    # the proceeds cover the debit).
+    from_money_market = max(_ZERO, investable - settlement_cash)
+    settlement_cash = investable - from_money_market
     # Name ONLY the single fund the 9-3 liquidation actually sells (the largest) —
     # never the whole parked list, which would misstate what's being sold.
     money_market_symbols = (

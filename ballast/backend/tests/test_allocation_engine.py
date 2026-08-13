@@ -1082,7 +1082,7 @@ def test_margin_debit_reduces_investable_and_split_is_honest(client):
         assert body["status"] == "deploy"
         # -5000 + min(50000, 50000-10000) = -5000 + 40000 = 35000 (NOT 40000).
         assert body["investable_cash"] == "35000.00"
-        assert body["settlement_cash"] == "0"           # clamped ≥ 0 (never negative)
+        assert body["settlement_cash"] == "0.00"        # clamped ≥ 0 (never negative)
         assert body["from_money_market"] == "35000.00"  # all nets from the money-market
         assert body["money_market_symbols"] == ["SWVXX"]
         # Split invariant holds.
@@ -1139,5 +1139,35 @@ def test_deep_margin_debit_is_no_cash(client):
         # -45000 + min(50000, 40000) = -5000 ≤ 0 → no_cash.
         assert body["status"] == "no_cash"
         assert body["investable_cash"] == "0"
+    finally:
+        _delete_user(email)
+
+
+def test_reserve_exceeds_parked_normal_account_split_stays_nonnegative(client):
+    """Regression (10-13 review): a NORMAL positive-cash account whose reserve EXCEEDS its
+    parked value → liquidatable_parked < 0 (excess reserve drawn from settlement). The
+    split must stay non-negative: from_money_market == 0, settlement_cash == investable
+    (never a negative from_money_market or a settlement_cash > investable)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "20000")           # positive settled cash
+        _seed_holding(uid, "SWVXX", "5000")   # parked $5k
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="8000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        # 20000 + min(5000, 5000-8000=-3000) = 20000 - 3000 = 17000.
+        assert body["investable_cash"] == "17000.00"
+        assert body["from_money_market"] == "0"        # nothing nets from the money-market
+        assert body["settlement_cash"] == "17000.00"   # all from settled cash; ≤ investable
+        assert body["money_market_symbols"] == []
+        assert Decimal(body["settlement_cash"]) + Decimal(
+            body["from_money_market"]
+        ) == Decimal(body["investable_cash"])
     finally:
         _delete_user(email)
