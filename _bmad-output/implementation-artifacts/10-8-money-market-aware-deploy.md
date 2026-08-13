@@ -1,7 +1,8 @@
 # Story 10.8: Money-market-aware deploy (count parked cash-equivalents)
 
-Status: in-progress
+Status: done
 baseline_commit: 80e53a7
+independent_review: 2026-08-13 (3-layer full-rework pass, MERGE-READY — 1 HIGH caught + fixed by Edge Case Hunter; all 6 findings closed)
 
 <!-- HARD GATE (docs/dev-loop-policy.md): APPROVED by MasterB 2026-08-13. Core design
      settled: money-market counts as DEPLOYABLE during analysis/planning, but at
