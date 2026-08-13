@@ -406,3 +406,21 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
   summary: A cost-switch (or 9.3 deploy) linked PendingBuy is queued for the SELL's full pre-fill dollar estimate, not the realized proceeds; on a PARTIAL market SELL the linked buy is oversized relative to what actually settled.
   evidence: `coach/execution.py:_is_placed` treats PARTIAL as placed; `api/cash.py:create_switch_pending_buy` seeds `amount` from the snapshot's SELL `order_intent.amount`. Fail-safe today (resume gated on `funds_ready` won't over-place), and it matches the cross-cutting "estimate now, floor at approve" convention shared with the 9.3 deploy/liquidation path — so this is a system-wide honesty consideration (reconcile linked-buy amount from `outcome.filled_qty × avg_price`), not a 10.5-only fix.
+
+## Deferred from: independent review of story 10-5 — cost-switch linked SELL+BUY (2026-08-13)
+
+- source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
+  summary: The linked cost-switch BUY's sub-share degrade (AC7: "no un-co-signable 0-share order") is exercised by NO test — the fake broker MARKET path does no whole-share flooring/refusal (unlike the LIMIT path), so the guarantee rides entirely on the schwab adapter's inline flooring at real placement.
+  evidence: `test_sub_share_switch_buy_degrades_calmly_at_resume` bumps balance to exactly $2,000 and only asserts a `proposed` BUY is minted; `brokers/fake_adapter.py` MARKET path has no `<1`-share refusal. Add a test that reaches a sub-share linked-buy resume (or verify on the real adapter) before real-money reliance.
+
+- source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
+  summary: `create_switch_pending_buy` dedupe is a non-atomic read-then-insert with no DB unique constraint; correctness is emergent from the Story 6.1 atomic co-sign claim serializing the single writer.
+  evidence: `api/cash.py:create_switch_pending_buy` does `_find_awaiting_pending_buy_by_sell_decision` then `repo.add`; `PendingBuy.__table_args__` has only `ix_pending_buy_owner_status`. Any future caller outside the claim reintroduces duplicate linked buys with no backstop. Add a partial-unique index on `(owner_id, sell_decision_id) WHERE status='awaiting_funds'` when next touched.
+
+- source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
+  summary: The server-truth `linked_buy_queued` reassurance is not durable across the linked buy's OWN lifecycle — after the buy is resumed or cancelled, a re-approve of the original SELL recomputes `linked_buy_queued=false` and can misfire the "we couldn't set aside the linked buy" fallback note.
+  evidence: `api/coach.py:_recorded_linked_buy_queued` → `_find_awaiting_pending_buy_by_sell_decision` skips non-`awaiting_funds` rows. Cosmetic false-alarm (the buy genuinely exists). Consider recognizing `resumed`/`cancelled` linked buys when recomputing the flag.
+
+- source_spec: `_bmad-output/implementation-artifacts/10-5-cost-switch-linked-sell-buy-pair.md`
+  summary: The `/recommend` switch path silently ignores a client-supplied `amount` (a verified cost-switch always sells the whole 10-4 position), so a user asking to switch only part of a position is quietly upsized to the whole position.
+  evidence: `api/coach.py:_verify_cost_switch` binds `order_intent = f.order_intent` (whole-position `market_value`) and discards `body.amount`. Documented 10-4 whole-position design; ignore `amount` explicitly for a verified switch or refuse a mismatch, for clarity.

@@ -4,7 +4,7 @@ Status: done
 baseline_revision: 9bb6c75
 final_revision: 2c0a0c7
 review_loop_iteration: 1
-followup_review_recommended: true
+followup_review_recommended: false  # satisfied by the 2026-08-13 human-requested independent review (see Independent Review Findings); 1 Medium fixed, 4 low deferred
 
 <!-- HARD GATE (docs/dev-loop-policy.md, adopted 2026-08-12): governing spec APPROVED by
      MasterB 2026-08-12. Linkage design settled: thread switch_to through the decision
@@ -185,3 +185,13 @@ Status: done
 **Verification:** Backend `831 passed`; Frontend `195 passed` (both suites, `ballast_test` DB / fake broker + fake LLM). The arbitrary-`switch_to` bypass is closed and covered by a dedicated adversarial test.
 
 **Residual risk / follow-up:** `followup_review_recommended: true` — the pass-2 patches (notably the deploy-dedupe reverse-conflation fix, which touches the shared 9.3 money-path) were applied without a subsequent independent review pass. One deferred honesty item (linked-buy amount = pre-fill estimate, not realized proceeds on a PARTIAL fill) recorded in `deferred-work.md`.
+
+### Independent Review Findings — human-requested (2026-08-13)
+
+_Satisfies `followup_review_recommended`. Full 3-layer independent pass (Blind Hunter + Edge Case Hunter + Acceptance Auditor) on `2c0a0c7`. Verified at HEAD: 831 backend + 196 frontend green. **The iteration-1 client-trusted `switch_to` scope-gate bypass is CONFIRMED CLOSED by all three layers** — the server re-derives the cost-switch from the user's own cached holdings (`_verify_cost_switch` → `find_cost_findings`), never widens a BUY, self/arbitrary/unheld/non-canonical targets all rejected (adversarial test present). Transaction safety, `sell_decision_id` dedupe, no-conflation with 9.3, and server-truth `linked_buy_queued` all verified. No Critical/High correctness bugs._
+
+- [x] [Review][Patch] MEDIUM — Live-broker reassurance gap: a `pending`/`timeout` SELL WITH a `broker_ref` is treated as placed by the backend (`_is_placed`) and DOES queue the linked buy (`linked_buy_queued=true`), but the frontend gated the linked-buy notes on `filled`/`partial` only, so on the real Schwab path a beginner saw nothing about their queued step-2 buy — the exact stranded-cash reassurance gap this story exists to close. **FIXED 2026-08-13:** the notes now gate on `sellPlaced` (mirrors backend `_is_placed`, incl. pending/timeout+broker_ref) [CoachConsult.jsx]; +1 regression test (`shows the "step 2 queued" note on a pending SELL with a broker_ref`).
+- [x] [Review][Defer] Sub-share degrade for the linked BUY is untested — AC7's "no un-co-signable 0-share order" is exercised nowhere (fake MARKET path doesn't floor/refuse; relies on the schwab adapter's inline flooring). Add a test / verify on the real adapter — deferred to `deferred-work.md`.
+- [x] [Review][Defer] `create_switch_pending_buy` dedupe is a non-atomic read-then-insert with no DB unique backstop (safe today only via the Story 6.1 co-sign claim). Consider a partial-unique index on `(owner_id, sell_decision_id) WHERE status='awaiting_funds'` — deferred.
+- [x] [Review][Defer] `linked_buy_queued` reassurance not durable across the buy's OWN lifecycle: after the linked buy is resumed/cancelled, a re-approve recomputes `false` and can misfire the "couldn't set aside" fallback — cosmetic false-alarm — deferred.
+- [x] [Review][Defer] The `/recommend` switch endpoint silently ignores a client `amount` (the SELL is always whole-position per 10-4) — quiet surprise; ignore/reject explicitly — deferred.

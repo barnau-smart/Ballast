@@ -799,8 +799,18 @@ export function CoachConsult() {
     orderIntent !== null &&
     Boolean(recommendation?.decision_id) &&
     approve !== 'placed'
-  const placedPosition =
-    outcome && (outcome.status === 'filled' || outcome.status === 'partial')
+  // Server-truth "the SELL was placed" — mirrors the backend `_is_placed`: a
+  // filled/partial fill, OR a pending/timeout that carries a broker_ref (a real
+  // venue commonly returns pending+ref before settling). Gating the outcome +
+  // linked-buy notes on this (not just filled/partial) means a placed cost-switch
+  // SELL surfaces its "step 2 of 2 is queued" reassurance on the live-broker path
+  // too — not just in fake mode where fills are instant.
+  const sellPlaced =
+    outcome &&
+    (outcome.status === 'filled' ||
+      outcome.status === 'partial' ||
+      ((outcome.status === 'pending' || outcome.status === 'timeout') &&
+        Boolean(outcome.broker_ref)))
 
   // Story 8.3 — the client-side matrix mirror + footgun warnings, derived live
   // from the human's approve-time options. The mirror gates Approve (defense in
@@ -1440,7 +1450,7 @@ export function CoachConsult() {
               data-testid="coach-outcome"
               role="status"
             >
-              {placedPosition ? (
+              {sellPlaced ? (
                 <>
                   <p className="ballast-consult__outcome-line">
                     Outcome: {outcome.status}
@@ -1473,10 +1483,11 @@ export function CoachConsult() {
                     </p>
                   ) : null}
                   {/* Story 10.5 — honest fallback: this co-sign WAS a cost-switch
-                      SELL (switchLinked set), it was placed (filled/partial), but the
-                      linked buy did NOT queue (server-truth flag false, a rare DB
-                      hiccup). Tell the beginner calmly rather than leave them silently
-                      stranded in cash — the exact failure this feature guards against. */}
+                      SELL (switchLinked set), it was placed (filled/partial, or
+                      pending/timeout with a broker_ref), but the linked buy did NOT
+                      queue (server-truth flag false, a rare DB hiccup). Tell the
+                      beginner calmly rather than leave them silently stranded in cash
+                      — the exact failure this feature guards against. */}
                   {switchLinked && !outcome.linked_buy_queued ? (
                     <p
                       className="ballast-consult__chip"

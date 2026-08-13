@@ -414,6 +414,38 @@ describe('CoachConsult — linked cost-switch SELL + BUY (Story 10.5)', () => {
     expectCalm(note.textContent)
   })
 
+  it('shows the "step 2 queued" note on a pending SELL with a broker_ref (live-broker path)', async () => {
+    // Regression: a real venue commonly returns pending+broker_ref before settling.
+    // The backend treats that as placed and queues the linked buy (linked_buy_queued
+    // true); the UI must surface the reassurance from that server-truth flag, not
+    // only for filled/partial — else a beginner is left unsure step 2 is queued.
+    stubReviewFlow({
+      findings: [COST_FINDING],
+      approve: {
+        status: 'pending',
+        filled_qty: '0',
+        avg_price: null,
+        broker_ref: 'fake-order-1',
+        linked_buy_queued: true,
+      },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('AGTHX'),
+    )
+    fireEvent.click(screen.getByTestId('coach-ask-submit'))
+    await screen.findByTestId('coach-approve')
+    fireEvent.click(screen.getByTestId('coach-approve'))
+
+    const note = await screen.findByTestId('coach-linked-buy-note')
+    expect(note).toHaveTextContent(/step 2 of 2 is queued/i)
+    expectCalm(note.textContent)
+  })
+
   it('does NOT show the step-2 note when linked_buy_queued is false', async () => {
     stubReviewFlow({
       findings: [COST_FINDING],
