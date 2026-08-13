@@ -42,3 +42,21 @@ twice (Epic 9: 8 fixes; Epic 10: a HIGH parked-cash bug the loop had rejected).
 A file belongs to exactly one story's commits. Don't land a later story's file
 (e.g. a Story 10-4 module) inside an earlier story's commit — it breaks
 per-story traceability.
+
+## Operational: worktree isolation
+
+**Adopted 2026-08-13.** Run each story in its own git worktree+branch:
+
+```toml
+[scm]
+isolation = "worktree"
+```
+
+**Why:** on 2026-08-12 a story (10-5) paused for manual recovery after a
+status-check race, and because the loop runs in-place (`isolation = "none"`) the
+pause landed on the main checkout with committed work above baseline. Worktree
+isolation keeps each attempt on its own branch — a paused/failed unit is kept for
+inspection (`keep_failed`) and never parks the main checkout; a successful unit
+merges back cleanly. Do NOT set `rollback_on_failure = true` (it auto-discards
+committed attempts — the dangerous direction); worktree isolation is the safe fix.
+Machine-local (`policy.toml` is gitignored), so set it per machine.
