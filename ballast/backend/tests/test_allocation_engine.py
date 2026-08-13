@@ -25,6 +25,7 @@ import pytest
 
 from allocation.engine import (
     MIN_DEPLOY,
+    _deployable_parked,
     classify_holdings,
     plan_deployment,
 )
@@ -807,3 +808,158 @@ def _assert_calm(text: str) -> None:
     for word in _FORBIDDEN:
         pattern = r"\b" + re.escape(word) + r"\b"
         assert not re.search(pattern, blob), f"plan copy should never say {word!r}"
+
+
+# --- Story 10.8 REVIEW FIXES (2026-08-13) ------------------------------------
+# double-count (parked ∩ classified), multi-fund single-liquidation cap,
+# unclassified double-report, and the parked None/unpriced guard.
+
+
+def test_deployable_parked_excludes_classified_symbols():
+    """A parked symbol that IS classified (VTI → US) is NOT deployable cash — only a
+    genuine unclassified parked fund (SWVXX) is. Prevents the review's double-count."""
+    holdings = [
+        _holding("SWVXX", "5000"),  # unclassified money-market → deployable
+        _holding("VTI", "6000"),    # classified (US) → NOT deployable cash
+    ]
+    total, largest = _deployable_parked(holdings, frozenset({"SWVXX", "VTI"}))
+    assert total == Decimal("5000")
+    assert largest == Decimal("5000")
+
+
+def test_deployable_parked_single_fund_cap_returns_largest():
+    """``largest_single`` is the biggest ONE parked fund — the cap on what one 9-3
+    liquidation can free."""
+    holdings = [
+        _holding("SWVXX", "5000"),
+        _holding("VMFXX", "4000"),
+        _holding("SNVXX", "1000"),
+    ]
+    total, largest = _deployable_parked(
+        holdings, frozenset({"SWVXX", "VMFXX", "SNVXX"})
+    )
+    assert total == Decimal("10000")
+    assert largest == Decimal("5000")
+
+
+def test_deployable_parked_skips_unpriced_holding():
+    """A None / non-finite / ≤0 market_value parked holding is skipped (no crash)."""
+    holdings = [
+        _holding("SWVXX", "5000"),
+        SimpleNamespace(symbol="VMFXX", market_value=None),
+        SimpleNamespace(symbol="SNVXX", market_value=Decimal("0")),
+    ]
+    total, largest = _deployable_parked(
+        holdings, frozenset({"SWVXX", "VMFXX", "SNVXX"})
+    )
+    assert total == Decimal("5000")
+    assert largest == Decimal("5000")
+
+
+def test_classify_routes_parked_unclassified_out_of_sleeve():
+    """A genuine parked cash-equivalent (SWVXX, unclassified) is in NEITHER a class
+    NOR the unclassified sleeve; a parked-tagged classified fund (VTI) STAYS in its
+    class."""
+    holdings = [
+        _holding("SWVXX", "5000"),  # parked + unclassified → cash (excluded)
+        _holding("VTI", "6000"),    # parked + classified → stays US
+        _holding("TSLA", "1000"),   # not parked, unclassified → sleeve
+    ]
+    c = classify_holdings(holdings, frozenset({"SWVXX", "VTI"}))
+    assert c.by_class["us_equity"] == Decimal("6000")    # VTI stays classified
+    assert "SWVXX" not in c.unclassified_symbols          # SWVXX is cash, not a holding
+    assert c.unclassified_value == Decimal("1000")        # only TSLA
+    assert c.unclassified_symbols == ["TSLA"]
+
+
+def test_parked_classified_symbol_not_double_counted(client):
+    """A user who tags a CLASSIFIED fund (VTI) as parked: VTI stays in its US class,
+    and investable is settlement only — VTI is never counted as BOTH classified AND
+    deployable cash (the review's phantom-money double-count)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "1000")
+        _seed_holding(uid, "VTI", "6000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="0", reserve_decided=True, parked_symbols=["VTI"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        # Investable is settlement only — VTI is NOT added as cash.
+        assert body["investable_cash"] == "1000.00"
+        # VTI is still honestly shown in the US class (not laundered into cash).
+        assert Decimal(body["current"]["us_equity"]["market_value"]) == Decimal("6000")
+    finally:
+        _delete_user(email)
+
+
+def test_multi_fund_parked_capped_to_single_largest(client):
+    """Two parked funds: investable is capped to settlement + the SINGLE largest fund
+    (reserve-aware) — the plan never promises more than one 9-3 liquidation can free."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "1000")
+        _seed_holding(uid, "SWVXX", "5000")   # largest parked fund
+        _seed_holding(uid, "VMFXX", "4000")   # second parked fund
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid,
+            reserve_amount="0",
+            reserve_decided=True,
+            parked_symbols=["SWVXX", "VMFXX"],
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        # settlement 1000 + min(largest 5000, total 9000 − reserve 0) = 1000 + 5000.
+        assert body["investable_cash"] == "6000.00"  # NOT 10,000 (uncapped)
+    finally:
+        _delete_user(email)
+
+
+def test_parked_zero_value_holding_skipped(client):
+    """A parked holding with a ≤0 market_value is skipped (the review's guard; a NULL
+    is impossible — market_value is NOT NULL — but a $0 cached row is reachable and must
+    not be summed or crash GET /plan). Investable is settlement only."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "1000")
+        _seed_holding(uid, "SWVXX", "0")  # $0 parked row → skipped, never summed
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="0", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        resp = client.get("/api/allocation/plan", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["investable_cash"] == "1000.00"
+    finally:
+        _delete_user(email)
+
+
+def test_parked_money_market_not_in_unclassified_sleeve(client):
+    """SWVXX (parked) is deployable cash — it appears in investable but NOT in the
+    unclassified sleeve (the review's parked/unclassified double-report)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "1000")
+        _seed_holding(uid, "SWVXX", "4000")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="0", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["investable_cash"] == "5000.00"               # counted as cash
+        assert "SWVXX" not in body["unclassified"]["symbols"]     # not double-reported
+        assert Decimal(body["unclassified"]["market_value"]) == Decimal("0")
+    finally:
+        _delete_user(email)

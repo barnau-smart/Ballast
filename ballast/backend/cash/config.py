@@ -74,6 +74,14 @@ def parked_market_value(holdings, config: CashConfig | None) -> Decimal:
             for h in holdings
             if h.symbol
             and any(sym in parked_set for sym in normalize_symbols([h.symbol]))
+            # Skip an unpriced / degenerate holding (mirrors the liquidation filter
+            # ``_largest_parked_holding``): a ``None``/non-finite/≤0 ``market_value``
+            # can't be sensibly summed — without this guard a single ``None``-valued
+            # parked holding raises a ``TypeError`` inside ``sum`` and 500s every
+            # caller (``GET /api/portfolio``, missed-growth, the deploy engine).
+            and h.market_value is not None
+            and h.market_value.is_finite()
+            and h.market_value > 0
         ),
         Decimal("0"),
     )
