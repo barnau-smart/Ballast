@@ -1,6 +1,6 @@
 # Story 10.8: Money-market-aware deploy (count parked cash-equivalents)
 
-Status: ready-for-dev
+Status: review
 baseline_commit: 80e53a7
 
 <!-- HARD GATE (docs/dev-loop-policy.md): APPROVED by MasterB 2026-08-13. Core design
@@ -69,6 +69,15 @@ holdings. The plan/UI must make the money-market-vs-cash distinction visible (e.
 5. Honest framing: the plan/narration makes clear it's deploying money-market cash and the reserve stays untouched (10-3 guardrails apply).
 6. Per-user scoped (AD-10); Decimal money; the Epic 9 cash-state model stays coherent (ready-to-trade / parked / reserved).
 
+## Tasks / Subtasks
+
+- [x] Task 1 — Phase 1: engine counts parked money-market as deployable (AC: 1, 2, 4)
+  - [x] `allocation/engine.py:build_plan` re-imports `parked_market_value`; investable = `max(0, view.cash) + parked_market_value(view.holdings, cash_config) − reserve` (reserve out of TOTAL); added a finiteness guard on the final `investable`. Docstring + comment rewritten (ADDS parked MM). No-parked users unchanged.
+- [x] Task 2 — Phase 2: verify the deploy→liquidate composition (AC: 3)
+  - [x] Confirmed NO new Phase-2 code needed: the existing 9-3 `plan_liquidation` already triggers for ANY buy > `ready_to_trade`, sets `available_parked = max(parked − reserve, 0)`, sells parked MM, never touches the reserve. Integration test proves a deploy plan's primary buy (> settlement) composes: `needs_liquidation=True`, `coverable=True`, sells SWVXX ≤ (parked − reserve). Phase-1 investable ($65,949) == settlement + available_parked (reserve counted once, no double-count, no buy without real cash).
+- [x] Task 3 — Tests (AC: all)
+  - [x] +3 tests: the flipped repro (→ `deploy`, `investable_cash == "65949.08"`), untagged-MM-not-deployable (→ `no_cash`), and the Phase-2 liquidation-composition. Updated the superseded Group-B parked test (parked now ADDS → investable $8,000). Full backend suite 841 passed.
+
 ## Dev Notes (reuse / touch points)
 
 - `allocation/engine.py:build_plan` — the investable computation (`ready_to_trade`/`reserve`/`investable`, ~:369-395). This is where the parked-MM count + reserve-from-total change lands.
@@ -85,6 +94,25 @@ holdings. The plan/UI must make the money-market-vs-cash distinction visible (e.
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (dev-story, in-chat)
+
+### Debug Log References
+
+- RED: the flipped repro failed on the old engine (returned `no_cash`); untagged-MM guard passed.
+- Key finding: **Phase 2 required NO new code.** The Epic 9 `plan_liquidation` (9-3) already funds any buy beyond `ready_to_trade` by selling parked MM, drawing `max(parked − reserve, 0)` — exactly matching Phase-1's `investable = settlement + parked − reserve`. So counting parked MM in analysis + the existing liquidation-at-co-sign compose cleanly; the reserve is subtracted once, consistently.
+
 ### Completion Notes List
 
+- **Phase 1 (analysis):** `build_plan` now counts the user's declared parked money-market as deployable: `investable = max(0, view.cash) + parked_market_value − reserve` (reserve out of total). MasterB's real setup flips from `no_cash` to `deploy` with $65,949.08 investable. Only `parked_symbols`-declared funds count (untagged SWVXX stays uncounted). Added a finiteness guard so a NaN parked/reserve can't slip past the `investable <= 0` check.
+- **Phase 2 (execution):** unchanged code — a deploy buy > settlement cash triggers the existing 9-3 liquidation (sell parked MM → settle → buy), reserve-protected, never margin. Proven by an integration test end-to-end.
+- **Money-safety preserved:** populate-don't-submit, whole-share, never-past-target, per-user scoping all intact; the engine stays read-only. Behind the fake broker.
+- **Deferred (noted for review):** SWVXX now appears BOTH in the x-ray's unclassified sleeve (as a holding) AND in investable (as deployable cash) — a display nuance worth reconciling later (exclude parked MM from the unclassified sleeve, or label it). Not a correctness issue.
+
 ### File List
+
+- `ballast/backend/allocation/engine.py` — `parked_market_value` import; `build_plan` investable = settlement + parked MM − reserve + finiteness guard; docstring/comment.
+- `ballast/backend/tests/test_allocation_engine.py` — +3 tests (MM deployable / untagged-not-deployable / deploy→liquidate composition); updated the superseded Group-B parked test.
+
+## Change Log
+
+- 2026-08-13 — Story 10.8 implemented: money-market-aware deploy. Phase 1 counts parked money-market as deployable (`investable = settlement + parked_MM − reserve`); Phase 2 reuses the existing 9-3 liquidation (no new code) to fund buys beyond settlement with real settled cash, reserve-protected, never margin. Flips MasterB's real case from `no_cash` to `deploy` ($65,949.08). +3 tests, backend 841 passed. Money-path → awaiting mandatory independent review before merge.

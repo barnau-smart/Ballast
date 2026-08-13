@@ -609,28 +609,27 @@ def test_at_target_with_cash_but_no_underweight(client):
         _delete_user(email)
 
 
-def test_parked_holding_does_not_reduce_settlement_investable(client):
+def test_parked_money_market_adds_to_deployable(client):
+    """Story 10.8 supersedes the Group-B behavior: parked money-market is a
+    cash-equivalent the user holds instead of idle cash, so it is DEPLOYABLE.
+    $4,000 settlement cash + a $4,000 SWVXX parked holding, reserve $0 →
+    investable = 4,000 + 4,000 = $8,000 (never `view.cash − parked`, never just
+    settlement). Execution funds any buy beyond settlement by liquidating SWVXX."""
     email = _unique_email()
     try:
         _register(client, email)
         headers = {"Authorization": f"Bearer {_login(client, email)}"}
         uid = _user_id_for(email)
-        # $4,000 ready settlement cash PLUS a SEPARATE $4,000 SWVXX money-market
-        # holding. The two are independent pools (Epic 9: ready_to_trade = view.cash).
-        # Parked money-market is a holding, never part of settlement cash, so it must
-        # NOT reduce investable — the $4,000 settlement cash is fully deployable.
         _seed_balance(uid, "4000")
-        _seed_holding(uid, "SWVXX", "4000")  # a parked money-market holding (separate)
+        _seed_holding(uid, "SWVXX", "4000")  # parked money-market
         client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
         _seed_cash_config(
             uid, reserve_amount="0", reserve_decided=True, parked_symbols=["SWVXX"]
         )
 
         body = client.get("/api/allocation/plan", headers=headers).json()
-        # Regression: previously the engine did view.cash - parked = 0 → false no_cash.
-        # The $4,000 settlement cash deploys; the parked SWVXX is untouched.
         assert body["status"] == "deploy"
-        assert body["investable_cash"] == "4000.00"
+        assert body["investable_cash"] == "8000.00"
     finally:
         _delete_user(email)
 
@@ -703,6 +702,93 @@ def test_plan_target_weights_empty_when_no_target(client):
         body = client.get("/api/allocation/plan", headers=headers).json()
         assert body["status"] == "no_target"
         assert body["target_weights"] == {}
+    finally:
+        _delete_user(email)
+
+
+def test_money_market_counted_as_deployable(client):
+    """Story 10.8 — parked money-market is DEPLOYABLE. MasterB's real setup:
+    settlement $12,182.82 + SWVXX $93,766.26 (parked) + reserve $40,000 →
+    investable = 12,182.82 + 93,766.26 − 40,000 = $65,949.08 → a deploy plan
+    (was 'no_cash' before this story)."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "12182.82")
+        _seed_holding(uid, "SWVXX", "93766.26")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="40000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "deploy"
+        # Reserve comes out of TOTAL (settlement + parked MM), not settlement alone.
+        assert body["investable_cash"] == "65949.08"
+    finally:
+        _delete_user(email)
+
+
+def test_untagged_money_market_is_not_deployable(client):
+    """Only the user's DECLARED parked_symbols count as deployable cash. The same
+    SWVXX holding, NOT tagged parked, is a plain (unclassified) holding — investable
+    stays settlement − reserve = negative → 'no_cash'."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "12182.82")
+        _seed_holding(uid, "SWVXX", "93766.26")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="40000", reserve_decided=True, parked_symbols=[]
+        )
+
+        body = client.get("/api/allocation/plan", headers=headers).json()
+        assert body["status"] == "no_cash"  # SWVXX untagged → not counted
+    finally:
+        _delete_user(email)
+
+
+def test_deploy_buy_funds_via_liquidation_reserve_protected(client):
+    """Story 10.8 Phase 2 — a deploy buy beyond settlement cash COMPOSES with the
+    Epic 9 (9-3) just-in-time liquidation: the primary buy from MasterB's deploy plan
+    (> $12,182.82 settlement) triggers a coverable liquidation that SELLS SWVXX for
+    the shortfall, drawing only from parked ABOVE the $40k reserve — never touching
+    the reserve, never margin. Proves the analysis figure ($65,949 investable) is
+    backed by real settled cash at execution."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "12182.82")
+        _seed_holding(uid, "SWVXX", "93766.26")
+        client.put("/api/target-allocation", headers=headers, json={"model": "growth"})
+        _seed_cash_config(
+            uid, reserve_amount="40000", reserve_decided=True, parked_symbols=["SWVXX"]
+        )
+
+        plan = client.get("/api/allocation/plan", headers=headers).json()
+        assert plan["status"] == "deploy"
+        primary = plan["primary_order"]
+        assert primary is not None
+        # The primary buy exceeds settlement cash → it must be funded by liquidation.
+        assert Decimal(primary["amount"]) > Decimal("12182.82")
+
+        liq = client.post(
+            "/api/cash/liquidation-plan",
+            headers=headers,
+            json={"symbol": primary["symbol"], "amount": primary["amount"]},
+        ).json()
+        assert liq["needs_liquidation"] is True
+        assert liq["coverable"] is True  # available parked $53,766.26 covers the shortfall
+        assert liq["sell_symbol"] == "SWVXX"
+        # Never sells into the reserve: the sell never exceeds parked − reserve.
+        assert Decimal(liq["sell_amount"]) <= Decimal("53766.26")
     finally:
         _delete_user(email)
 

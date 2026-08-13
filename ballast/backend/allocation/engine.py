@@ -45,6 +45,7 @@ from allocation.config import get_config as get_target_config, resolve as resolv
 from brokers.portfolio import get_portfolio
 from cash.config import (
     get_config as get_cash_config,
+    parked_market_value,
     resolve_reserve,
 )
 from db.scope import Scope
@@ -312,8 +313,8 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
     1. Undecided target (10-1 → ``None``) → ``no_target``.
     2. Never-decided reserve (no cash config, or ``resolve_reserve`` → ``None``) →
        ``decide_reserve`` (NEVER silently 0).
-    3. Investable cash (``ready_to_trade − reserve``, ready = settlement view.cash) ≤ 0 →
-       ``no_cash``.
+    3. Investable cash (``settlement view.cash + parked money-market − reserve``;
+       parked MM is deployable, reserve out of the total) ≤ 0 → ``no_cash``.
     4. No underweight class the cash can add to (or every allocation is dust) →
        ``at_target``.
     5. Otherwise → ``deploy`` with the per-class buys + the largest-gap
@@ -366,22 +367,28 @@ async def build_plan(scope: Scope, session: AsyncSession) -> Plan:
             as_of=as_of,
         )
 
-    # (3) Investable cash = ready_to_trade − reserve. ``ready_to_trade`` is the
-    # settlement cash (``view.cash``, the balance row) — Epic 9's canonical
-    # definition (``api/portfolio``, ``cash/liquidation``, ``api/cash`` all set
-    # ``ready_to_trade = view.cash``). Parked money-market is a SEPARATE holding pool
-    # (never part of ``view.cash``): subtracting its value here would double-remove
-    # money that was never in settlement, under-deploying or falsely reporting
-    # no_cash for any user of the Epic 9 park feature. Clamp cash to zero (a negative
-    # settlement balance is not investable). ``reserve`` is re-validated here (finite,
-    # non-negative) because the engine trusts a value stored by another writer — a
-    # NaN would otherwise slip past the ``investable <= 0`` guard (NaN compares False)
-    # and a negative would inflate investable past the real cash.
+    # (3) Investable cash = ready_to_trade + parked money-market − reserve (Story 10.8).
+    # ``ready_to_trade`` is settlement cash (``view.cash``, the balance row). Parked
+    # money-market — the user's DECLARED ``parked_symbols`` (e.g. SWVXX) — is a
+    # cash-equivalent they hold INSTEAD of idle cash, so it IS deployable and is
+    # counted here. The reserve is a cushion out of the TOTAL available (settlement +
+    # parked MM), never settlement alone. Clamp settlement to zero (a negative margin
+    # balance is not investable). ``reserve`` is re-validated (finite, non-negative),
+    # and the final ``investable`` is finiteness-checked, so a stored NaN cannot slip
+    # past the ``investable <= 0`` guard (NaN compares False) nor a negative inflate it.
+    #
+    # EXECUTION SAFETY (Phase 2): counting parked MM here is ANALYSIS only. A deploy
+    # buy beyond settlement cash is funded at co-sign by liquidating parked MM first
+    # (Epic 9 ``cash.liquidation.plan_liquidation``, which frees ``max(parked − reserve,
+    # 0)`` and never touches the reserve), so a buy ALWAYS places against REAL settled
+    # cash — never margin. This ``investable`` therefore exactly equals settlement +
+    # the liquidatable parked (the reserve is subtracted exactly once, consistently).
     ready_to_trade = max(_ZERO, view.cash)
+    parked = parked_market_value(view.holdings, cash_config)
     if not reserve.is_finite() or reserve < _ZERO:
         reserve = _ZERO
-    investable = ready_to_trade - reserve
-    if investable <= _ZERO:
+    investable = ready_to_trade + parked - reserve
+    if not investable.is_finite() or investable <= _ZERO:
         return Plan(
             status=STATUS_NO_CASH,
             current=current,

@@ -167,7 +167,7 @@ development_status:
   10-5-cost-switch-linked-sell-buy-pair: done
   10-6-unit-tagged-number-gate: done
   10-7-surface-current-vs-target-xray: done
-  10-8-money-market-aware-deploy: ready-for-dev
+  10-8-money-market-aware-deploy: review
   epic-10-retrospective: done
 
 action_items:
