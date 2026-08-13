@@ -61,6 +61,34 @@ FAKE_HOLDINGS: tuple[Holding, ...] = (
 )
 FAKE_CASH = Decimal("750.25")
 
+# --- Demo portfolio (Story: safe team demo) ---------------------------------
+# A richer, presentation-friendly fake portfolio returned ONLY when
+# ``DEMO_PORTFOLIO`` is set (never in tests / default runs): an all-US position +
+# a couple single stocks (the "not counted toward your target mix" sleeve) + a few
+# thousand cash, so the deploy tells the clean "all-US → buy Bonds & International"
+# story on FAKE data — no real account info. All money is Decimal.
+DEMO_HOLDINGS: tuple[Holding, ...] = (
+    Holding(
+        symbol="VTI",  # all-US index position (classified: us_equity)
+        quantity=Decimal("26"),
+        market_value=Decimal("10000.00"),
+        cost_basis=Decimal("7800.00"),
+    ),
+    Holding(
+        symbol="AAPL",  # single stock → unclassified (surfaced, excluded from math)
+        quantity=Decimal("12"),
+        market_value=Decimal("2500.00"),
+        cost_basis=Decimal("1800.00"),
+    ),
+    Holding(
+        symbol="NVDA",  # single stock → unclassified
+        quantity=Decimal("8"),
+        market_value=Decimal("1500.00"),
+        cost_basis=Decimal("900.00"),
+    ),
+)
+DEMO_CASH = Decimal("4000.00")
+
 # A deterministic, obviously-fake fill price the fake adapter reports for every
 # placed order. No wall-clock, no market data, no randomness — so the same
 # order placed twice yields a byte-identical OrderOutcome (tests assert this).
@@ -135,10 +163,19 @@ class FakeBrokerAdapter(BrokerPort):
         ``as_of_offset`` — deterministic so the reconcile-wins tests can build a
         newer/older snapshot without touching the wall clock.
         """
+        # Demo mode returns the richer presentation portfolio (fake data only); the
+        # default small portfolio is unchanged for tests/normal runs. Read the flag
+        # lazily so the fake adapter never imports settings at module load.
+        from api.config import get_settings
+
+        if get_settings().DEMO_PORTFOLIO:
+            holdings, cash = list(DEMO_HOLDINGS), DEMO_CASH
+        else:
+            holdings, cash = list(FAKE_HOLDINGS), FAKE_CASH
         return PortfolioSnapshot(
             as_of=FAKE_AS_OF_BASE + self._as_of_offset,
-            cash=FAKE_CASH,
-            holdings=list(FAKE_HOLDINGS),
+            cash=cash,
+            holdings=holdings,
             # A non-margin account by default (Story 10.10) so dev/demo/tests never
             # trip the margin warning — the warning is real-broker-only by construction.
             account_type="CASH",
