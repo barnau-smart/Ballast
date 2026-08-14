@@ -41,10 +41,14 @@ from allocation.review import (
     build_review_facts,
     check_no_forecast,
     check_no_invented_numbers,
+    BLENDED_ER_INFO,
     SINGLE_NAME_AGG_MAX,
+    Fees,
     SingleStock,
     compute_coverage,
+    compute_fees,
     coverage_message,
+    fees_message,
     single_stock_from_coverage,
     single_stock_message,
     find_bond_floor_finding,
@@ -53,7 +57,7 @@ from allocation.review import (
     find_review,
     narrate_finding,
 )
-from api.allocation import _coverage_out, _single_stock_out
+from api.allocation import _coverage_out, _fees_out, _single_stock_out
 from strategy.target_allocation import BONDS, INTL_EQUITY, US_EQUITY
 from api.app import create_app
 from brokers.portfolio import PortfolioView
@@ -718,7 +722,9 @@ def test_review_shape_ranking_and_no_writes(client):
         r = client.get("/api/allocation/review", headers=headers)
         assert r.status_code == 200, r.text
         body = r.json()
-        assert set(body.keys()) == {"findings", "coverage", "single_stock"}
+        assert set(body.keys()) == {"findings", "coverage", "single_stock", "fees"}
+        # Blended ER = (2000*0.61 + 2500*0.03)/4500 = 0.2878% < 0.30 band → no fees note.
+        assert body["fees"] is None
         # TSLA 5500 + AGTHX 2000 unclassified of 10000 total → 25% coverage → inadequate.
         assert body["coverage"]["adequate"] is False
         assert body["coverage"]["coverage"] == "25.00"
@@ -823,7 +829,7 @@ def test_review_per_user_isolation(client):
         # B sees ONLY its own (empty) state — never A's holdings. Empty portfolio →
         # coverage is null (nothing to measure), not a fabricated 0%/100%.
         b_body = client.get("/api/allocation/review", headers=headers_b).json()
-        assert b_body == {"findings": [], "coverage": None, "single_stock": None}
+        assert b_body == {"findings": [], "coverage": None, "single_stock": None, "fees": None}
     finally:
         _delete_user(email_a)
         _delete_user(email_b)
@@ -991,6 +997,75 @@ def test_coverage_out_serializes_and_gates_message():
     assert high.message is None  # adequate → no informational line
 
     assert _coverage_out(None) is None
+
+
+# --- Blended expense summary (Story 11.4) ------------------------------------
+
+
+def test_fees_blended_math_and_coverage():
+    """Dollar-weighted blended ER + annual $ + honest coverage over priced funds only."""
+    view = _view([
+        _Holding("AGTHX", Decimal("3000"), Decimal("30")),  # 0.61% (priced)
+        _Holding("VTI", Decimal("1000"), Decimal("5")),      # 0.03% (priced)
+        _Holding("TSLA", Decimal("1000"), Decimal("4")),     # no ER (excluded)
+    ])
+    fees = compute_fees(view)
+    assert fees is not None
+    # weighted = 3000*0.61 + 1000*0.03 = 1860; priced = 4000; total = 5000.
+    assert fees.blended_er == Decimal("1860") / Decimal("4000")   # 0.465%
+    assert fees.annual_cost == Decimal("1860") / Decimal("100")   # $18.60
+    assert fees.coverage == Decimal("4000") / Decimal("5000")     # 0.80 (TSLA excluded)
+    assert fees.over is True                                       # 0.465 > 0.30
+
+
+def test_fees_below_band_not_over():
+    """All-cheap-index → blended under the band → not over."""
+    view = _view([_Holding("VTI", Decimal("6000"), Decimal("30")), _Holding("BND", Decimal("4000"), Decimal("28"))])
+    fees = compute_fees(view)
+    assert fees is not None and fees.over is False                # 0.03% << 0.30
+
+
+def test_fees_no_priced_funds_returns_none():
+    """Only individual stocks (no known ER) → None (never invent a fee)."""
+    assert compute_fees(_view([_Holding("TSLA", Decimal("5000"), Decimal("20"))])) is None
+
+
+def test_fees_empty_returns_none():
+    assert compute_fees(_view([], cash="0")) is None
+
+
+def test_fees_non_finite_skipped():
+    """A NaN-priced fund is skipped, never poisoning the blend."""
+    view = _view([
+        _Holding("AGTHX", Decimal("NaN"), Decimal("30")),   # unpriced → skipped
+        _Holding("VTI", Decimal("1000"), Decimal("5")),
+    ])
+    fees = compute_fees(view)
+    assert fees is not None
+    assert fees.blended_er == Decimal("0.03")               # only VTI counted
+    assert fees.over is False
+
+
+def test_fees_message_is_calm_and_states_coverage():
+    view = _view([_Holding("AGTHX", Decimal("3000"), Decimal("30")), _Holding("TSLA", Decimal("7000"), Decimal("20"))])
+    fees = compute_fees(view)                                # coverage 30%
+    msg = fees_message(fees)
+    assert "30.00%" in msg          # honest fee coverage (stocks not implied free)
+    assert "0.61%" in msg           # blended (only AGTHX priced)
+    _assert_calm(msg)
+    check_no_forecast(msg)
+
+
+def test_fees_out_surfaces_only_when_over():
+    # AGTHX 3000 (0.61%) + VTI 2000 (0.03%): weighted 1890, blended 0.378%, annual $18.90.
+    over = _fees_out(compute_fees(_view([_Holding("AGTHX", Decimal("3000"), Decimal("30")), _Holding("VTI", Decimal("2000"), Decimal("10"))])))
+    assert over is not None
+    assert over.blended_er == "0.38"          # 0.378 → 0.38 cent-rounded
+    assert over.annual_cost == "18.90"
+    assert over.coverage == "100.00"          # both holdings are priced funds
+    assert over.message
+    assert _fees_out(compute_fees(_view([_Holding("VTI", Decimal("9000"), Decimal("45"))]))) is None  # under band
+    assert _fees_out(None) is None
 
 
 # --- Single-stock aggregate concentration (Story 11.3) -----------------------

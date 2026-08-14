@@ -30,11 +30,14 @@ from allocation.engine import ActionItem, Plan, build_plan
 from allocation.narrate import AllocationNarration, narrate_plan
 from allocation.review import (
     Coverage,
+    Fees,
     NarratedFinding,
     SingleStock,
     build_coverage,
+    build_fees,
     build_review,
     coverage_message,
+    fees_message,
     single_stock_from_coverage,
     single_stock_message,
 )
@@ -190,14 +193,28 @@ class SingleStockOut(BaseModel):
     message: str
 
 
+class FeesOut(BaseModel):
+    """The whole-portfolio blended fund-fee summary (Story 11.4) — present ONLY when the
+    blended ER is over the band (else ``null``). ``blended_er`` / ``coverage`` are fixed-point
+    percent strings; ``annual_cost`` fixed-point money; ``message`` the calm line.
+    Informational — carries NO order."""
+
+    blended_er: str
+    annual_cost: str
+    coverage: str
+    message: str
+
+
 class ReviewResponse(BaseModel):
     """The ``GET /api/allocation/review`` payload — the ranked findings (empty when
-    there is nothing to fix), plus the coverage meta-check (Story 11.1) and the aggregate
-    single-stock note (Story 11.3); each ``null`` when not applicable."""
+    there is nothing to fix), plus the coverage meta-check (Story 11.1), the aggregate
+    single-stock note (Story 11.3), and the blended-fee summary (Story 11.4); each ``null``
+    when not applicable."""
 
     findings: list[ReviewFindingOut]
     coverage: CoverageOut | None = None
     single_stock: SingleStockOut | None = None
+    fees: FeesOut | None = None
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -365,6 +382,19 @@ def _single_stock_out(ss: SingleStock | None) -> SingleStockOut | None:
     )
 
 
+def _fees_out(fees: Fees | None) -> FeesOut | None:
+    """Serialize the blended-fee summary (Story 11.4): surface ONLY when the blended ER is
+    over the band (``fees.over``); percent/money as fixed-point strings; ``None`` otherwise."""
+    if fees is None or not fees.over:
+        return None
+    return FeesOut(
+        blended_er=format_money(fees.blended_er.quantize(Decimal("0.01"))),
+        annual_cost=format_money(fees.annual_cost.quantize(Decimal("0.01"))),
+        coverage=format_money((fees.coverage * Decimal("100")).quantize(Decimal("0.01"))),
+        message=fees_message(fees),
+    )
+
+
 @router.get("/review", response_model=ReviewResponse)
 async def read_review(
     scope: Scope = Depends(get_scope),
@@ -389,4 +419,5 @@ async def read_review(
         findings=[_review_finding_out(f) for f in findings],
         coverage=_coverage_out(coverage),
         single_stock=_single_stock_out(single_stock_from_coverage(coverage)),
+        fees=_fees_out(await build_fees(scope, session)),
     )

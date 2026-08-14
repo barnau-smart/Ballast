@@ -276,6 +276,9 @@ export function CoachConsult() {
   // Story 11.3 — the aggregate single-stock note (`{single_stock}`), present only when the
   // individual-stock sleeve is over the band; null otherwise → nothing rendered.
   const [reviewSingleStock, setReviewSingleStock] = useState(null)
+  // Story 11.4 — the blended fund-fee summary (`{fees}`), present only when the blended ER
+  // is over the band; null otherwise → nothing rendered.
+  const [reviewFees, setReviewFees] = useState(null)
   const reviewingRef = useRef(false) // synchronous double-click guard
 
   // Story 10.5 — the cheaper canonical fund a cost-switch SELL switches INTO. When
@@ -838,6 +841,7 @@ export function CoachConsult() {
     setReviewFindings([])
     setReviewCoverage(null)
     setReviewSingleStock(null)
+    setReviewFees(null)
     try {
       const res = await apiFetch('/api/allocation/review')
       if (!mounted.current) return
@@ -876,6 +880,7 @@ export function CoachConsult() {
       // empty states when it carries a message (i.e. coverage is inadequate).
       setReviewCoverage(data?.coverage ?? null)
       setReviewSingleStock(data?.single_stock ?? null)   // Story 11.3
+      setReviewFees(data?.fees ?? null)                  // Story 11.4
       const findings = Array.isArray(data?.findings) ? data.findings : []
       if (findings.length === 0) {
         setReviewFindings([])
@@ -1173,6 +1178,16 @@ export function CoachConsult() {
           role="status"
         >
           {reviewSingleStock.message}
+        </p>
+      ) : null}
+
+      {(review === 'ready' || review === 'empty') && reviewFees?.message ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-fees"
+          role="status"
+        >
+          {reviewFees.message}
         </p>
       ) : null}
 

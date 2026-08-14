@@ -701,6 +701,87 @@ def single_stock_message(ss: SingleStock) -> str:
     )
 
 
+# --- Whole-portfolio blended expense summary (Story 11.4) ---------------------
+
+#: The blended-fee nudge band (Story 11.4): when the dollar-weighted blended expense ratio
+#: across the funds Ballast can price exceeds this many percentage points, surface a calm
+#: "here's your yearly fund fee in dollars" note. Locked strategy constant; 0.30pp — a broad
+#: index portfolio (~0.03–0.10%) never trips it, while an active-fund-heavy one does.
+BLENDED_ER_INFO: Decimal = Decimal("0.30")
+
+
+@dataclass(frozen=True)
+class Fees:
+    """The whole-portfolio blended fund-fee summary (pure, Story 11.4).
+
+    ``blended_er`` is the dollar-weighted expense ratio (percentage points) across holdings
+    with a KNOWN expense ratio; ``annual_cost`` the implied $/year on those funds;
+    ``coverage`` the fraction of the portfolio those priced funds represent (stated honestly
+    so unknown-ER holdings are never implied fee-free). ``over`` is
+    ``blended_er > BLENDED_ER_INFO``. Informational only — carries NO order."""
+
+    blended_er: Decimal
+    annual_cost: Decimal
+    coverage: Decimal
+    over: bool
+
+
+def compute_fees(view: PortfolioView) -> Fees | None:
+    """Compute the dollar-weighted blended fund fee (pure, Story 11.4).
+
+    Over holdings with a known ER (`fund_cost` — funds only; individual stocks have no
+    entry): ``blended_er = Σ(mv·er)/Σ(mv)``, ``annual_cost = Σ(mv·er)/100`` ($), and
+    ``coverage = Σ(priced mv)/total``. Skips non-finite/≤0 market values and non-finite/<0
+    ERs. ``None`` when there are no priced funds or the portfolio is empty — never invents a
+    fee for an unpriced holding. Aggregates by symbol first so a split fund is one position."""
+    total = _total_portfolio_value(view)
+    if total <= _ZERO:
+        return None
+    view = _aggregate_by_symbol(view)
+    priced_mv = _ZERO
+    weighted = _ZERO  # Σ mv·er
+    for h in view.holdings or []:
+        symbol = (h.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        mv = h.market_value if h.market_value is not None else _ZERO
+        if not mv.is_finite() or mv <= _ZERO:
+            continue
+        cost = fund_cost(symbol)
+        if cost is None:
+            continue  # unknown fee → never invent a ratio
+        er = cost.expense_ratio
+        if not er.is_finite() or er < _ZERO:
+            continue
+        priced_mv += mv
+        weighted += mv * er
+    if priced_mv <= _ZERO:
+        return None
+    blended = weighted / priced_mv
+    return Fees(
+        blended_er=blended,
+        annual_cost=weighted / _HUNDRED,
+        coverage=priced_mv / total,
+        over=blended > BLENDED_ER_INFO,
+    )
+
+
+def fees_message(fees: Fees) -> str:
+    """The deterministic, calm blended-fee line (pure, Story 11.4). Turns the abstract
+    percent into a recurring dollar figure and states the fee COVERAGE honestly (so unpriced
+    holdings are never implied free). States only detector numbers (never-invent); no
+    forecast, no FOMO. NO LLM call."""
+    er = format_money(fees.blended_er.quantize(_CENT))
+    cost = format_money(fees.annual_cost.quantize(_CENT))
+    cov = format_money((fees.coverage * _HUNDRED).quantize(_CENT))
+    return (
+        f"Across the funds I can price ({cov}% of your portfolio), you're paying about "
+        f"{er}% a year in fund fees — roughly ${cost} this year, and it recurs every year. "
+        "Lower-cost versions of similar funds could keep more of that money working for you. "
+        "This isn't a prediction — it's just what the published fees add up to."
+    )
+
+
 # --- Evidence + allow-set (pure, built from a finding) -----------------------
 
 
@@ -1130,3 +1211,11 @@ async def build_coverage(scope: Scope, session: AsyncSession) -> Coverage | None
     view = await get_portfolio(scope, session)
     cash_config = await get_cash_config(scope, session)
     return compute_coverage(view, cash_config)
+
+
+async def build_fees(scope: Scope, session: AsyncSession) -> Fees | None:
+    """Resolve the caller's cached portfolio and compute the blended fund-fee summary
+    (Story 11.4). READ-ONLY, fail-closed per-user (AD-10) — no writes, no LLM. ``None`` when
+    the portfolio is empty or holds no priced funds."""
+    view = await get_portfolio(scope, session)
+    return compute_fees(view)

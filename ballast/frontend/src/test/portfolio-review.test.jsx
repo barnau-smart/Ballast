@@ -29,14 +29,14 @@ function expectCalm(text) {
 // `{findings: [...]}`. Any other URL is unexpected in these tests (so a stray
 // /approve or /recommend would blow up loudly — proving nothing was submitted).
 
-function stubFetch({ findings, coverage = null, single_stock = null, ok = true, status = 200 } = {}) {
+function stubFetch({ findings, coverage = null, single_stock = null, fees = null, ok = true, status = 200 } = {}) {
   const fn = vi.fn((url) => {
     const u = String(url)
     if (u.includes('/api/allocation/review')) {
       return Promise.resolve({
         ok,
         status,
-        json: () => Promise.resolve({ findings: findings ?? [], coverage, single_stock }),
+        json: () => Promise.resolve({ findings: findings ?? [], coverage, single_stock, fees }),
       })
     }
     return Promise.reject(new Error(`unexpected url: ${u}`))
@@ -735,6 +735,43 @@ describe('Review — aggregate single-stock note (Story 11.3)', () => {
     fireEvent.click(screen.getByTestId('coach-review-portfolio'))
     await screen.findByTestId('coach-review-empty')
     expect(screen.queryByTestId('coach-review-single-stock')).toBeNull()
+  })
+})
+
+// --- Story 11.4: blended-fee summary -----------------------------------------
+
+const FEES = {
+  blended_er: '0.55',
+  annual_cost: '240.00',
+  coverage: '80.00',
+  message:
+    "Across the funds I can price (80.00% of your portfolio), you're paying about 0.55% a " +
+    "year in fund fees — roughly $240.00 this year, and it recurs every year. Lower-cost " +
+    "versions of similar funds could keep more of that money working for you. This isn't a " +
+    "prediction — it's just what the published fees add up to.",
+}
+
+describe('Review — blended-fee summary (Story 11.4)', () => {
+  it('shows the fees line when the blended ER is over the band', async () => {
+    stubFetch({ findings: [], fees: FEES })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+
+    const line = await screen.findByTestId('coach-review-fees')
+    expect(line.textContent).toMatch(/\$240\.00 this year/)
+    expect(line.textContent).toMatch(/0\.55% a year/)
+    expectCalm(line.textContent)
+  })
+
+  it('renders nothing when fees is absent (null)', async () => {
+    stubFetch({ findings: [], fees: null })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+    expect(screen.queryByTestId('coach-review-fees')).toBeNull()
   })
 })
 
