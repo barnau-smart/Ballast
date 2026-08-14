@@ -194,7 +194,7 @@ development_status:
   # + 11-3 aggregate single-stock (MONEY-PATH: need bmad-spec + independent review) →
   # 11-4 blended expense (informational). Opened 2026-08-14 from a fiduciary consult.
   epic-11: in-progress
-  11-1-unclassified-coverage-gate: ready-for-dev
+  11-1-unclassified-coverage-gate: review
   11-2-bond-floor-risk-capacity: backlog
   11-3-single-stock-aggregate-concentration: backlog
   11-4-blended-expense-summary: backlog

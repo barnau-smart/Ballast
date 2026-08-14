@@ -24,9 +24,17 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from decimal import Decimal
+
 from allocation.engine import ActionItem, Plan, build_plan
 from allocation.narrate import AllocationNarration, narrate_plan
-from allocation.review import NarratedFinding, build_review
+from allocation.review import (
+    Coverage,
+    NarratedFinding,
+    build_coverage,
+    build_review,
+    coverage_message,
+)
 from api.deps import get_scope
 from db.scope import Scope
 from db.session import get_async_session
@@ -149,11 +157,27 @@ class ReviewFindingOut(BaseModel):
     narration: NarrationOut
 
 
+class CoverageOut(BaseModel):
+    """The classifiable-coverage meta-check (Story 11.1) — how much of the portfolio the
+    review can categorize. ``coverage`` is a fixed-point PERCENT string (e.g. "60.00");
+    ``unclassified_value`` is fixed-point money. ``message`` is the calm informational line,
+    present ONLY when ``adequate`` is false (nothing to say at good coverage). Carries NO
+    order — informational, never money-path."""
+
+    coverage: str
+    adequate: bool
+    unclassified_value: str
+    unclassified_symbols: list[str]
+    message: str | None = None
+
+
 class ReviewResponse(BaseModel):
     """The ``GET /api/allocation/review`` payload — the ranked findings (empty when
-    there is nothing to fix)."""
+    there is nothing to fix), plus the coverage meta-check (Story 11.1; ``null`` when the
+    portfolio is empty/never-imported)."""
 
     findings: list[ReviewFindingOut]
+    coverage: CoverageOut | None = None
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -281,6 +305,22 @@ def _review_finding_out(narrated: NarratedFinding) -> ReviewFindingOut:
     )
 
 
+def _coverage_out(cov: Coverage | None) -> CoverageOut | None:
+    """Serialize the coverage meta-check (Story 11.1): percent + money as fixed-point
+    strings; the calm ``message`` only when coverage is inadequate (adequate → ``None`` so
+    the UI shows nothing). ``None`` in → ``None`` out (empty/never-imported portfolio)."""
+    if cov is None:
+        return None
+    pct = format_money((cov.coverage * Decimal("100")).quantize(Decimal("0.01")))
+    return CoverageOut(
+        coverage=pct,
+        adequate=cov.adequate,
+        unclassified_value=format_money(cov.unclassified_value.quantize(Decimal("0.01"))),
+        unclassified_symbols=list(cov.unclassified_symbols),
+        message=None if cov.adequate else coverage_message(cov),
+    )
+
+
 @router.get("/review", response_model=ReviewResponse)
 async def read_review(
     scope: Scope = Depends(get_scope),
@@ -299,4 +339,8 @@ async def read_review(
     through the existing ``/approve`` spine. 401 unauth; money as fixed-point strings.
     """
     findings = await build_review(scope, session, get_llm_gateway())
-    return ReviewResponse(findings=[_review_finding_out(f) for f in findings])
+    coverage = await build_coverage(scope, session)
+    return ReviewResponse(
+        findings=[_review_finding_out(f) for f in findings],
+        coverage=_coverage_out(coverage),
+    )

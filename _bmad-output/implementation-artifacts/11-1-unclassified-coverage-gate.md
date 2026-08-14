@@ -1,6 +1,9 @@
+---
+baseline_commit: 3542fa87cc0cca0610760624c2e7ef6300e5803b
+---
 # Story 11.1: Unclassified-holdings coverage gate
 
-Status: ready-for-dev
+Status: review
 
 <!-- Epic 11 (Fiduciary-Grade Portfolio Review), story 1 of 4 — the FOUNDATION.
      INFORMATIONAL, NOT money-path (proposes NO order) → no bmad-spec/independent-review
@@ -31,16 +34,16 @@ This is the load-bearing honesty foundation for Epic 11; build it first (the fid
 
 ## Tasks / Subtasks
 
-- [ ] Task 1 — Coverage detector (AC: 1, 2, 6)
-  - [ ] Pure `find_coverage`/`compute_coverage(view, cash_config)` in `allocation/review.py` reusing `classify_holdings`; returns coverage fraction + unclassified value/symbols + `adequate`. `COVERAGE_MIN = Decimal("0.80")` constant with a doc-comment.
-- [ ] Task 2 — Surface via the review layer (AC: 3, 4, 5, 6)
-  - [ ] `build_review` computes coverage; emit the informational result (deterministic templated copy) when `not adequate`; return coverage alongside the findings without forcing an order.
-- [ ] Task 3 — Wire + API (AC: 5, 7)
-  - [ ] Add a `coverage` object to `ReviewResponse` (`coverage` percent string, `adequate` bool, `unclassified_value` money string, `unclassified_symbols` list) in `api/allocation.py`, serialized in `read_review`. Additive only.
-- [ ] Task 4 — UI (AC: 8)
-  - [ ] Render the coverage line in `CoachConsult.jsx`'s review block; calm copy; degrade-safe; React-escaped. Extend `portfolio-review.test.jsx`.
-- [ ] Task 5 — Tests (AC: all)
-  - [ ] Backend: coverage math (mixed / all-classified / all-unclassified / empty), parked-not-counted-as-unclassified, threshold boundary, no-order-ever, per-user scope, wire serialization, calm-copy. Frontend: renders coverage line from a stubbed response + degrades when absent. `ballast_test` DB only.
+- [x] Task 1 — Coverage detector (AC: 1, 2, 6)
+  - [x] Pure `compute_coverage(view, cash_config)` + `Coverage` dataclass in `allocation/review.py`, reusing `classify_holdings`; returns coverage fraction (clamped [0,1]) + unclassified value/symbols + `adequate`. `COVERAGE_MIN = Decimal("0.80")` constant with a doc-comment. `total<=0` → `None`.
+- [x] Task 2 — Surface via the review layer (AC: 3, 4, 5, 6)
+  - [x] `build_coverage(scope, session)` (read-only, scoped) computes coverage; `coverage_message()` is the deterministic calm copy (no LLM). Coverage returned alongside findings; no order ever produced.
+- [x] Task 3 — Wire + API (AC: 5, 7)
+  - [x] Additive `CoverageOut` + `ReviewResponse.coverage` in `api/allocation.py`; `_coverage_out` serializes percent/money as fixed-point strings and gates `message` to `null` when adequate; `read_review` calls `build_coverage`. No existing field changed.
+- [x] Task 4 — UI (AC: 8)
+  - [x] `reviewCoverage` state + coverage line in `CoachConsult.jsx` (shown in ready AND empty states, only when `coverage.message` present); React-escaped; degrade-safe (null/adequate → nothing).
+- [x] Task 5 — Tests (AC: all)
+  - [x] Backend: coverage math (mixed / all-classified / boundary-inclusive / cash-counts / empty→None), parked-not-unclassified, message calm + no-forecast, `_coverage_out` serialization + message-gating; the two API review tests now assert coverage end-to-end (low + full) + empty→null. Frontend: coverage line renders with findings, renders on empty-findings, hidden when adequate, degrades when null. All on `ballast_test`.
 
 ## Dev Notes
 
@@ -76,12 +79,32 @@ This is the load-bearing honesty foundation for Epic 11; build it first (the fid
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (bmad-dev-story, in-chat)
+
 ### Debug Log References
+
+- Backend `test_allocation_review.py`: 51 passed. Full backend suite: 899 passed (ballast_test DB, `BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1`, `LLM_ADAPTER=fake`) — no regressions.
+- Frontend `npm test`: 205 passed (21 files), incl. 4 new coverage tests.
+- One fix during GREEN: `format_money` does not zero-pad whole numbers ("7500" not "7500.00"); quantized `unclassified_value` to cents before formatting (both `coverage_message` and `_coverage_out`) so money always renders fixed-point.
 
 ### Completion Notes List
 
+- **Detector (`allocation/review.py`):** `compute_coverage(view, cash_config)` reuses `allocation.engine.classify_holdings` so "unclassified" is byte-identical to the deploy engine and a declared parked money-market holding (SWVXX) counts as KNOWN cash — never inflates `unclassified_value`. `coverage = 1 − unclassified/total`, clamped [0,1]; `total<=0` → `None` (degrade-safe, no divide-by-zero). `COVERAGE_MIN=0.80` locked constant; `adequate = coverage >= COVERAGE_MIN` (inclusive). `coverage_message()` is deterministic calm copy (no LLM), citing only detector numbers.
+- **Review layer:** `build_coverage(scope, session)` — read-only, AD-10 scoped. Returns `Coverage | None`; `adequate` is the signal 11.2/drift will hard-gate on.
+- **Wire (`api/allocation.py`):** additive `ReviewResponse.coverage: CoverageOut | None`; `_coverage_out` emits fixed-point percent/money strings and includes `message` ONLY when inadequate (adequate → `null`, so the UI shows nothing). Empty portfolio → `coverage: null` (never a fabricated 0%/100%).
+- **UI (`CoachConsult.jsx`):** `reviewCoverage` state; coverage line renders in BOTH ready and empty states when `coverage.message` is present; React-escaped; degrade-safe.
+- **Money-safety/contracts preserved:** read-only, per-user scoped, fixed-point money, no order ever produced (informational only), additive wire (no existing field changed), no XSS. Proposes and places NOTHING.
+
 ### File List
+
+- `ballast/backend/allocation/review.py` — `COVERAGE_MIN`, `_ONE`, `Coverage`, `compute_coverage`, `coverage_message`, `build_coverage`; import `classify_holdings`.
+- `ballast/backend/api/allocation.py` — `CoverageOut`, `ReviewResponse.coverage`, `_coverage_out`, `build_coverage` wired into `read_review`; `Decimal` import.
+- `ballast/backend/tests/test_allocation_review.py` — coverage unit tests + `_coverage_out` serialization test; updated 3 API review assertions to assert coverage end-to-end.
+- `ballast/frontend/src/components/CoachConsult.jsx` — `reviewCoverage` state + coverage line render.
+- `ballast/frontend/src/test/portfolio-review.test.jsx` — `stubFetch` carries `coverage`; 4 coverage render tests.
 
 ## Change Log
 
-- 2026-08-14 — Story created via bmad-create-story (Epic 11, story 1/4). Foundation coverage gate; informational/non-money-path; reuses `classify_holdings`; exposes `adequate` for 11.2's hard-gate. COVERAGE_MIN=0.80 (confirm at dev). ready-for-dev.
+- 2026-08-14 — Story created via bmad-create-story (Epic 11, story 1/4). Foundation coverage gate; informational/non-money-path; reuses `classify_holdings`; exposes `adequate` for 11.2's hard-gate. COVERAGE_MIN=0.80.
+- 2026-08-14 — Implemented via bmad-dev-story. Detector + review-layer + additive wire + UI + tests. Backend 899 green, frontend 205 green (ballast_test DB). Status → review.
+- 2026-08-14 — Independent adversarial review (fresh context): **APPROVE WITH NITS**. All non-negotiable contracts verified (no money-path leak, reuse-not-reinvent, parked-not-counted, never-invent/no-forecast, additive wire, per-user scope, boundary-inclusive, clean import — no circular dep). One **Medium** fixed: a non-finite (NaN) `market_value` on an unclassified holding made the coarse guard zero the WHOLE unclassified sleeve → coverage over-reported as 100%/adequate (least-honest direction). Fix: drop only the unpriced row before `classify_holdings` (matches `_total_portfolio_value`'s non-finite skip), so an unpriced holding is excluded from BOTH sides; added `test_coverage_non_finite_market_value_does_not_over_report`. Nits deferred (dead `Coverage.total` field; minor quantize duplication) — non-blocking. Root cause (`classify_holdings` lacks a per-holding `is_finite` guard, engine.py:189) noted for a later shared hardening; NOT changed here to avoid touching the deploy money-path engine from an informational story.

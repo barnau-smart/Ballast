@@ -269,6 +269,10 @@ export function CoachConsult() {
   const [review, setReview] = useState('idle')
   const [reviewMessage, setReviewMessage] = useState('')
   const [reviewFindings, setReviewFindings] = useState([])
+  // Story 11.1 — the classifiable-coverage meta-check (`{coverage}` on the review
+  // payload). Carries a calm `message` ONLY when coverage is inadequate; null/absent
+  // (good coverage or empty portfolio) → nothing rendered.
+  const [reviewCoverage, setReviewCoverage] = useState(null)
   const reviewingRef = useRef(false) // synchronous double-click guard
 
   // Story 10.5 — the cheaper canonical fund a cost-switch SELL switches INTO. When
@@ -829,6 +833,7 @@ export function CoachConsult() {
     setReview('loading')
     setReviewMessage('')
     setReviewFindings([])
+    setReviewCoverage(null)
     try {
       const res = await apiFetch('/api/allocation/review')
       if (!mounted.current) return
@@ -863,6 +868,9 @@ export function CoachConsult() {
       setSuggestFillNote('')
       setSuggestStaleNote('')
       setPendingSuggestion(null)
+      // Coverage rides alongside findings (Story 11.1); shown in both the ready and
+      // empty states when it carries a message (i.e. coverage is inadequate).
+      setReviewCoverage(data?.coverage ?? null)
       const findings = Array.isArray(data?.findings) ? data.findings : []
       if (findings.length === 0) {
         setReviewFindings([])
@@ -1130,6 +1138,16 @@ export function CoachConsult() {
           role="status"
         >
           Nothing to fix right now — your portfolio looks diversified and low-cost.
+        </p>
+      ) : null}
+
+      {(review === 'ready' || review === 'empty') && reviewCoverage?.message ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-coverage"
+          role="status"
+        >
+          {reviewCoverage.message}
         </p>
       ) : null}
 

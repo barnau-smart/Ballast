@@ -29,14 +29,14 @@ function expectCalm(text) {
 // `{findings: [...]}`. Any other URL is unexpected in these tests (so a stray
 // /approve or /recommend would blow up loudly — proving nothing was submitted).
 
-function stubFetch({ findings, ok = true, status = 200 } = {}) {
+function stubFetch({ findings, coverage = null, ok = true, status = 200 } = {}) {
   const fn = vi.fn((url) => {
     const u = String(url)
     if (u.includes('/api/allocation/review')) {
       return Promise.resolve({
         ok,
         status,
-        json: () => Promise.resolve({ findings: findings ?? [] }),
+        json: () => Promise.resolve({ findings: findings ?? [], coverage }),
       })
     }
     return Promise.reject(new Error(`unexpected url: ${u}`))
@@ -635,5 +635,66 @@ describe('CoachConsult — linked cost-switch SELL + BUY (Story 10.5)', () => {
     const urls = fn.mock.calls.map(([u]) => String(u))
     expect(urls.some((u) => u.includes('/api/coach/recommend'))).toBe(false)
     expect(urls.some((u) => u.includes('/api/coach/approve'))).toBe(false)
+  })
+})
+
+// --- Story 11.1: coverage meta-check line ------------------------------------
+
+const LOW_COVERAGE = {
+  coverage: '60.00',
+  adequate: false,
+  unclassified_value: '7500.00',
+  unclassified_symbols: ['TSLA', 'AGTHX'],
+  message:
+    'I can categorize about 60.00% of your portfolio into stocks and bonds. The rest — ' +
+    '$7,500.00 in TSLA, AGTHX — is in individual stocks and specialty funds I don’t ' +
+    'classify, so when I describe your mix, keep in mind I’m only describing the part I can see.',
+}
+
+describe('Review — coverage meta-check (Story 11.1)', () => {
+  it('shows the coverage line alongside findings when coverage is inadequate', async () => {
+    stubFetch({ findings: [CONCENTRATION_FINDING], coverage: LOW_COVERAGE })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+
+    const line = await screen.findByTestId('coach-review-coverage')
+    expect(line.textContent).toMatch(/60\.00%/)
+    expect(line.textContent).toMatch(/TSLA/)
+    expectCalm(line.textContent)
+  })
+
+  it('shows the coverage line even when there is nothing to fix (empty findings)', async () => {
+    // MasterB's real case: no SELL findings, but most of the account is unclassified.
+    stubFetch({ findings: [], coverage: LOW_COVERAGE })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+
+    const line = await screen.findByTestId('coach-review-coverage')
+    expect(line.textContent).toMatch(/only describing the part I can see/)
+  })
+
+  it('renders NO coverage line when coverage is adequate (message null)', async () => {
+    stubFetch({
+      findings: [],
+      coverage: { coverage: '100.00', adequate: true, unclassified_value: '0.00', unclassified_symbols: [], message: null },
+    })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+    expect(screen.queryByTestId('coach-review-coverage')).toBeNull()
+  })
+
+  it('degrades safely when coverage is absent (null)', async () => {
+    stubFetch({ findings: [], coverage: null })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+    expect(screen.queryByTestId('coach-review-coverage')).toBeNull()
   })
 })

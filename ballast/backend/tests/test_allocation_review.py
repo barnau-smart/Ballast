@@ -29,19 +29,24 @@ from allocation.narrate import NarrationValidationError
 from allocation.narrate import UNIT_BARE, UNIT_MONEY, UNIT_PERCENT
 from allocation.review import (
     CONCENTRATION_CEILING,
+    COVERAGE_MIN,
     KIND_CONCENTRATION,
     KIND_COST,
+    Coverage,
     ReviewFinding,
     _fallback_review_narration,
     allowed_review_facts,
     build_review_facts,
     check_no_forecast,
     check_no_invented_numbers,
+    compute_coverage,
+    coverage_message,
     find_concentration_findings,
     find_cost_findings,
     find_review,
     narrate_finding,
 )
+from api.allocation import _coverage_out
 from api.app import create_app
 from brokers.portfolio import PortfolioView
 from coach.recommendation import OrderSide, OrderType
@@ -705,7 +710,11 @@ def test_review_shape_ranking_and_no_writes(client):
         r = client.get("/api/allocation/review", headers=headers)
         assert r.status_code == 200, r.text
         body = r.json()
-        assert set(body.keys()) == {"findings"}
+        assert set(body.keys()) == {"findings", "coverage"}
+        # TSLA 5500 + AGTHX 2000 unclassified of 10000 total → 25% coverage → inadequate.
+        assert body["coverage"]["adequate"] is False
+        assert body["coverage"]["coverage"] == "25.00"
+        assert body["coverage"]["message"]  # calm informational line present when low
         findings = body["findings"]
         assert len(findings) == 2
         # Ranked by SELL amount desc: AGTHX ($2000) before TSLA ($1500).
@@ -770,7 +779,13 @@ def test_review_empty_findings_nothing_to_fix(client):
 
         r = client.get("/api/allocation/review", headers=headers)
         assert r.status_code == 200, r.text
-        assert r.json() == {"findings": []}
+        body = r.json()
+        assert body["findings"] == []
+        # All index-core → fully classified → adequate, no informational message.
+        assert body["coverage"]["adequate"] is True
+        assert body["coverage"]["coverage"] == "100.00"
+        assert body["coverage"]["unclassified_value"] == "0.00"
+        assert body["coverage"]["message"] is None
     finally:
         _delete_user(email)
 
@@ -793,9 +808,174 @@ def test_review_per_user_isolation(client):
         a_body = client.get("/api/allocation/review", headers=headers_a).json()
         assert any(f["symbol"] == "TSLA" for f in a_body["findings"])
 
-        # B sees ONLY its own (empty) state — never A's holdings.
+        # B sees ONLY its own (empty) state — never A's holdings. Empty portfolio →
+        # coverage is null (nothing to measure), not a fabricated 0%/100%.
         b_body = client.get("/api/allocation/review", headers=headers_b).json()
-        assert b_body == {"findings": []}
+        assert b_body == {"findings": [], "coverage": None}
     finally:
         _delete_user(email_a)
         _delete_user(email_b)
+
+
+# --- Coverage meta-check (Story 11.1) ----------------------------------------
+
+
+@dataclass
+class _Cfg:
+    parked_symbols: list
+
+
+def test_coverage_mixed_below_threshold():
+    """A big unclassified single-stock sleeve drops coverage below the floor."""
+    view = _view(
+        [
+            _Holding("TSLA", Decimal("5500"), Decimal("20")),  # unclassified
+            _Holding("VTI", Decimal("4500"), Decimal("10")),   # index-core
+        ]
+    )
+    cov = compute_coverage(view, None)
+    assert cov is not None
+    assert cov.coverage == Decimal("0.45")
+    assert cov.adequate is False
+    assert cov.unclassified_value == Decimal("5500")
+    assert cov.unclassified_symbols == ["TSLA"]
+
+
+def test_coverage_all_classified_is_adequate():
+    """All index-core → fully classified → coverage 1.0, adequate, nothing unclassified."""
+    view = _view(
+        [
+            _Holding("VTI", Decimal("6000"), Decimal("30")),
+            _Holding("VXUS", Decimal("3000"), Decimal("50")),
+            _Holding("BND", Decimal("1000"), Decimal("14")),
+        ]
+    )
+    cov = compute_coverage(view, None)
+    assert cov is not None
+    assert cov.coverage == Decimal("1")
+    assert cov.adequate is True
+    assert cov.unclassified_value == Decimal("0")
+    assert cov.unclassified_symbols == []
+
+
+def test_coverage_parked_money_market_counts_as_known():
+    """A declared parked money-market holding (SWVXX) is KNOWN cash, never unclassified —
+    so it must NOT drag coverage down."""
+    view = _view(
+        [
+            _Holding("SWVXX", Decimal("6000"), Decimal("6000")),  # parked → known
+            _Holding("VTI", Decimal("4000"), Decimal("20")),
+        ]
+    )
+    cov = compute_coverage(view, _Cfg(parked_symbols=["SWVXX"]))
+    assert cov is not None
+    assert cov.unclassified_value == Decimal("0")
+    assert cov.coverage == Decimal("1")
+    assert cov.adequate is True
+
+
+def test_coverage_cash_counts_toward_the_known_side():
+    """Cash is part of total AND the classified/known side — it raises coverage."""
+    # VTI 2000 classified + TSLA 2000 unclassified + 6000 cash = 10000 total; 20% unclassified.
+    view = _view(
+        [
+            _Holding("VTI", Decimal("2000"), Decimal("10")),
+            _Holding("TSLA", Decimal("2000"), Decimal("8")),
+        ],
+        cash="6000",
+    )
+    cov = compute_coverage(view, None)
+    assert cov is not None
+    assert cov.coverage == Decimal("0.80")
+    assert cov.adequate is True  # exactly at the floor → adequate (>=)
+
+
+def test_coverage_boundary_is_inclusive():
+    """coverage == COVERAGE_MIN is adequate (the floor is inclusive)."""
+    # unclassified 2000 of 10000 → coverage exactly 0.80 == COVERAGE_MIN.
+    view = _view(
+        [
+            _Holding("TSLA", Decimal("2000"), Decimal("8")),
+            _Holding("VTI", Decimal("8000"), Decimal("40")),
+        ]
+    )
+    cov = compute_coverage(view, None)
+    assert cov is not None
+    assert cov.coverage == COVERAGE_MIN
+    assert cov.adequate is True
+
+
+def test_coverage_empty_portfolio_returns_none():
+    """No holdings and no cash → nothing to measure → None (never a fabricated 0%/100%)."""
+    assert compute_coverage(_view([], cash="0"), None) is None
+
+
+def test_coverage_non_finite_market_value_does_not_over_report():
+    """An unpriced (NaN) unclassified holding must NOT zero the whole sleeve / report 100%
+    coverage. It is dropped from BOTH sides (like ``_total_portfolio_value``), so coverage
+    honestly reflects the finite split — the remaining unclassified AAPL still counts."""
+    view = _view(
+        [
+            _Holding("TSLA", Decimal("NaN"), Decimal("5")),   # unpriced → excluded both sides
+            _Holding("VTI", Decimal("4000"), Decimal("20")),  # index-core
+            _Holding("AAPL", Decimal("3000"), Decimal("12")),  # unclassified, finite
+        ]
+    )
+    cov = compute_coverage(view, None)
+    assert cov is not None
+    # total = 7000 (NaN skipped); unclassified = 3000 (AAPL); coverage = 1 - 3000/7000.
+    assert cov.unclassified_value == Decimal("3000")
+    assert cov.coverage == (Decimal("1") - Decimal("3000") / Decimal("7000"))
+    assert cov.adequate is False  # ~0.571 < 0.80 → the message would show, honestly
+    assert "AAPL" in cov.unclassified_symbols
+    assert "TSLA" not in cov.unclassified_symbols
+
+
+def test_coverage_message_is_calm_and_cites_only_real_numbers():
+    """The low-coverage message states the computed percent + value + symbols, stays calm,
+    and never forecasts."""
+    cov = compute_coverage(
+        _view([_Holding("TSLA", Decimal("6000"), Decimal("20")),
+               _Holding("VTI", Decimal("4000"), Decimal("20"))]),
+        None,
+    )
+    assert cov is not None and cov.adequate is False
+    msg = coverage_message(cov)
+    assert "40.00%" in msg  # 1 - 6000/10000 = 40%
+    assert "6,000.00" in msg or "6000.00" in msg
+    assert "TSLA" in msg
+    _assert_calm(msg)
+    check_no_forecast(msg)  # must not raise — no prediction language
+
+
+def test_coverage_out_serializes_and_gates_message():
+    """_coverage_out: percent+money as fixed-point strings; message ONLY when inadequate."""
+    low = _coverage_out(
+        Coverage(
+            coverage=Decimal("0.25"),
+            adequate=False,
+            unclassified_value=Decimal("7500"),
+            unclassified_symbols=["TSLA", "AGTHX"],
+            total=Decimal("10000"),
+        )
+    )
+    assert low is not None
+    assert low.coverage == "25.00"
+    assert low.unclassified_value == "7500.00"
+    assert low.unclassified_symbols == ["TSLA", "AGTHX"]
+    assert low.message  # present when inadequate
+
+    high = _coverage_out(
+        Coverage(
+            coverage=Decimal("1"),
+            adequate=True,
+            unclassified_value=Decimal("0"),
+            unclassified_symbols=[],
+            total=Decimal("10000"),
+        )
+    )
+    assert high is not None
+    assert high.coverage == "100.00"
+    assert high.message is None  # adequate → no informational line
+
+    assert _coverage_out(None) is None

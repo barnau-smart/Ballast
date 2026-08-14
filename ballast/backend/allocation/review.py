@@ -58,6 +58,7 @@ from allocation.narrate import (
     check_no_forecast,
     check_no_invented_numbers,
 )
+from allocation.engine import classify_holdings
 from brokers.portfolio import PortfolioView, get_portfolio
 from cash.config import get_config as get_cash_config, normalize_symbols
 from coach.execution import whole_share_quantity
@@ -82,6 +83,7 @@ from strategy.target_allocation import (
 )
 
 _ZERO = Decimal("0")
+_ONE = Decimal("1")
 _CENT = Decimal("0.01")
 _HUNDRED = Decimal("100")
 
@@ -94,6 +96,15 @@ _HUNDRED = Decimal("100")
 #: the heavy coach-pipeline / precedent-engine import graph; keep the two in sync as
 #: a deliberate strategy decision.
 CONCENTRATION_CEILING: Decimal = Decimal("0.40")
+
+#: The coverage floor (Story 11.1, Epic 11): the classifiable share of the portfolio
+#: (holdings mapped to an asset class + cash + parked money-market, ÷ total value) at/above
+#: which the review's class-level reasoning is considered adequate. Below it, the review
+#: surfaces a calm informational "I can only see part of your portfolio" note and 11.2 /
+#: any target-drift check gate on it (never imply completeness over an unclassified sleeve).
+#: A locked, auditable strategy constant like :data:`CONCENTRATION_CEILING` — never
+#: LLM-touched; ~0.80 means "at least 80% classified".
+COVERAGE_MIN: Decimal = Decimal("0.80")
 
 #: Finding kinds (the two analysis buckets). Stable string keys — wire-friendly.
 KIND_CONCENTRATION = "concentration"
@@ -412,6 +423,88 @@ def find_review(
     findings = [f for f in concentration if f.symbol not in cost_symbols] + cost
     findings.sort(key=lambda f: (-f.amount, f.symbol))
     return findings
+
+
+# --- Coverage meta-check (Story 11.1, Epic 11) -------------------------------
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """How much of the portfolio the review can actually classify (pure).
+
+    ``coverage`` is the classifiable fraction (0..1): ``1 − unclassified_value / total``,
+    where ``total`` is Σ holding market value + cash and ``unclassified_value`` is the
+    non-index, NON-parked sleeve (single stocks / niche ETFs). Parked money-market
+    (declared cash-equivalents, e.g. SWVXX) is KNOWN, not unclassified — it never inflates
+    ``unclassified_value`` (:func:`~allocation.engine.classify_holdings` excludes it).
+    ``adequate`` is ``coverage >= COVERAGE_MIN``. Informational only — carries NO order."""
+
+    coverage: Decimal
+    adequate: bool
+    unclassified_value: Decimal
+    unclassified_symbols: list[str]
+    total: Decimal
+
+
+def compute_coverage(
+    view: PortfolioView, cash_config: CashConfig | None
+) -> Coverage | None:
+    """Compute the classifiable-coverage meta-check (pure, Story 11.1).
+
+    Reuses :func:`~allocation.engine.classify_holdings` (the SAME split the deploy engine
+    uses) so "unclassified" never disagrees between the two, and a declared parked
+    money-market holding counts as known cash — never as an unseen holding. Returns
+    ``None`` when there's nothing to measure (``total <= 0`` — never imported / empty), so
+    the caller emits no coverage note and never divides by zero. ``coverage`` is clamped to
+    ``[0, 1]`` defensively. Pure arithmetic — never invents a fact, never forecasts."""
+    total = _total_portfolio_value(view)
+    if total <= _ZERO:
+        return None
+    parked_set: frozenset[str] = frozenset()
+    if cash_config is not None:
+        parked_set = frozenset(normalize_symbols(cash_config.parked_symbols))
+    # Guard per-holding non-finite market_value the SAME way the denominator does
+    # (`_total_portfolio_value` skips non-finite): drop ONLY the unpriced row(s) before
+    # classifying, so an unpriced holding is excluded from BOTH sides and can never zero
+    # the whole unclassified sleeve and over-report coverage as 100% (Story 11.1 review —
+    # Medium). ``None`` stays (``classify_holdings`` treats it as 0, matching the total).
+    finite_holdings = [
+        h
+        for h in (view.holdings or [])
+        if h.market_value is None or h.market_value.is_finite()
+    ]
+    classification = classify_holdings(finite_holdings, parked_set)
+    unclassified = classification.unclassified_value
+    if unclassified < _ZERO:
+        unclassified = _ZERO
+    coverage = _ONE - (unclassified / total)
+    if coverage < _ZERO:
+        coverage = _ZERO
+    elif coverage > _ONE:
+        coverage = _ONE
+    return Coverage(
+        coverage=coverage,
+        adequate=coverage >= COVERAGE_MIN,
+        unclassified_value=unclassified,
+        unclassified_symbols=list(classification.unclassified_symbols),
+        total=total,
+    )
+
+
+def coverage_message(cov: Coverage) -> str:
+    """The deterministic, calm informational line for a LOW-coverage portfolio (pure).
+
+    Authored to be honest + calm (no forecast, no FOMO, no nudge) and to state ONLY numbers
+    the detector computed (never-invent): the classifiable percent and the unclassified
+    dollar amount + symbols. NO LLM call — this is templated by construction."""
+    pct = format_money((cov.coverage * _HUNDRED).quantize(_CENT))
+    syms = ", ".join(cov.unclassified_symbols) if cov.unclassified_symbols else "some holdings"
+    return (
+        f"I can categorize about {pct}% of your portfolio into stocks and bonds. The rest — "
+        f"${format_money(cov.unclassified_value.quantize(_CENT))} in {syms} — is in individual stocks and "
+        "specialty funds I don't classify, so when I describe your mix, keep in mind I'm only "
+        "describing the part I can see."
+    )
 
 
 # --- Evidence + allow-set (pure, built from a finding) -----------------------
@@ -757,3 +850,16 @@ async def build_review(
         NarratedFinding(finding=f, narration=narrate_finding(gateway, f))
         for f in findings
     ]
+
+
+async def build_coverage(scope: Scope, session: AsyncSession) -> Coverage | None:
+    """Resolve the caller's cached portfolio + cash config and compute coverage (Story 11.1).
+
+    READ-ONLY and fail-closed per-user (AD-10): reads only THIS user's cached holdings +
+    scoped cash config — no live broker session, no writes, no LLM. Returns ``None`` when
+    nothing is imported (``total <= 0``). The ``adequate`` flag on the result is the signal
+    Story 11.2 (bond-floor) / any target-drift check hard-gate on before trusting the
+    class-level mix."""
+    view = await get_portfolio(scope, session)
+    cash_config = await get_cash_config(scope, session)
+    return compute_coverage(view, cash_config)
