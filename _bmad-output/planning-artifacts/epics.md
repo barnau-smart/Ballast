@@ -703,3 +703,68 @@ So that the analysis is a real portfolio review, not just cash deployment.
 - **Concentration / single-stock:** flag a position over a threshold or a non-index single stock → action item to trim/de-speculate into the index core (reuse the 9-3 liquidation machinery), populate-don't-submit.
 - **Cost / fees:** flag a holding whose expense ratio materially exceeds a near-identical cheaper index fund → action item to switch. (Requires a small expense-ratio reference table for the known funds; the tax consequence of switching is noted honestly but NOT computed — tax is deferred.)
 - Each item is narrated by the advisor and passes the 10.3 safeguards. Suite green.
+
+## Epic 11: Fiduciary-Grade Portfolio Review — See the Whole Picture Honestly
+
+**Value:** Epic 10.4 gave the review two checks (single-name >40% concentration; high-fee-fund switch). A real fiduciary catches more — and the checks below target the harms that actually hurt beginners: **hidden aggregate single-stock risk** (many names, none over 40%), being **under-protected for your own chosen risk level** (too few bonds for a Conservative pick), **silent fee drag** across the whole account, and **idle cash**. Every check uses ONLY data Ballast already has and stays inside the locked guardrails. Source of truth: in-chat fee-only-fiduciary consultation 2026-08-14 (catalog + explicit "cannot honestly do" list).
+
+**Reuses existing work:** Epic 10 review buckets + the 10.3 narration safeguards (never-invent / no-forecast / deterministic fallback); Epic 9 cash states + reserve; the 3-class index-core map, the expense-ratio reference table, and 20y `market_daily`; the 10.1 target model; the propose→approve→co-sign spine (populate, human submits); the fail-closed `ScopedRepository` (AD-10).
+
+**Load-bearing guardrails (inherited from Epic 10, locked):**
+- Opinion on the user's situation + settled principles, **NEVER a market forecast**; **never invent a fact** (deterministic detectors compute every number, the AI only narrates, a validator rejects any unhanded figure); **"nothing to fix" is a valid, honest output**; **rebalance toward the user's plan, never chase**; **populate-don't-submit** (human co-signs every order); per-user scoping; whole-share sizing; dust dropped.
+- **NEW — honest coverage:** the review must state how much of the portfolio it can actually classify, and every class-level finding is **gated on adequate coverage** — it must never imply completeness over an unclassified sleeve.
+- **Out of scope — cannot honestly do (missing data; never fake these):** tax-loss harvesting, asset-location, after-tax return, factor/style tilts, true volatility/beta/Sharpe, income/yield analysis, sector/geographic breakdown, fund overlap/look-through, per-lot optimal sale. Blocked by absent tax-lot detail, account-type/tax-wrapper, purchase dates, dividend/income data, individual-stock price history — or by the no-forecast rule. A check needing any of these is DECLINED, not approximated.
+
+**Build order:** 11.1 → 11.2 → 11.3 → 11.4. Ship **11.1 + 11.2 as a pair** (11.2's class-level math is unsafe without 11.1's coverage gate). 11.2, 11.3 are **money-path** (propose orders) → each needs an approved `bmad-spec` + independent review before merge (docs/dev-loop-policy.md).
+
+**Relationship to the drafted Story 10.14 (target-drift rebalance SELL):** 11.2 (bond-floor / risk-capacity) is the honest **downside-only** slice of that idea — under-bonded for your chosen model is the asymmetric beginner harm. Decide at spec time whether 10.14's general both-directions drift folds into 11.2 or ships separately; do not build both unreconciled.
+
+### Story 11.1: Unclassified-holdings coverage gate (foundation)
+
+As a beginner,
+I want the review to tell me how much of my portfolio it can actually categorize,
+So that I know when its allocation findings cover my whole account versus just part of it — and it never pretends to see money it can't.
+
+**Acceptance Criteria:**
+- A deterministic detector computes **coverage** = classified market value ÷ total (holdings + cash); the unclassified sleeve is the holdings not in the index-core class map (individual stocks / niche ETFs), surfaced honestly by value + symbols.
+- When coverage < a locked threshold (`COVERAGE_MIN`, tune in spec, ~0.80), emit a calm **informational** finding AND set a flag that **gates/down-confidences** the class-level checks (11.2 and any drift). No order. Never framed as a problem to "fix."
+- Pure arithmetic (never-invent trivially satisfied); per-user scoped; "everything classified" → no finding. Suite green.
+
+### Story 11.2: Bond-floor / risk-capacity check (money-path)
+
+As a beginner who chose a risk level,
+I want the review to warn me when I hold far fewer bonds than my chosen plan calls for, and offer the fix,
+So that I'm not carrying more risk than I signed up for right when a downturn would hurt.
+
+**Acceptance Criteria:**
+- Directional detector: fires only when **bond allocation is materially BELOW** the chosen model's bond target (`target_bond − current_bond > BOND_SHORTFALL`, locked pp band in spec); over-bonded never fires (that's merely conservative). Measured on the classified sleeve; **hard-gated on 11.1 coverage**.
+- Proposes a **rebalance move toward the user's own target** — BUY a bond index fund with investable cash, or SELL an overweight equity class into bonds (reuse the 10.4 SELL sizing / whole-share / dust rules). Populate-don't-submit; never sells past target; no forecast.
+- Narrated by the 10.3 advisor (frames it as meeting the user's chosen risk level, not a market call); passes never-invent + no-forecast; no-target or low-coverage → no finding. Suite green.
+
+### Story 11.3: Single-stock aggregate concentration (money-path)
+
+As a beginner,
+I want the review to flag when a lot of my money is spread across many individual stocks — even if no single one is huge — and offer to diversify,
+So that I don't carry big undiversified single-company risk that the "one position over 40%" rule misses entirely.
+
+**Acceptance Criteria:**
+- Detector sums **individual-stock / unclassified market value** and fires when it exceeds a locked band (`SINGLE_NAME_AGG_MAX`, ~20–25% in spec) even when no single name trips the 10.4 40% ceiling. Labeled honestly ("individual stocks and specialty funds") given the fund-vs-stock ambiguity.
+- Primary output **informational**; optional **propose-SELL** of a slice into a diversified index-core fund in an underweight class (reuse 10.4 machinery), populate-don't-submit. Must not double-count with the 10.4 single-name trim (dedup precedence defined in spec).
+- Narrated by 10.3 (structural diversification, never "these will fall"); never-invent/no-forecast clean; per-user scoped. Suite green.
+
+### Story 11.4: Whole-portfolio blended expense summary
+
+As a beginner,
+I want one plain dollar figure for what I pay in fund fees across my whole account each year,
+So that abstract percentages become a real recurring cost I can act on.
+
+**Acceptance Criteria:**
+- Detector computes the **dollar-weighted blended expense ratio** over holdings with a known ER (from the reference table) and the implied **annual $ cost**, plus the **fee coverage %** (share of portfolio priced) — stated honestly (unknown-ER holdings are not implied to be free).
+- **Informational** (the 10.4 per-fund switch already owns the propose-SELL/BUY action); fires above a locked nudge threshold (`BLENDED_ER_INFO`, ~0.30%). Every number from the ER table + market values; no forecast.
+- Narrated calmly by 10.3; "no priced funds" / below threshold → no finding. Suite green.
+
+### Parked for later (runners-up — lower priority, not this epic's core)
+
+- **Cash-drag / over-reserve nudge:** flag idle non-reserve cash beyond a band (routes to the existing deploy feature, don't duplicate) and, separately, a reserve so large it dominates the account (informational question, never an order).
+- **Redundant same-class funds:** flag ≥2 index-core funds in one class (with a dust floor) → optional consolidation via the 10.5 linked SELL+BUY; language "similar job," never "identical."
+- **Cost-basis SELL co-sign rider:** attach the raw pre-tax gain/loss to any SELL the app proposes, as an **informational disclaimer only** — NO tax math (aggregate basis + unknown account type); ship as a generic "check tax before you approve" note if a clean figure can't be worded honestly.
