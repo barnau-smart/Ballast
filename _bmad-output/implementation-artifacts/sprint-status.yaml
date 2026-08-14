@@ -193,13 +193,31 @@ development_status:
   # 10.4's two checks. 11-1 coverage gate (informational, foundation) → 11-2 bond-floor
   # + 11-3 aggregate single-stock (MONEY-PATH: need bmad-spec + independent review) →
   # 11-4 blended expense (informational). Opened 2026-08-14 from a fiduciary consult.
-  epic-11: in-progress
+  epic-11: done
   11-1-unclassified-coverage-gate: done  # independent review APPROVE WITH NITS; 1 Medium (non-finite over-report) fixed; backend 900 + frontend 205 green (3e43884)
-  11-2-bond-floor-risk-capacity: done  # spec-11-2 approved; built + independent money-path review APPROVE WITH NITS (1 Medium non-finite + 1 Low fixed); backend 912 + frontend 206 green. NOT merged — Epic 11 merge is MasterB's call
-  11-3-single-stock-aggregate-concentration: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order); 1 Low fixed; backend 917 + frontend 208 green
-  11-4-blended-expense-summary: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order; math verified); backend 924 + frontend 210 green
+  11-2-bond-floor-risk-capacity: done  # spec-11-2 approved; built + independent money-path review APPROVE WITH NITS (1 Medium non-finite + 1 Low fixed); backend 912 + frontend 206 green (308c16a)
+  11-3-single-stock-aggregate-concentration: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order); 1 Low fixed; backend 917 + frontend 208 green (8eadb2e)
+  11-4-blended-expense-summary: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order; math verified); backend 924 + frontend 210 green (51187eb)
+  epic-11-retrospective: done  # epic-11-retro-2026-08-14.md; 4 action items recorded
 
 action_items:
+  - epic: 11
+    action: "Hoist the non-finite market_value guard into classify_holdings (allocation/engine.py) so every consumer inherits it — the non-finite defect recurred (fixed in 11-1's compute_coverage, re-appeared in 11-2) because the guard lives at call sites, not the shared function. Money-path-adjacent (touches the deploy engine) -> own bmad-spec + independent review."
+    owner: "MasterB"
+    status: open
+  - epic: 11
+    action: "Mark Story 10.14 (target-drift) superseded: its bond-shortfall scope is subsumed by 11-2; its equity-overweight both-directions generalization is deferred. Prevents building it unreconciled."
+    owner: "MasterB"
+    status: open
+  - epic: 11
+    action: "Consolidate GET /api/allocation/review into ONE scoped portfolio read (build_review/build_coverage/build_fees/build_plan each fetch the cached portfolio -> up to 4x). Perf/cleanliness only; correctness is fine (read-only cache)."
+    owner: "MasterB"
+    status: open
+  - epic: 11
+    action: "Reaffirm: mandatory independent adversarial review before merging review-module work — it caught a real defect in 4/4 Epic 11 stories. Keep it standing for the fiduciary-review surface."
+    owner: "MasterB"
+    status: open
+
   - epic: 4
     action: "Epic 4 shipped 'done' without its UX centerpiece: the live Coach card (ask -> recommendation -> Approve & Co-sign / 'not now' decline) was never built in the SPA — only the backend propose/approve (4.6) and the Decisions replay UI (4.10). The planned surface exists in the UX (EXPERIENCE.md 'emotional centerpiece', DESIGN.md, mockups/coach-card.html) but has no frontend. Reopened Epic 4 + created Story 4.11 to complete it. Consider a brief course-correction/retro note on how a 'done' epic missed its centerpiece screen."
     owner: "MasterB"
