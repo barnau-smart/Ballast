@@ -1118,6 +1118,16 @@ export function CoachConsult() {
               data-testid={`coach-review-finding-${i}`}
             >
               <CoachCard recommendation={finding.narration} />
+              {finding.kind === 'bond_floor' &&
+              finding.current_weight != null &&
+              finding.target_weight != null ? (
+                <p
+                  className="ballast-consult__note"
+                  data-testid={`coach-review-bondmix-${i}`}
+                >
+                  Bonds: {finding.current_weight}% now · target {finding.target_weight}%
+                </p>
+              ) : null}
               <button
                 type="button"
                 className="ballast-consult__review-fill"

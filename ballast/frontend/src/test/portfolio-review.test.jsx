@@ -698,3 +698,47 @@ describe('Review — coverage meta-check (Story 11.1)', () => {
     expect(screen.queryByTestId('coach-review-coverage')).toBeNull()
   })
 })
+
+// --- Story 11.2: bond-floor finding ------------------------------------------
+
+const BOND_FLOOR_FINDING = {
+  kind: 'bond_floor',
+  symbol: 'VTI',
+  switch_to: 'BND',
+  order: { symbol: 'VTI', side: 'sell', amount: '4000.00', order_type: 'market' },
+  current_weight: '20.00',
+  target_weight: '60.00',
+  narration: {
+    action_label: 'Add to your bonds to match the risk level you chose',
+    reasoning:
+      'Your bonds are 20.00% of your invested mix, while the plan you chose aims for ' +
+      '60.00% — you are holding more in stocks than your risk level calls for. This is a ' +
+      'two-step move: sell 4000.00 of VTI now and buy the broad BND bond fund. It is a ' +
+      'rebalance toward your own plan, not a bet on where markets go next.',
+    uncertainties: [
+      'Markets move, so a fill isn’t guaranteed and this isn’t a prediction.',
+    ],
+    evidence: [
+      { id: 'strat-bond1', kind: 'strategy', statement: 'bonds vs target', stats: {}, source: 'allocation-review', as_of: '2026-08-14' },
+    ],
+  },
+}
+
+describe('Review — bond-floor finding (Story 11.2)', () => {
+  it('renders the bond-floor card + current-vs-target bond mix, and fills a SELL', async () => {
+    stubReviewFlow({ findings: [BOND_FLOOR_FINDING] })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-result')
+
+    const mix = screen.getByTestId('coach-review-bondmix-0')
+    expect(mix.textContent).toMatch(/Bonds: 20\.00% now · target 60\.00%/)
+    expectCalm(screen.getByTestId('coach-review-finding-0').textContent)
+
+    fireEvent.click(screen.getByTestId('coach-review-fill-0'))
+    await waitFor(() =>
+      expect(screen.getByTestId('coach-symbol-input').value).toBe('VTI'),
+    )
+  })
+})

@@ -1,6 +1,6 @@
 # Story 11.2: Bond-floor / risk-capacity check
 
-Status: ready-for-dev
+Status: done
 
 <!-- Epic 11 (Fiduciary-Grade Portfolio Review), story 2 of 4. MONEY-PATH — proposes a real
      BUY/SELL order the human co-signs. HARD GATE (docs/dev-loop-policy.md): NOT ready-for-dev.
@@ -71,12 +71,31 @@ Changing risk tolerance does nothing to the review today (confirmed: `allocation
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (bmad-dev-story, in-chat)
+
 ### Debug Log References
+
+- Backend `test_allocation_review.py`: 64 passed. Full backend suite: **912 passed** (ballast_test DB, `BALLAST_ALLOW_DIRTY_BROKERAGE_DB=1`, `LLM_ADAPTER=fake`). Frontend `npm test`: **206 passed**. No regressions.
 
 ### Completion Notes List
 
+- **Detector (`allocation/review.py`):** `find_bond_floor_finding` — D1 bond% on the classified sleeve (`classify_holdings`), D4 downside-only 15pp band (`BOND_SHORTFALL=0.15`), coverage-gated on 11.1 (`Coverage.adequate`), D2/D3 residual `max(0, bond_gap − deploy_bond_buy)` (SELLs overweight equity into bonds only for what the deploy card's cash BUY can't cover; defers when cash covers it). SELL sized `min(residual, class_overweight, holding_value)`, whole-share floored (`_sell_intent`), dust dropped; `switch_to=BND`. Non-finite market_value filtered before classify (11.2 review Medium fix).
+- **Narration:** bond_floor branches in `build_review_facts` / `allowed_review_facts` (admits current+target bond % and the shortfall) / `_fallback_review_narration` (risk-capacity principle, honest tax note, ≥1 uncertainty) / `compose_review_request` / `_REVIEW_SYSTEM`; reuses the 10-3 never-invent + no-forecast gates verbatim, degrade-safe.
+- **Orchestration:** `build_review` resolves target (same resolver as the deploy engine), computes coverage, and reads `build_plan`'s BND buy for `deploy_bond_buy` — ONLY when a finding is possible (target + adequate coverage). Read-only, AD-10 scoped, places nothing.
+- **Wire/UI:** additive `ReviewFindingOut.current_weight/target_weight` (percent strings) + `order.side` now reads the intent's side; `CoachConsult.jsx` shows "Bonds: X% now · target Y%" + the SELL populate. React-escaped.
+- **Money-safety:** independent review found NO oversell / double-spend / order-placement path; populate-don't-submit, per-user scoped, fixed-point money, whole-share sizing all verified.
+
 ### File List
+
+- `ballast/backend/allocation/review.py` — `KIND_BOND_FLOOR`, `BOND_SHORTFALL`, `ReviewFinding.target_weight`, `find_bond_floor_finding`, bond_floor narration branches, `find_review`/`build_review` threading (target + coverage + deploy_bond_buy); imports (`build_plan`, target resolver, `BONDS`/`ASSET_CLASSES`).
+- `ballast/backend/api/allocation.py` — `ReviewFindingOut.current_weight/target_weight`, `_review_finding_out` bond_floor mapping + intent-driven `order.side`.
+- `ballast/backend/tests/test_allocation_review.py` — 12 bond_floor tests (fires/within-band/over-bonded/no-target/coverage-gated/defers-on-cash/residual-on-partial-cash/dust/non-finite/oversell-guard/fallback-calm/endpoint).
+- `ballast/frontend/src/components/CoachConsult.jsx` — bond-mix x-ray line.
+- `ballast/frontend/src/test/portfolio-review.test.jsx` — bond_floor render + SELL-fill test.
 
 ## Change Log
 
-- 2026-08-14 — Story created via bmad-create-story (Epic 11, story 2/4). MONEY-PATH → status ready-for-spec (NOT ready-for-dev); needs approved bmad-spec + MasterB sign-off before dev. Downside-only bond-floor slice; supersedes 10.14's bond-shortfall scope. 4 open decisions flagged for the spec (denominator, BUY-vs-SELL, deploy non-contradiction, BOND_SHORTFALL band).
+- 2026-08-14 — Story created via bmad-create-story (Epic 11, story 2/4). MONEY-PATH → ready-for-spec; needs approved spec + MasterB sign-off before dev. Downside-only bond-floor slice; supersedes 10.14's bond-shortfall scope.
+- 2026-08-14 — Spec `spec-11-2` APPROVED by MasterB (4 decisions locked + partial-cash residual rule) → ready-for-dev.
+- 2026-08-14 — Implemented via bmad-dev-story. Detector + narration + additive wire + UI + 12 tests. Backend 912 + frontend 206 green (ballast_test).
+- 2026-08-14 — Independent adversarial review (money-path, fresh context): **APPROVE WITH NITS** — NO oversell / double-spend / order-placement path; D1–D4 math verified sound. Fixed 1 Medium (non-finite market_value not filtered before classify — the 11.1 gap not inherited; now filtered + NaN test) and 1 Low (API read the intent's `side` instead of hardcoding "sell"); added an explicit oversell-guard test. Nits (redundant reads) deferred. Status → done. **NOT merged — Epic 11 merge to main is MasterB's call.**

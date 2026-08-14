@@ -58,7 +58,9 @@ from allocation.narrate import (
     check_no_forecast,
     check_no_invented_numbers,
 )
-from allocation.engine import classify_holdings
+from allocation.config import get_config as get_target_config
+from allocation.config import resolve as resolve_target_config
+from allocation.engine import build_plan, classify_holdings
 from brokers.portfolio import PortfolioView, get_portfolio
 from cash.config import get_config as get_cash_config, normalize_symbols
 from coach.execution import whole_share_quantity
@@ -77,7 +79,9 @@ from precedent.evidence import EvidenceKind, EvidenceRecord, make_id
 from strategy.expense_ratio import EXPENSE_RATIO_MATERIAL_DELTA, fund_cost
 from strategy.index_core import is_index_core
 from strategy.target_allocation import (
+    ASSET_CLASSES,
     ASSET_CLASS_LABEL,
+    BONDS,
     CANONICAL_FUND,
     asset_class_for,
 )
@@ -106,9 +110,17 @@ CONCENTRATION_CEILING: Decimal = Decimal("0.40")
 #: LLM-touched; ~0.80 means "at least 80% classified".
 COVERAGE_MIN: Decimal = Decimal("0.80")
 
-#: Finding kinds (the two analysis buckets). Stable string keys — wire-friendly.
+#: The bond-shortfall band (Story 11.2, Epic 11): the classified-sleeve bond weight must
+#: fall MORE than this many percentage points (as a fraction) below the chosen model's bond
+#: target before the risk-capacity check fires. Locked strategy constant like
+#: :data:`CONCENTRATION_CEILING`; 0.15 = 15pp — catches "Conservative 60% bonds held at 25%"
+#: while ignoring normal drift. Downside-only: over-bonded / within-band never fires.
+BOND_SHORTFALL: Decimal = Decimal("0.15")
+
+#: Finding kinds (the analysis buckets). Stable string keys — wire-friendly.
 KIND_CONCENTRATION = "concentration"
 KIND_COST = "cost"
+KIND_BOND_FLOOR = "bond_floor"
 
 #: The provenance string on every review evidence record — the deterministic
 #: review detectors, never a market feed (these are the user's own facts).
@@ -149,6 +161,11 @@ class ReviewFinding:
     expense_ratio: Decimal | None
     cheaper_expense_ratio: Decimal | None
     as_of: date | None
+    #: BOND_FLOOR only (Story 11.2): the chosen model's bond target as a fraction. For a
+    #: bond-floor finding ``weight`` carries the CURRENT classified-sleeve bond fraction and
+    #: ``target_weight`` the target — so the narration can honestly state "bonds are X% vs a
+    #: Y% target". ``None`` for concentration/cost.
+    target_weight: Decimal | None = None
 
 
 # --- Small pure helpers ------------------------------------------------------
@@ -397,10 +414,126 @@ def _aggregate_by_symbol(view: PortfolioView) -> PortfolioView:
     return PortfolioView(holdings=holdings, cash=view.cash, as_of=view.as_of)
 
 
+def find_bond_floor_finding(
+    view: PortfolioView,
+    target_weights: dict[str, Decimal] | None,
+    coverage: Coverage | None,
+    cash_config: CashConfig | None,
+    deploy_bond_buy: Decimal,
+) -> ReviewFinding | None:
+    """Detect a material bond shortfall vs the chosen target and size a SELL of overweight
+    equity into bonds for the residual cash can't cover (pure, Story 11.2).
+
+    Downside-only + coverage-gated + defer-to-deploy (spec-11-2 D1–D4). Returns ``None``
+    when: no target (``target_weights`` None); coverage absent/inadequate (11.1 gate); the
+    classified sleeve is empty; the bond weight is within ``BOND_SHORTFALL`` of target or
+    over it; the residual after the deploy plan's cash-funded bond buy is dust; or nothing is
+    overweight to sell. Weights are measured on the CLASSIFIED sleeve (bonds ÷ Σ classified,
+    D1). The SELL is sized as ``min(residual, class_overweight, holding_value)`` — never past
+    the residual, the overweight class's target, or the holding's value — then whole-share
+    floored (dust dropped). ``switch_to`` = the canonical bond fund to BUY next (narrated,
+    like a cost switch). The SELL symbol is an index-core holding, so it can never collide
+    with the concentration/cost buckets (both NON-index only) — no cross-bucket dedup needed."""
+    if target_weights is None:
+        return None
+    if coverage is None or not coverage.adequate:
+        return None
+    target_bond = target_weights.get(BONDS)
+    if target_bond is None or not target_bond.is_finite():
+        return None
+
+    parked_set: frozenset[str] = frozenset()
+    if cash_config is not None:
+        parked_set = frozenset(normalize_symbols(cash_config.parked_symbols))
+    # Guard non-finite market_value the SAME way Story 11.1's compute_coverage does — drop
+    # the unpriced rows BEFORE classifying/aggregating, so a NaN/Inf holding can't poison
+    # classified_total / current_bond and size a garbage SELL (11.2 review — Medium; the
+    # bond-floor path must inherit the finite-guard 11.1 added). None stays (treated as 0).
+    finite_holdings = [
+        h
+        for h in (view.holdings or [])
+        if h.market_value is None or h.market_value.is_finite()
+    ]
+    view = _aggregate_by_symbol(
+        PortfolioView(holdings=finite_holdings, cash=view.cash, as_of=view.as_of)
+    )
+    by_class = classify_holdings(view.holdings or [], parked_set).by_class
+    classified_total = sum((by_class.get(c, _ZERO) for c in ASSET_CLASSES), _ZERO)
+    if classified_total <= _ZERO:
+        return None
+
+    current_bond = by_class.get(BONDS, _ZERO)
+    current_bond_pct = current_bond / classified_total
+    if target_bond - current_bond_pct <= BOND_SHORTFALL:
+        return None  # within band or over-bonded → downside-only, no finding
+
+    # Base-invariant bond gap (rebalance within the sleeve to hit target), minus the deploy
+    # card's cash-funded bond buy → SELL only the residual (D3; safe direction — can only
+    # under-size, never oversell, since a cash buy grows the base).
+    bond_gap = (target_bond * classified_total - current_bond).quantize(_CENT)
+    buy = deploy_bond_buy if deploy_bond_buy.is_finite() and deploy_bond_buy > _ZERO else _ZERO
+    residual = (bond_gap - buy).quantize(_CENT)
+    if residual <= _ZERO:
+        return None  # cash covers it → defer entirely to the deploy card
+
+    # Sell from the MOST-overweight equity class (largest positive gap vs its target).
+    best_class: str | None = None
+    best_over = _ZERO
+    for cls in ASSET_CLASSES:
+        if cls == BONDS:
+            continue
+        over = by_class.get(cls, _ZERO) - (target_weights.get(cls, _ZERO) * classified_total)
+        if over > best_over:
+            best_over = over
+            best_class = cls
+    if best_class is None or best_over <= _ZERO:
+        return None  # nothing overweight to sell
+
+    # Largest HELD index-core holding in that class is the one we sell.
+    sell_symbol: str | None = None
+    sell_mv = _ZERO
+    sell_qty: Decimal | None = None
+    for h in view.holdings or []:
+        symbol = (h.symbol or "").strip().upper()
+        if not symbol or asset_class_for(symbol) != best_class:
+            continue
+        mv = h.market_value if h.market_value is not None else _ZERO
+        if not mv.is_finite() or mv <= _ZERO:
+            continue
+        if mv > sell_mv:
+            sell_mv, sell_symbol, sell_qty = mv, symbol, h.quantity
+    if sell_symbol is None:
+        return None
+
+    amount = min(residual, best_over.quantize(_CENT), sell_mv).quantize(_CENT)
+    intent = _sell_intent(sell_symbol, amount, sell_mv, sell_qty)
+    if intent is None:
+        return None  # dust — under one whole share
+
+    return ReviewFinding(
+        kind=KIND_BOND_FLOOR,
+        symbol=sell_symbol,
+        asset_class=best_class,
+        order_intent=intent,
+        switch_to=CANONICAL_FUND.get(BONDS),  # BND — the bonds to buy next (narrated)
+        amount=amount,
+        holding_value=sell_mv,
+        weight=current_bond_pct,  # CURRENT classified-sleeve bond fraction
+        expense_ratio=None,
+        cheaper_expense_ratio=None,
+        as_of=_as_of_date(view.as_of),
+        target_weight=target_bond,
+    )
+
+
 def find_review(
-    view: PortfolioView, cash_config: CashConfig | None
+    view: PortfolioView,
+    cash_config: CashConfig | None,
+    target_weights: dict[str, Decimal] | None = None,
+    coverage: Coverage | None = None,
+    deploy_bond_buy: Decimal = _ZERO,
 ) -> list[ReviewFinding]:
-    """Run both detectors and return the ranked findings (pure).
+    """Run the analysis detectors and return the ranked findings (pure).
 
     Ranked by SELL dollar ``amount`` descending, ties broken by ``symbol`` ascending
     (deterministic). "Nothing to fix" → an EMPTY list (the honest, valid output).
@@ -409,18 +542,22 @@ def find_review(
     so a ticker split across multiple cache rows can never surface as two overlapping
     trims (a co-sign-into-oversell hazard).
 
-    A single holding can qualify for BOTH buckets — a non-index high-fee fund held
-    over the ceiling (e.g. an actively-managed fund at 55%). Surfacing both would
-    double-count one position (two overlapping SELLs the human could co-sign into an
-    oversell). The cost switch sells the WHOLE position and moves it to the cheaper
-    same-class core, which subsumes the concentration trim (a partial sell of the
-    same holding), so we prefer the cost switch and drop the redundant trim for that
-    symbol."""
+    A single holding can qualify for BOTH the concentration and cost buckets — a non-index
+    high-fee fund held over the ceiling. Surfacing both would double-count one position; the
+    cost switch (whole position) subsumes the concentration trim, so we prefer cost and drop
+    the redundant trim for that symbol. The Story-11.2 ``bond_floor`` finding (when its inputs
+    are supplied) sells an INDEX-CORE holding, which can never collide with the concentration
+    or cost symbols (both NON-index only), so it needs no cross-bucket dedup."""
     view = _aggregate_by_symbol(view)
     concentration = find_concentration_findings(view, cash_config)
     cost = find_cost_findings(view, cash_config)
     cost_symbols = {f.symbol for f in cost}
     findings = [f for f in concentration if f.symbol not in cost_symbols] + cost
+    bond_floor = find_bond_floor_finding(
+        view, target_weights, coverage, cash_config, deploy_bond_buy
+    )
+    if bond_floor is not None:
+        findings.append(bond_floor)
     findings.sort(key=lambda f: (-f.amount, f.symbol))
     return findings
 
@@ -536,6 +673,15 @@ def build_review_facts(finding: ReviewFinding) -> tuple[EvidenceRecord, ...]:
             f"${format_money(finding.amount)} of {finding.symbol} lets you switch to the "
             "cheaper same-class fund."
         )
+    elif finding.kind == KIND_BOND_FLOOR:
+        stats["target_weight"] = finding.target_weight
+        cur_pct = (finding.weight * _HUNDRED).quantize(_CENT)
+        tgt_pct = ((finding.target_weight or _ZERO) * _HUNDRED).quantize(_CENT)
+        statement = (
+            f"Your bonds are {format_money(cur_pct)}% of your invested mix versus your "
+            f"{format_money(tgt_pct)}% target — selling ${format_money(finding.amount)} of "
+            f"{finding.symbol} into {finding.switch_to} moves you toward the risk level you chose."
+        )
     else:
         weight_pct = (finding.weight * _HUNDRED).quantize(_CENT)
         statement = (
@@ -593,6 +739,12 @@ def allowed_review_facts(finding: ReviewFinding) -> frozenset[tuple[Decimal, str
         allowed.add((finding.expense_ratio, UNIT_PERCENT))
     if finding.cheaper_expense_ratio is not None:
         allowed.add((finding.cheaper_expense_ratio, UNIT_PERCENT))
+    # BOND_FLOOR (Story 11.2): admit the target bond weight AND the shortfall (target −
+    # current), both fraction+percent, so the narration may state "bonds are X% vs a Y%
+    # target, Z below it". ``weight`` (current bond) is already admitted above.
+    if finding.target_weight is not None:
+        _add_weight_forms(allowed, finding.target_weight)
+        _add_weight_forms(allowed, finding.target_weight - finding.weight)
     return frozenset(allowed)
 
 
@@ -623,13 +775,41 @@ def _fallback_review_narration(
     ERs/``switch_to`` by construction in :func:`find_cost_findings`, but we treat the
     fee branch as cost-shaped only when those fields are actually present so a
     malformed finding degrades to the concentration copy instead of throwing."""
+    is_bond_floor = (
+        finding.kind == KIND_BOND_FLOOR
+        and finding.target_weight is not None
+        and finding.switch_to
+    )
     is_cost = (
         finding.kind == KIND_COST
         and finding.expense_ratio is not None
         and finding.cheaper_expense_ratio is not None
         and finding.switch_to
     )
-    if is_cost:
+    if is_bond_floor:
+        cur_pct = format_money((finding.weight * _HUNDRED).quantize(_CENT))
+        tgt_pct = format_money(((finding.target_weight or _ZERO) * _HUNDRED).quantize(_CENT))
+        action_label = "Add to your bonds to match the risk level you chose"
+        reasoning = (
+            f"Your bonds are {cur_pct}% of your invested mix, while the plan you chose aims "
+            f"for {tgt_pct}% — you are holding more in stocks than your risk level calls for. "
+            "The principle here is risk capacity: bonds cushion the ride, so a portfolio that "
+            "matches your chosen plan holds you steadier when markets fall. This is a two-step "
+            f"move: step one is to sell ${format_money(finding.amount)} of {finding.symbol} "
+            f"from your overweight stocks now; step two, the follow-up buy of the broad "
+            f"{finding.switch_to} bond fund, is queued and linked to this sell so it is ready "
+            "to review the moment the cash settles — you are never left stranded in cash. It "
+            "is a rebalance toward your own plan, not a bet on where markets go next. The "
+            "tradeoff is honest: more in bonds means a bit less upside in a strong market, in "
+            "exchange for a steadier ride; and selling may realize a taxable gain, which we do "
+            "not calculate here, so weigh that before you co-sign."
+        )
+        uncertainties = (
+            "Markets move, so a fill isn't guaranteed and this isn't a prediction — it's "
+            "simply bringing your bonds up to the plan you chose; and selling may have a tax "
+            "consequence we don't calculate for you.",
+        )
+    elif is_cost:
         action_label = "Switch this pricey fund for a cheaper one that holds the same thing"
         reasoning = (
             f"Your {finding.symbol} charges a {format_money(finding.expense_ratio)}% "
@@ -702,7 +882,10 @@ _REVIEW_SYSTEM = (
     "to explain, in plain warm English, the WHY, the TRADEOFF, and the settled "
     "principle as situational opinion: for an over-concentrated single stock, "
     "diversifying out of single-name risk into the broad index core; for a high-fee "
-    "fund, switching to a cheaper same-class index fund because low costs compound. "
+    "fund, switching to a cheaper same-class index fund because low costs compound; "
+    "for a bond shortfall, selling some overweight stock into a broad bond fund to "
+    "bring bonds up to the RISK LEVEL THE USER CHOSE (a rebalance toward their own "
+    "plan, never a market call — bonds cushion drawdowns). "
     "For a fee switch, frame it as a LINKED TWO-STEP switch: step one sells the "
     "high-fee fund now; step two, the follow-up buy of the cheaper fund, is queued "
     "and linked to that sell so it is ready to review once the cash settles — the "
@@ -733,15 +916,28 @@ def compose_review_request(
         f"- holding to sell: {finding.symbol}",
         f"- sell amount: ${format_money(finding.amount)}",
         f"- holding market value: ${format_money(finding.holding_value)}",
-        f"- single-position ceiling: "
-        f"{format_money(CONCENTRATION_CEILING * _HUNDRED)}%",
     ]
     if finding.kind == KIND_CONCENTRATION:
         weight_pct = format_money((finding.weight * _HUNDRED).quantize(_CENT))
+        lines.append(
+            f"- single-position ceiling: {format_money(CONCENTRATION_CEILING * _HUNDRED)}%"
+        )
         lines.append(f"- this position's weight: {weight_pct}% of the portfolio")
         lines.append(
             "- goal: trim this oversized single stock back toward the ceiling and "
             "into the broad diversified index core (de-speculate, do not chase)"
+        )
+    elif finding.kind == KIND_BOND_FLOOR:
+        cur_pct = format_money((finding.weight * _HUNDRED).quantize(_CENT))
+        tgt_pct = format_money(((finding.target_weight or _ZERO) * _HUNDRED).quantize(_CENT))
+        lines.append(f"- current bonds: {cur_pct}% of your invested mix")
+        lines.append(f"- your chosen target bonds: {tgt_pct}%")
+        lines.append(f"- buy next (canonical broad bond fund): {finding.switch_to}")
+        lines.append(
+            "- goal: sell this overweight stock holding and buy the broad bond fund to "
+            "bring bonds up to the risk level the user CHOSE — a rebalance toward their "
+            "own plan, NOT a market call; note honestly that selling may realize a "
+            "taxable gain and that tax is NOT calculated here"
         )
     else:
         lines.append(f"- switch to (cheaper same-class index fund): {finding.switch_to}")
@@ -844,7 +1040,21 @@ async def build_review(
     the existing ``/approve`` spine; this places NOTHING."""
     view = await get_portfolio(scope, session)
     cash_config = await get_cash_config(scope, session)
-    findings = find_review(view, cash_config)
+    # Story 11.2 inputs for the bond-floor check: the resolved target weights (same resolver
+    # the deploy engine uses — never a cross-model guess), the 11.1 coverage gate, and the
+    # deploy plan's cash-funded bond buy (so bond-floor SELLs only the residual cash can't
+    # cover — D3). Compute the deploy plan ONLY when a bond-floor finding is even possible
+    # (target chosen + coverage adequate), to avoid the extra read/work otherwise.
+    resolved = resolve_target_config(await get_target_config(scope, session))
+    target_weights = resolved["weights"] if resolved else None
+    coverage = compute_coverage(view, cash_config)
+    deploy_bond_buy = _ZERO
+    if target_weights is not None and coverage is not None and coverage.adequate:
+        plan = await build_plan(scope, session)
+        deploy_bond_buy = sum(
+            (it.amount for it in plan.action_items if it.asset_class == BONDS), _ZERO
+        )
+    findings = find_review(view, cash_config, target_weights, coverage, deploy_bond_buy)
     # "Nothing to fix" is valid — no findings means NO LLM call.
     return [
         NarratedFinding(finding=f, narration=narrate_finding(gateway, f))

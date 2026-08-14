@@ -143,18 +143,22 @@ class SellOrderOut(BaseModel):
 
 
 class ReviewFindingOut(BaseModel):
-    """One SELL-side analysis finding (Story 10.4).
+    """One SELL-side analysis finding (Story 10.4 / 11.2).
 
-    ``kind`` ∈ ``{concentration, cost}``. ``switch_to`` is the cheaper canonical fund
-    to BUY next (``cost`` only; ``null`` for ``concentration``). ``order`` is the
-    ready-to-approve SELL MARKET order; ``narration`` is the fiduciary-advisor card
-    (same shape as :class:`NarrationOut`)."""
+    ``kind`` ∈ ``{concentration, cost, bond_floor}``. ``switch_to`` is the fund to BUY
+    next (the cheaper canonical for ``cost``; the broad bond fund for ``bond_floor``;
+    ``null`` for ``concentration``). ``order`` is the ready-to-approve SELL MARKET order;
+    ``narration`` is the fiduciary-advisor card. ``current_weight`` / ``target_weight``
+    are fixed-point PERCENT strings present ONLY for ``bond_floor`` (current vs chosen-target
+    bond %); ``null`` otherwise."""
 
     kind: str
     symbol: str
     switch_to: str | None = None
     order: SellOrderOut
     narration: NarrationOut
+    current_weight: str | None = None
+    target_weight: str | None = None
 
 
 class CoverageOut(BaseModel):
@@ -291,17 +295,27 @@ async def read_narration(
 
 def _review_finding_out(narrated: NarratedFinding) -> ReviewFindingOut:
     finding = narrated.finding
+    # bond_floor (Story 11.2) carries the current vs chosen-target bond % as fixed-point
+    # percent strings for the UI x-ray; other kinds leave them null.
+    current_weight = target_weight = None
+    if finding.kind == "bond_floor" and finding.target_weight is not None:
+        current_weight = format_money((finding.weight * Decimal("100")).quantize(Decimal("0.01")))
+        target_weight = format_money((finding.target_weight * Decimal("100")).quantize(Decimal("0.01")))
     return ReviewFindingOut(
         kind=finding.kind,
         symbol=finding.symbol,
         switch_to=finding.switch_to,
         order=SellOrderOut(
+            # Read the intent's own side (all review intents are SELL today; future-proof
+            # against a bond_floor BUY without changing behavior — 11.2 review LOW).
             symbol=finding.order_intent.symbol,
-            side="sell",
+            side=finding.order_intent.side.value,
             amount=format_money(finding.order_intent.amount),
             order_type="market",
         ),
         narration=_narration_out(narrated.narration),
+        current_weight=current_weight,
+        target_weight=target_weight,
     )
 
 

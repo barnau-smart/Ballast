@@ -28,8 +28,10 @@ import pytest
 from allocation.narrate import NarrationValidationError
 from allocation.narrate import UNIT_BARE, UNIT_MONEY, UNIT_PERCENT
 from allocation.review import (
+    BOND_SHORTFALL,
     CONCENTRATION_CEILING,
     COVERAGE_MIN,
+    KIND_BOND_FLOOR,
     KIND_CONCENTRATION,
     KIND_COST,
     Coverage,
@@ -41,12 +43,14 @@ from allocation.review import (
     check_no_invented_numbers,
     compute_coverage,
     coverage_message,
+    find_bond_floor_finding,
     find_concentration_findings,
     find_cost_findings,
     find_review,
     narrate_finding,
 )
 from api.allocation import _coverage_out
+from strategy.target_allocation import BONDS, INTL_EQUITY, US_EQUITY
 from api.app import create_app
 from brokers.portfolio import PortfolioView
 from coach.recommendation import OrderSide, OrderType
@@ -979,3 +983,170 @@ def test_coverage_out_serializes_and_gates_message():
     assert high.message is None  # adequate → no informational line
 
     assert _coverage_out(None) is None
+
+
+# --- Bond-floor / risk-capacity (Story 11.2) ---------------------------------
+
+# Conservative-shaped target (60% bonds) for the bond-floor tests.
+_CONSERVATIVE = {US_EQUITY: Decimal("0.30"), INTL_EQUITY: Decimal("0.10"), BONDS: Decimal("0.60")}
+
+
+def _adequate(total="10000"):
+    return Coverage(
+        coverage=Decimal("1"), adequate=True,
+        unclassified_value=Decimal("0"), unclassified_symbols=[], total=Decimal(total),
+    )
+
+
+def test_bond_floor_fires_when_underbonded_no_cash():
+    """Under-bonded vs a Conservative target, no cash → SELL overweight equity into bonds."""
+    view = _view([
+        _Holding("VTI", Decimal("8000"), Decimal("40")),  # us_equity, overweight
+        _Holding("BND", Decimal("2000"), Decimal("14")),   # bonds 20% of a 60% target
+    ])
+    f = find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0"))
+    assert f is not None
+    assert f.kind == KIND_BOND_FLOOR
+    assert f.symbol == "VTI"                 # the overweight equity holding
+    assert f.switch_to == "BND"              # buy bonds next
+    assert f.order_intent.side == OrderSide.SELL
+    assert f.amount == Decimal("4000.00")    # 0.60*10000 - 2000
+    assert f.weight == Decimal("2000") / Decimal("10000")   # current bond fraction 0.20
+    assert f.target_weight == Decimal("0.60")
+
+
+def test_bond_floor_within_band_no_finding():
+    """Bonds within BOND_SHORTFALL of target → no finding (downside-only)."""
+    view = _view([
+        _Holding("VTI", Decimal("5000"), Decimal("25")),
+        _Holding("BND", Decimal("5000"), Decimal("35")),   # 50% vs 60% target → 10pp ≤ 15pp
+    ])
+    assert find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0")) is None
+
+
+def test_bond_floor_over_bonded_no_finding():
+    """More bonds than target → never fires on the upside."""
+    view = _view([
+        _Holding("VTI", Decimal("3000"), Decimal("15")),
+        _Holding("BND", Decimal("7000"), Decimal("49")),   # 70% > 60% target
+    ])
+    assert find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0")) is None
+
+
+def test_bond_floor_no_target_none():
+    """No chosen target → no finding."""
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("40")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    assert find_bond_floor_finding(view, None, _adequate(), None, Decimal("0")) is None
+
+
+def test_bond_floor_low_coverage_gated():
+    """Inadequate 11.1 coverage → no finding (class weights untrustworthy)."""
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("40")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    low = Coverage(coverage=Decimal("0.5"), adequate=False, unclassified_value=Decimal("5000"),
+                   unclassified_symbols=["TSLA"], total=Decimal("10000"))
+    assert find_bond_floor_finding(view, _CONSERVATIVE, low, None, Decimal("0")) is None
+    assert find_bond_floor_finding(view, _CONSERVATIVE, None, None, Decimal("0")) is None
+
+
+def test_bond_floor_defers_when_cash_covers_shortfall():
+    """When the deploy plan's cash-funded bond buy covers the gap → defer (no finding)."""
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("40")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    # bond_gap = 4000; deploy buys 4000 of bonds with cash → residual 0 → defer.
+    assert find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("4000")) is None
+
+
+def test_bond_floor_sells_only_the_residual_on_partial_cash():
+    """Partial cash → SELL sized to the residual the deploy buy can't cover."""
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("40")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    f = find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("1500"))
+    assert f is not None
+    assert f.amount == Decimal("2500.00")    # 4000 gap - 1500 deploy buy
+
+
+def test_bond_floor_dust_dropped():
+    """A residual that sizes to < 1 whole share of the equity holding → dropped."""
+    # VTI qty 1 → unit 8000; residual 4000 → floor(4000/8000)=0 shares → dust.
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("1")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    assert find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0")) is None
+
+
+def test_bond_floor_ignores_non_finite_market_value():
+    """A NaN/unpriced classified holding must NOT poison classified_total/current_bond —
+    it is dropped before classifying (inherits 11.1's finite-guard). Coverage (finite) and
+    bond-floor now agree on the same base."""
+    view = _view([
+        _Holding("SCHB", Decimal("NaN"), Decimal("10")),  # unpriced us_equity → dropped
+        _Holding("VTI", Decimal("8000"), Decimal("40")),   # us_equity, priced
+        _Holding("BND", Decimal("2000"), Decimal("14")),    # bonds 20% of the finite base
+    ])
+    f = find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0"))
+    assert f is not None
+    # finite classified base = 10000 (NaN SCHB dropped); bond_gap = 0.60*10000 - 2000 = 4000.
+    assert f.weight == Decimal("2000") / Decimal("10000")
+    assert f.amount == Decimal("4000.00")
+    assert f.symbol == "VTI"
+
+
+def test_bond_floor_never_sells_more_than_the_holding():
+    """Explicit oversell guard: the SELL amount never exceeds the sold holding's value."""
+    view = _view([
+        _Holding("VTI", Decimal("3000"), Decimal("15")),   # only $3000 of equity held
+        _Holding("BND", Decimal("1000"), Decimal("7")),     # bonds 25% of a 60% target
+    ])
+    f = find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0"))
+    assert f is not None
+    # bond_gap = 0.60*4000 - 1000 = 1400; capped by VTI overweight (3000-0.30*4000=1800)
+    # and by the holding value (3000) → 1400. Must never exceed the $3000 holding.
+    assert f.amount <= Decimal("3000")
+    assert f.order_intent.amount <= f.holding_value
+
+
+def test_bond_floor_fallback_narration_is_calm_and_lesson_bearing():
+    """The deterministic bond-floor fallback passes the honesty gates + is calm."""
+    view = _view([_Holding("VTI", Decimal("8000"), Decimal("40")), _Holding("BND", Decimal("2000"), Decimal("14"))])
+    f = find_bond_floor_finding(view, _CONSERVATIVE, _adequate(), None, Decimal("0"))
+    ev = build_review_facts(f)
+    narration = _fallback_review_narration(f, ev)
+    blob = " ".join((narration.reasoning, narration.action_label, *narration.uncertainties))
+    _assert_calm(blob)
+    check_no_forecast(blob)                                   # must not raise
+    check_no_invented_numbers(blob, allowed_review_facts(f))  # every number is engine-provided
+    assert "60.00%" in narration.reasoning and "20.00%" in narration.reasoning
+    assert len(narration.uncertainties) >= 1
+
+
+def test_bond_floor_endpoint_flow(client):
+    """End-to-end: a Conservative target + an under-bonded, fully-classified portfolio →
+    a bond_floor finding with current/target bond % on the wire; nothing placed."""
+    email = _unique_email()
+    try:
+        _register(client, email)
+        headers = {"Authorization": f"Bearer {_login(client, email)}"}
+        uid = _user_id_for(email)
+        _seed_balance(uid, "0")
+        _seed_holding(uid, "VTI", "8000", "40")   # us_equity, overweight
+        _seed_holding(uid, "BND", "2000", "14")    # bonds 20% of a 60% target
+        r = client.put("/api/target-allocation", json={"model": "conservative"}, headers=headers)
+        assert r.status_code == 200, r.text
+
+        before = _decision_count(uid)
+        r = client.get("/api/allocation/review", headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Fully index-core → coverage adequate → bond_floor can fire.
+        assert body["coverage"]["adequate"] is True
+        bond = [f for f in body["findings"] if f["kind"] == "bond_floor"]
+        assert len(bond) == 1, body["findings"]
+        f = bond[0]
+        assert f["symbol"] == "VTI"
+        assert f["switch_to"] == "BND"
+        assert f["order"]["side"] == "sell"
+        assert f["order"]["order_type"] == "market"
+        assert f["order"]["amount"] == "4000.00"       # 0.60*10000 - 2000
+        assert f["current_weight"] == "20.00"
+        assert f["target_weight"] == "60.00"
+        _assert_calm(f["narration"]["reasoning"])
+        # Writes NOTHING, places no order.
+        assert before == _decision_count(uid) == 0
+    finally:
+        _delete_user(email)
