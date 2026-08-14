@@ -14,7 +14,16 @@
 # none, and seeds the account only if it isn't already seeded (so decisions don't
 # pile up). Called automatically by scripts/demo.sh; runnable on its own too.
 #
-#   ./scripts/demo_setup.sh
+#   ./scripts/demo_setup.sh            # provision if missing (idempotent, default)
+#   ./scripts/demo_setup.sh reset      # PUT IT BACK: after you've played with the
+#                                       #   data, restore the clean demo baseline
+#                                       #   (portfolio + Balanced target + 2 decisions
+#                                       #   + $4k cash + reserve undecided). Keeps the
+#                                       #   DB/schema/market history, so the running
+#                                       #   app keeps working — just RELOAD the page.
+#   ./scripts/demo_setup.sh fresh      # NUKE: drop + rebuild the whole demo DB
+#                                       #   (re-clones market history; STOP the app
+#                                       #   first — this drops the DB out from under it).
 #
 # Demo login →  demo@example.com  /  ballast-demo-2026
 
@@ -24,6 +33,17 @@ BACKEND="$ROOT/ballast/backend"
 DEMO_DB="${DEMO_DB:-ballast_demo}"
 SOURCE_DB="${SOURCE_DB:-ballast}"       # where 20y of market history already lives
 DEMO_URL="postgresql://ballast:ballast@localhost:5432/$DEMO_DB"
+DEMO_EMAIL="demo@example.com"
+
+MODE="provision"
+case "${1:-}" in
+  reset|--reset)          MODE="reset" ;;
+  fresh|--fresh|nuke)     MODE="fresh" ;;
+  ""|provision)           MODE="provision" ;;
+  -h|--help)
+    sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "unknown argument '$1' (use: reset | fresh | --help)"; exit 2 ;;
+esac
 
 psql_demo() { ( cd "$ROOT" && docker compose exec -T db psql -U ballast -d "$DEMO_DB" "$@" ); }
 
@@ -32,6 +52,15 @@ echo "▶ Provisioning demo DB '$DEMO_DB' (safe: fake data, separate DB)…"
 # --- 1. Postgres up + demo DB exists -----------------------------------------
 ( cd "$ROOT" && (docker compose up -d --wait db 2>/dev/null || docker compose up -d db) ) \
   || { echo "✗ failed to start Postgres"; exit 1; }
+
+# `fresh`: drop the whole demo DB first (--force terminates any app connections),
+# so everything below rebuilds from zero, re-cloning market history.
+if [ "$MODE" = "fresh" ]; then
+  echo "  • dropping '$DEMO_DB' for a fresh rebuild (stop the app first if it's running)…"
+  ( cd "$ROOT" && docker compose exec -T db dropdb -U ballast --force --if-exists "$DEMO_DB" ) \
+    || echo "    (drop reported an error; continuing)"
+fi
+
 if ! psql_demo -tAc "SELECT 1" >/dev/null 2>&1; then
   echo "  • creating database '$DEMO_DB'…"
   ( cd "$ROOT" && docker compose exec -T db createdb -U ballast "$DEMO_DB" ) \
@@ -86,9 +115,26 @@ else
   echo "  • market history already present ($demo_rows rows) — skipping clone."
 fi
 
+# --- 3b. `reset`: wipe the demo account's mutable state (played-with data) ----
+# Clears decisions, cash config (reserve + parked tags), and any pending buys for
+# the demo user, then falls through to the seed below (which re-links → re-imports
+# the demo portfolio, re-sets the Balanced target, and re-seeds exactly 2 decisions).
+# Keeps schema + market history, so a running app keeps its connection — just reload.
+if [ "$MODE" = "reset" ]; then
+  rid="$(psql_demo -tAc "SELECT id FROM \"user\" WHERE email='$DEMO_EMAIL'" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$rid" ]; then
+    echo "  • reset: clearing played-with data for ${DEMO_EMAIL}…"
+    psql_demo -c "
+      DELETE FROM decision_record WHERE owner_id='$rid';
+      DELETE FROM cash_config     WHERE owner_id='$rid';
+      DELETE FROM pending_buy     WHERE owner_id='$rid';
+    " >/dev/null 2>&1
+  fi
+fi
+
 # --- 4. Seed the demo account (only if not already seeded) -------------------
 seeded="$(psql_demo -tAc \
-  "SELECT count(*) FROM decision_record dr JOIN \"user\" u ON u.id = dr.owner_id WHERE u.email = 'demo@example.com'" \
+  "SELECT count(*) FROM decision_record dr JOIN \"user\" u ON u.id = dr.owner_id WHERE u.email = '$DEMO_EMAIL'" \
   2>/dev/null | tr -d '[:space:]')"
 if [ "${seeded:-0}" -ge 2 ] 2>/dev/null; then
   echo "  • demo account already seeded ($seeded decisions) — skipping seed."
@@ -96,7 +142,7 @@ else
   echo "  • seeding demo account (portfolio + Balanced target + 2 decisions)…"
   ( cd "$BACKEND" && DATABASE_URL="$DEMO_URL" uv run python "$ROOT/scripts/demo_seed.py" ) \
     | grep -E "✓|✗|Dry run|Demo login" || true
-  duid="$(psql_demo -tAc "SELECT id FROM \"user\" WHERE email='demo@example.com'" 2>/dev/null | tr -d '[:space:]')"
+  duid="$(psql_demo -tAc "SELECT id FROM \"user\" WHERE email='$DEMO_EMAIL'" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$duid" ]; then
     # Leave the reserve UNDECIDED so the live set-or-decline beat works on stage,
     # AND restore the $4,000 cash baseline: the 2 seeded co-signs are MARKET buys

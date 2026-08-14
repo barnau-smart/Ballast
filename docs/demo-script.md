@@ -11,7 +11,11 @@ There are **two** ways to demo Ballast:
   portfolio (all-US VTI + AAPL/NVDA + $4k cash), a **Balanced** target, and 2
   co-signed decisions, with the cash reserve left *undecided* so the live
   set-or-decline beat still works. Add `LLM_ADAPTER=anthropic` for real AI
-  narration. Rebuild the demo DB anytime with `./scripts/demo_setup.sh`.
+  narration. **Played with the data and want it back?** `./scripts/demo_setup.sh
+  reset` restores the clean baseline (portfolio + Balanced target + 2 decisions +
+  $4k cash, reserve undecided) in place — the running app keeps working, just
+  reload the page. `./scripts/demo_setup.sh fresh` is the full nuke-and-rebuild
+  (drops the DB + re-clones market history; stop the app first).
 - **All-live run-book (real Schwab, real trade)** — the rest of this document.
   Your real balances are on screen and a real order is placed on stage.
 
