@@ -273,6 +273,9 @@ export function CoachConsult() {
   // payload). Carries a calm `message` ONLY when coverage is inadequate; null/absent
   // (good coverage or empty portfolio) → nothing rendered.
   const [reviewCoverage, setReviewCoverage] = useState(null)
+  // Story 11.3 — the aggregate single-stock note (`{single_stock}`), present only when the
+  // individual-stock sleeve is over the band; null otherwise → nothing rendered.
+  const [reviewSingleStock, setReviewSingleStock] = useState(null)
   const reviewingRef = useRef(false) // synchronous double-click guard
 
   // Story 10.5 — the cheaper canonical fund a cost-switch SELL switches INTO. When
@@ -834,6 +837,7 @@ export function CoachConsult() {
     setReviewMessage('')
     setReviewFindings([])
     setReviewCoverage(null)
+    setReviewSingleStock(null)
     try {
       const res = await apiFetch('/api/allocation/review')
       if (!mounted.current) return
@@ -871,6 +875,7 @@ export function CoachConsult() {
       // Coverage rides alongside findings (Story 11.1); shown in both the ready and
       // empty states when it carries a message (i.e. coverage is inadequate).
       setReviewCoverage(data?.coverage ?? null)
+      setReviewSingleStock(data?.single_stock ?? null)   // Story 11.3
       const findings = Array.isArray(data?.findings) ? data.findings : []
       if (findings.length === 0) {
         setReviewFindings([])
@@ -1158,6 +1163,16 @@ export function CoachConsult() {
           role="status"
         >
           {reviewCoverage.message}
+        </p>
+      ) : null}
+
+      {(review === 'ready' || review === 'empty') && reviewSingleStock?.message ? (
+        <p
+          className="ballast-consult__note"
+          data-testid="coach-review-single-stock"
+          role="status"
+        >
+          {reviewSingleStock.message}
         </p>
       ) : null}
 

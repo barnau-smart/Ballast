@@ -644,6 +644,63 @@ def coverage_message(cov: Coverage) -> str:
     )
 
 
+# --- Single-stock aggregate concentration (Story 11.3) -----------------------
+
+#: The aggregate individual-stock band (Story 11.3): when the individual-stock / unclassified
+#: sleeve exceeds this share of the whole portfolio, surface a calm "a lot riding on single
+#: companies" note — catching many hand-picked names that the 10.4 single-position (40%)
+#: ceiling misses. Locked strategy constant; 0.25 = 25% (MasterB decision 2026-08-14).
+SINGLE_NAME_AGG_MAX: Decimal = Decimal("0.25")
+
+
+@dataclass(frozen=True)
+class SingleStock:
+    """The aggregate individual-stock sleeve as a share of the portfolio (pure, Story 11.3).
+
+    ``fraction`` is ``unclassified_value / total`` (the SAME sleeve :class:`Coverage`
+    measures — individual stocks + specialty funds); ``over`` is
+    ``fraction > SINGLE_NAME_AGG_MAX``. Informational only — carries NO order."""
+
+    fraction: Decimal
+    value: Decimal
+    symbols: list[str]
+    over: bool
+
+
+def single_stock_from_coverage(cov: Coverage | None) -> SingleStock | None:
+    """Derive the aggregate single-stock view from an already-computed :class:`Coverage`
+    (pure, Story 11.3) — reuses 11.1's finite-guarded unclassified sleeve so the two
+    checks report the SAME dollars. ``None`` when there is nothing to measure."""
+    if cov is None or cov.total <= _ZERO:
+        return None
+    fraction = cov.unclassified_value / cov.total
+    if fraction < _ZERO:
+        fraction = _ZERO
+    return SingleStock(
+        fraction=fraction,
+        value=cov.unclassified_value,
+        symbols=list(cov.unclassified_symbols),
+        over=fraction > SINGLE_NAME_AGG_MAX,
+    )
+
+
+def single_stock_message(ss: SingleStock) -> str:
+    """The deterministic, calm risk-framed line for an over-concentrated individual-stock
+    sleeve (pure, Story 11.3). Distinct from :func:`coverage_message` (which frames the SAME
+    sleeve as a coverage-honesty caveat) — this frames it as single-company RISK to consider
+    diversifying. States only detector numbers (never-invent); no forecast, no FOMO, no
+    directive. NO LLM call."""
+    pct = format_money((ss.fraction * _HUNDRED).quantize(_CENT))
+    syms = ", ".join(ss.symbols) if ss.symbols else "several holdings"
+    return (
+        f"About {pct}% of your portfolio is in individual stocks and specialty funds "
+        f"({syms}) — that's a lot riding on a handful of specific companies. Spreading some "
+        "of it into a broad, diversified fund would lower that single-company risk without "
+        "changing your overall stock-and-bond balance. This isn't a prediction — it's just "
+        "how concentrated that slice is right now."
+    )
+
+
 # --- Evidence + allow-set (pure, built from a finding) -----------------------
 
 

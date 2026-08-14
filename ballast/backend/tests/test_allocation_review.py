@@ -41,15 +41,19 @@ from allocation.review import (
     build_review_facts,
     check_no_forecast,
     check_no_invented_numbers,
+    SINGLE_NAME_AGG_MAX,
+    SingleStock,
     compute_coverage,
     coverage_message,
+    single_stock_from_coverage,
+    single_stock_message,
     find_bond_floor_finding,
     find_concentration_findings,
     find_cost_findings,
     find_review,
     narrate_finding,
 )
-from api.allocation import _coverage_out
+from api.allocation import _coverage_out, _single_stock_out
 from strategy.target_allocation import BONDS, INTL_EQUITY, US_EQUITY
 from api.app import create_app
 from brokers.portfolio import PortfolioView
@@ -714,11 +718,15 @@ def test_review_shape_ranking_and_no_writes(client):
         r = client.get("/api/allocation/review", headers=headers)
         assert r.status_code == 200, r.text
         body = r.json()
-        assert set(body.keys()) == {"findings", "coverage"}
+        assert set(body.keys()) == {"findings", "coverage", "single_stock"}
         # TSLA 5500 + AGTHX 2000 unclassified of 10000 total → 25% coverage → inadequate.
         assert body["coverage"]["adequate"] is False
         assert body["coverage"]["coverage"] == "25.00"
         assert body["coverage"]["message"]  # calm informational line present when low
+        # 75% single-stock sleeve → over the 25% band → the 11.3 note is present + distinct.
+        assert body["single_stock"] is not None
+        assert body["single_stock"]["pct"] == "75.00"
+        assert body["single_stock"]["message"] != body["coverage"]["message"]
         findings = body["findings"]
         assert len(findings) == 2
         # Ranked by SELL amount desc: AGTHX ($2000) before TSLA ($1500).
@@ -815,7 +823,7 @@ def test_review_per_user_isolation(client):
         # B sees ONLY its own (empty) state — never A's holdings. Empty portfolio →
         # coverage is null (nothing to measure), not a fabricated 0%/100%.
         b_body = client.get("/api/allocation/review", headers=headers_b).json()
-        assert b_body == {"findings": [], "coverage": None}
+        assert b_body == {"findings": [], "coverage": None, "single_stock": None}
     finally:
         _delete_user(email_a)
         _delete_user(email_b)
@@ -983,6 +991,65 @@ def test_coverage_out_serializes_and_gates_message():
     assert high.message is None  # adequate → no informational line
 
     assert _coverage_out(None) is None
+
+
+# --- Single-stock aggregate concentration (Story 11.3) -----------------------
+
+
+def _cov(unclassified, total, symbols=("TSLA",)):
+    frac = Decimal(unclassified) / Decimal(total)
+    return Coverage(
+        coverage=Decimal("1") - frac, adequate=(Decimal("1") - frac) >= COVERAGE_MIN,
+        unclassified_value=Decimal(unclassified), unclassified_symbols=list(symbols),
+        total=Decimal(total),
+    )
+
+
+def test_single_stock_over_band_flagged():
+    """Individual-stock sleeve above 25% → flagged (over=True), with value + symbols."""
+    ss = single_stock_from_coverage(_cov("6000", "10000", ("TSLA", "NVDA")))
+    assert ss is not None
+    assert ss.fraction == Decimal("0.6")
+    assert ss.over is True
+    assert ss.value == Decimal("6000")
+    assert ss.symbols == ["TSLA", "NVDA"]
+
+
+def test_single_stock_at_or_below_band_not_over():
+    """At/below 25% → over=False (nothing to flag)."""
+    at = single_stock_from_coverage(_cov("2500", "10000"))   # exactly 25%
+    assert at is not None and at.over is False               # strictly-greater band
+    below = single_stock_from_coverage(_cov("1000", "10000"))
+    assert below is not None and below.over is False
+
+
+def test_single_stock_none_when_nothing_to_measure():
+    """No coverage (empty portfolio) → None."""
+    assert single_stock_from_coverage(None) is None
+
+
+def test_single_stock_message_is_calm_distinct_and_cites_numbers():
+    """The risk-framed message is calm, cites the computed %/symbols, and differs from the
+    coverage-honesty line for the SAME sleeve."""
+    cov = _cov("6000", "10000", ("TSLA", "NVDA"))
+    ss = single_stock_from_coverage(cov)
+    msg = single_stock_message(ss)
+    assert "60.00%" in msg and "TSLA" in msg
+    _assert_calm(msg)
+    check_no_forecast(msg)
+    assert msg != coverage_message(cov)   # complementary, not duplicate
+
+
+def test_single_stock_out_surfaces_only_when_over():
+    """_single_stock_out serializes only when over the band; fixed-point strings."""
+    over = _single_stock_out(single_stock_from_coverage(_cov("7500", "10000", ("TSLA",))))
+    assert over is not None
+    assert over.pct == "75.00"
+    assert over.value == "7500.00"
+    assert over.message
+    # under the band → None (informational only when it matters)
+    assert _single_stock_out(single_stock_from_coverage(_cov("1000", "10000"))) is None
+    assert _single_stock_out(None) is None
 
 
 # --- Bond-floor / risk-capacity (Story 11.2) ---------------------------------

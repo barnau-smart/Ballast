@@ -31,9 +31,12 @@ from allocation.narrate import AllocationNarration, narrate_plan
 from allocation.review import (
     Coverage,
     NarratedFinding,
+    SingleStock,
     build_coverage,
     build_review,
     coverage_message,
+    single_stock_from_coverage,
+    single_stock_message,
 )
 from api.deps import get_scope
 from db.scope import Scope
@@ -175,13 +178,26 @@ class CoverageOut(BaseModel):
     message: str | None = None
 
 
+class SingleStockOut(BaseModel):
+    """The aggregate individual-stock concentration note (Story 11.3) — present ONLY when
+    the individual-stock sleeve exceeds the band (else ``null``). ``pct`` is a fixed-point
+    percent string; ``value`` fixed-point money; ``message`` the calm risk-framed line.
+    Informational — carries NO order."""
+
+    value: str
+    pct: str
+    symbols: list[str]
+    message: str
+
+
 class ReviewResponse(BaseModel):
     """The ``GET /api/allocation/review`` payload — the ranked findings (empty when
-    there is nothing to fix), plus the coverage meta-check (Story 11.1; ``null`` when the
-    portfolio is empty/never-imported)."""
+    there is nothing to fix), plus the coverage meta-check (Story 11.1) and the aggregate
+    single-stock note (Story 11.3); each ``null`` when not applicable."""
 
     findings: list[ReviewFindingOut]
     coverage: CoverageOut | None = None
+    single_stock: SingleStockOut | None = None
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -335,6 +351,20 @@ def _coverage_out(cov: Coverage | None) -> CoverageOut | None:
     )
 
 
+def _single_stock_out(ss: SingleStock | None) -> SingleStockOut | None:
+    """Serialize the aggregate single-stock note (Story 11.3): surface ONLY when the sleeve
+    is over the band (``ss.over``); percent/money as fixed-point strings; ``None`` otherwise."""
+    if ss is None or not ss.over:
+        return None
+    pct = format_money((ss.fraction * Decimal("100")).quantize(Decimal("0.01")))
+    return SingleStockOut(
+        value=format_money(ss.value.quantize(Decimal("0.01"))),
+        pct=pct,
+        symbols=list(ss.symbols),
+        message=single_stock_message(ss),
+    )
+
+
 @router.get("/review", response_model=ReviewResponse)
 async def read_review(
     scope: Scope = Depends(get_scope),
@@ -354,7 +384,9 @@ async def read_review(
     """
     findings = await build_review(scope, session, get_llm_gateway())
     coverage = await build_coverage(scope, session)
+    # Story 11.3 reuses the SAME coverage computation (the unclassified sleeve) — no extra read.
     return ReviewResponse(
         findings=[_review_finding_out(f) for f in findings],
         coverage=_coverage_out(coverage),
+        single_stock=_single_stock_out(single_stock_from_coverage(coverage)),
     )

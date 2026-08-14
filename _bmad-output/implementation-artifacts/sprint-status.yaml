@@ -196,7 +196,7 @@ development_status:
   epic-11: in-progress
   11-1-unclassified-coverage-gate: done  # independent review APPROVE WITH NITS; 1 Medium (non-finite over-report) fixed; backend 900 + frontend 205 green (3e43884)
   11-2-bond-floor-risk-capacity: done  # spec-11-2 approved; built + independent money-path review APPROVE WITH NITS (1 Medium non-finite + 1 Low fixed); backend 912 + frontend 206 green. NOT merged — Epic 11 merge is MasterB's call
-  11-3-single-stock-aggregate-concentration: backlog
+  11-3-single-stock-aggregate-concentration: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order); 1 Low fixed; backend 917 + frontend 208 green
   11-4-blended-expense-summary: backlog
 
 action_items:

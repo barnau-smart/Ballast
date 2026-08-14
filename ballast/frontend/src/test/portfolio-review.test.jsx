@@ -29,14 +29,14 @@ function expectCalm(text) {
 // `{findings: [...]}`. Any other URL is unexpected in these tests (so a stray
 // /approve or /recommend would blow up loudly — proving nothing was submitted).
 
-function stubFetch({ findings, coverage = null, ok = true, status = 200 } = {}) {
+function stubFetch({ findings, coverage = null, single_stock = null, ok = true, status = 200 } = {}) {
   const fn = vi.fn((url) => {
     const u = String(url)
     if (u.includes('/api/allocation/review')) {
       return Promise.resolve({
         ok,
         status,
-        json: () => Promise.resolve({ findings: findings ?? [], coverage }),
+        json: () => Promise.resolve({ findings: findings ?? [], coverage, single_stock }),
       })
     }
     return Promise.reject(new Error(`unexpected url: ${u}`))
@@ -696,6 +696,45 @@ describe('Review — coverage meta-check (Story 11.1)', () => {
     fireEvent.click(screen.getByTestId('coach-review-portfolio'))
     await screen.findByTestId('coach-review-empty')
     expect(screen.queryByTestId('coach-review-coverage')).toBeNull()
+  })
+})
+
+// --- Story 11.3: aggregate single-stock note ---------------------------------
+
+const SINGLE_STOCK = {
+  value: '7,500.00',
+  pct: '75.00',
+  symbols: ['TSLA', 'NVDA'],
+  // Exact copy the backend single_stock_message emits (kept in sync with review.py).
+  message:
+    "About 75.00% of your portfolio is in individual stocks and specialty funds (TSLA, " +
+    "NVDA) — that's a lot riding on a handful of specific companies. Spreading some of it " +
+    "into a broad, diversified fund would lower that single-company risk without changing " +
+    "your overall stock-and-bond balance. This isn't a prediction — it's just how " +
+    "concentrated that slice is right now.",
+}
+
+describe('Review — aggregate single-stock note (Story 11.3)', () => {
+  it('shows the single-stock line when the sleeve is over the band', async () => {
+    stubFetch({ findings: [], single_stock: SINGLE_STOCK })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+
+    const line = await screen.findByTestId('coach-review-single-stock')
+    expect(line.textContent).toMatch(/75\.00%/)
+    expect(line.textContent).toMatch(/TSLA/)
+    expectCalm(line.textContent)
+  })
+
+  it('renders nothing when single_stock is absent (null)', async () => {
+    stubFetch({ findings: [], single_stock: null })
+    renderConsult()
+
+    fireEvent.click(screen.getByTestId('coach-review-portfolio'))
+    await screen.findByTestId('coach-review-empty')
+    expect(screen.queryByTestId('coach-review-single-stock')).toBeNull()
   })
 })
 
