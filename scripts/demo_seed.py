@@ -119,6 +119,11 @@ def main() -> int:
             holdings.get("VTI", {}).get("market_value") in ("10000.00", "10000"),
             f"got {holdings.get('VTI', {}).get('market_value')}",
         )
+        # The $4,000 cash must land in the dedicated portfolio_balance source
+        # (Story 6.5) that the dashboard reads for "Ready to trade" — checked BEFORE
+        # the co-signs below, which are market buys that legitimately debit it.
+        ready = pf.get("cash_states", {}).get("ready_to_trade")
+        check("ready-to-trade cash imported ($4,000)", ready in ("4000.00", "4000"), f"got {ready}")
 
         # --- 4. Set the Balanced target -------------------------------------
         r = c.put("/api/target-allocation", json={"model": "balanced"}, headers=headers)

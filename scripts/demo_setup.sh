@@ -38,26 +38,31 @@ if ! psql_demo -tAc "SELECT 1" >/dev/null 2>&1; then
     || echo "    (createdb error — it may already exist; continuing)"
 fi
 
-# --- 2. Provision the schema (a brief, throwaway backend boot) ---------------
-# The app auto-provisions all tables on startup (create_all + migrations). Boot
-# it briefly against the demo DB with the FAKE broker + fake LLM (no creds, no
-# network), wait for health, then stop it — the tables persist.
+# --- 2. Provision the schema (directly, in-process — no server, no port) ------
+# The app's own idempotent create_all + startup migrations, run against the demo
+# DB. Doing it in Python (not a throwaway uvicorn boot) avoids a subtle footgun:
+# `uv run uvicorn …` spawns a CHILD process, so killing the `uv` wrapper can leave
+# a zombie server squatting the port; a later rebuild's health check then hits the
+# STALE server and wrongly concludes the (empty) DB is provisioned.
 if ! psql_demo -tAc "SELECT to_regclass('public.market_daily')" 2>/dev/null | grep -q market_daily; then
-  echo "  • creating schema (brief app boot)…"
+  echo "  • creating schema…"
   ( cd "$BACKEND" && DATABASE_URL="$DEMO_URL" BROKER_ADAPTER=fake LLM_ADAPTER=fake \
       DECISION_MAINTENANCE_ENABLED=false MARKETDATA_INGEST_ENABLED=false \
-      uv run uvicorn api.main:app --port 8019 >/tmp/ballast_demo_provision.log 2>&1 ) &
-  boot_pid=$!
-  for _ in $(seq 1 45); do
-    curl -sf http://localhost:8019/api/health >/dev/null 2>&1 && break
-    kill -0 "$boot_pid" 2>/dev/null || { echo "✗ provisioning boot exited — see /tmp/ballast_demo_provision.log"; exit 1; }
-    sleep 1
-  done
-  kill "$boot_pid" 2>/dev/null || true
-  wait "$boot_pid" 2>/dev/null || true
+      uv run python -c "
+import asyncio
+from db.session import create_db_and_tables, engine
+from db.migrations import run_startup_migrations
+async def _s():
+    await create_db_and_tables()
+    await run_startup_migrations(engine)
+asyncio.run(_s())
+" ) || { echo "✗ schema provisioning failed"; exit 1; }
 fi
 
 # --- 3. Clone 20y of market history from the real DB (only if empty) ----------
+# Fails LOUDLY: ON_ERROR_STOP + a post-clone count check, so a missing table or a
+# partial copy can never masquerade as success (which would silently kill the
+# Recovery Precedent beat).
 demo_rows="$(psql_demo -tAc "SELECT count(*) FROM market_daily" 2>/dev/null | tr -d '[:space:]')"
 if [ "${demo_rows:-0}" = "0" ]; then
   src_rows="$( ( cd "$ROOT" && docker compose exec -T db psql -U ballast -d "$SOURCE_DB" \
@@ -67,9 +72,15 @@ if [ "${demo_rows:-0}" = "0" ]; then
     echo "      beat will be empty. Backfill it first (python -m marketdata.ingest …)."
   else
     echo "  • cloning market_daily from '$SOURCE_DB' ($src_rows rows)…"
-    ( cd "$ROOT" && docker compose exec -T db sh -c \
-        "pg_dump -U ballast --data-only --table=market_daily $SOURCE_DB | psql -U ballast -d $DEMO_DB -q" ) \
-      >/dev/null 2>&1 || echo "    (clone reported an error; check manually)"
+    if ! ( cd "$ROOT" && docker compose exec -T db sh -c \
+        "pg_dump -U ballast --data-only --table=market_daily $SOURCE_DB | psql -U ballast -d $DEMO_DB -q -v ON_ERROR_STOP=1" ); then
+      echo "✗ market_daily clone failed"; exit 1
+    fi
+    got="$(psql_demo -tAc "SELECT count(*) FROM market_daily" 2>/dev/null | tr -d '[:space:]')"
+    if [ "${got:-0}" -lt "$src_rows" ] 2>/dev/null; then
+      echo "✗ clone incomplete: expected $src_rows rows, got ${got:-0}"; exit 1
+    fi
+    echo "    cloned $got rows ✓"
   fi
 else
   echo "  • market history already present ($demo_rows rows) — skipping clone."
@@ -85,9 +96,20 @@ else
   echo "  • seeding demo account (portfolio + Balanced target + 2 decisions)…"
   ( cd "$BACKEND" && DATABASE_URL="$DEMO_URL" uv run python "$ROOT/scripts/demo_seed.py" ) \
     | grep -E "✓|✗|Dry run|Demo login" || true
-  # Leave the reserve UNDECIDED so the live set-or-decline beat works on stage.
   duid="$(psql_demo -tAc "SELECT id FROM \"user\" WHERE email='demo@example.com'" 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$duid" ] && psql_demo -c "DELETE FROM cash_config WHERE owner_id='$duid';" >/dev/null 2>&1
+  if [ -n "$duid" ]; then
+    # Leave the reserve UNDECIDED so the live set-or-decline beat works on stage,
+    # AND restore the $4,000 cash baseline: the 2 seeded co-signs are MARKET buys
+    # totalling exactly $4,000, and the debit-after-fill logic (Story 10.12)
+    # correctly spends that cash — which would leave the demo showing $0 ready-to-
+    # trade. The seeded decisions are just history for the Decisions tab; reset the
+    # cash so the deploy-my-cash story still has its $4,000 to work with.
+    psql_demo -c "
+      DELETE FROM cash_config WHERE owner_id='$duid';
+      UPDATE portfolio_balance SET cash='4000.00' WHERE owner_id='$duid';
+      UPDATE portfolio_cache   SET cash='4000.00' WHERE owner_id='$duid';
+    " >/dev/null 2>&1
+  fi
 fi
 
 echo "✅ Demo DB '$DEMO_DB' ready.  Login →  demo@example.com  /  ballast-demo-2026"
