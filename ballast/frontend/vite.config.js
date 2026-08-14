@@ -19,6 +19,13 @@ import basicSsl from '@vitejs/plugin-basic-ssl'
 export default defineConfig(({ mode }) => {
   const httpsMode = mode === 'httpslink'
   return {
+    // Give the real-Schwab https mode its OWN dep-cache dir. That mode runs under
+    // sudo (to bind :443), so Vite writes its cache as ROOT; sharing the default
+    // `node_modules/.vite` with the normal (non-sudo) run then makes the next
+    // plain `vite` crash with `EACCES: permission denied, unlink .../.vite/deps/...`
+    // (bit us repeatedly 2026-08-14). Separate cache dirs means the root-owned
+    // cache never collides with the user-owned one — no cross-mode permission clash.
+    cacheDir: httpsMode ? 'node_modules/.vite-httpslink' : 'node_modules/.vite',
     plugins: [react(), ...(httpsMode ? [basicSsl()] : [])],
     // In real-link mode, force the client's API base to the same https origin so
     // apiFetch hits https://127.0.0.1/api/... (proxied to the backend) — never
