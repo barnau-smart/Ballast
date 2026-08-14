@@ -1,3 +1,22 @@
+# Ballast — Demo Run-Books
+
+There are **two** ways to demo Ballast:
+
+- **Safe team demo (fake data, no real money)** — `./scripts/demo.sh`. Runs the
+  full flow on a *fake* portfolio in a *separate* `ballast_demo` database, so no
+  real account or trade is ever involved. It auto-provisions realistic demo data
+  on boot (idempotent): 20 years of market history (cloned from your real DB, so
+  the Recovery Precedent beat works) plus a seeded account —
+  **login `demo@example.com` / `ballast-demo-2026`** — pre-loaded with the demo
+  portfolio (all-US VTI + AAPL/NVDA + $4k cash), a **Balanced** target, and 2
+  co-signed decisions, with the cash reserve left *undecided* so the live
+  set-or-decline beat still works. Add `LLM_ADAPTER=anthropic` for real AI
+  narration. Rebuild the demo DB anytime with `./scripts/demo_setup.sh`.
+- **All-live run-book (real Schwab, real trade)** — the rest of this document.
+  Your real balances are on screen and a real order is placed on stage.
+
+---
+
 # Ballast — Live Demo Run-Book (~18 min, everything real)
 
 The secret to wowing them: **don't do a feature tour — tell a story, land 4

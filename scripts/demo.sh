@@ -30,19 +30,14 @@ echo "▶ Ballast TEAM DEMO"
 echo "    fake broker + fake data, separate DB '$DEMO_DB' — your real 'ballast' DB is UNTOUCHED."
 echo
 
-# --- 1. Postgres up, then ensure the demo database exists (safe to re-run) ----
-echo "▶ Starting Postgres…"
-( cd "$ROOT" && (docker compose up -d --wait db 2>/dev/null || docker compose up -d db) ) \
-  || { echo "✗ failed to start Postgres"; exit 1; }
-
-if ! ( cd "$ROOT" && docker compose exec -T db \
-        psql -U ballast -tAc "SELECT 1 FROM pg_database WHERE datname='$DEMO_DB'" 2>/dev/null ) \
-      | grep -q 1; then
-  echo "▶ Creating demo database '$DEMO_DB'…"
-  ( cd "$ROOT" && docker compose exec -T db createdb -U ballast "$DEMO_DB" ) \
-    || echo "    (createdb error — it may already exist; continuing)"
-fi
-# (The app auto-provisions all tables on first boot: create_all + startup migrations.)
+# --- 1. Provision the demo DB: schema + market history + seeded account -------
+#     Idempotent (safe to re-run): creates the DB if missing, clones 20y of
+#     market history from your real `ballast` DB (powers the Recovery Precedent
+#     beat), and seeds the demo account (portfolio + Balanced target + 2 co-signed
+#     decisions, reserve left undecided). See scripts/demo_setup.sh.
+DEMO_DB="$DEMO_DB" "$ROOT/scripts/demo_setup.sh" \
+  || { echo "✗ demo DB provisioning failed"; exit 1; }
+echo
 
 # --- 2. Point the app at the demo DB + the richer demo portfolio, then run ----
 #     scripts/dev.sh FORCES the fake broker, so no real money is ever possible.
