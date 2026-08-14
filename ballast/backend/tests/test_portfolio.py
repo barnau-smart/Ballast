@@ -987,13 +987,15 @@ async def test_reconcile_overwrites_a_prior_debit_with_broker_truth(two_owner_id
 
 
 def test_fake_demo_portfolio_flag_returns_demo_holdings(monkeypatch):
-    """DEMO_PORTFOLIO=1 → the richer presentation portfolio (all-US + single stocks
-    + a few thousand cash), so a team demo tells the deploy story on FAKE data."""
+    """DEMO_PORTFOLIO=1 → the richer presentation portfolio (all-US index core + an
+    over-concentrated single stock + a high-fee active fund + an under-ceiling stock
+    + a few thousand cash), so a team demo lights up the deploy AND SELL-side review
+    stories on FAKE data."""
     from brokers.fake_adapter import DEMO_CASH
     monkeypatch.setenv("DEMO_PORTFOLIO", "1")
     snap = FakeBrokerAdapter().fetch_portfolio()
     symbols = {h.symbol for h in snap.holdings}
-    assert symbols == {"VTI", "AAPL", "NVDA"}          # all-US + unclassified singles
+    assert symbols == {"VTI", "NVDA", "AGTHX", "AAPL"}  # index core + unclassified sleeve
     assert "VXUS" not in symbols and "BND" not in symbols  # underweight → deploy buys them
     assert snap.cash == DEMO_CASH == Decimal("4000.00")
     assert snap.account_type == "CASH"                  # never a margin warning in demo

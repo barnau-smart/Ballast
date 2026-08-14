@@ -110,14 +110,19 @@ def main() -> int:
         pf = r.json()
         holdings = {h["symbol"]: h for h in pf.get("holdings", [])}
         check(
-            "portfolio imported (VTI + AAPL + NVDA)",
-            {"VTI", "AAPL", "NVDA"} <= set(holdings),
+            "portfolio imported (VTI + NVDA + AGTHX + AAPL)",
+            {"VTI", "NVDA", "AGTHX", "AAPL"} <= set(holdings),
             f"symbols={sorted(holdings)}",
         )
         check(
-            "VTI market value $10,000",
+            "VTI market value $10,000 (the diversified index core)",
             holdings.get("VTI", {}).get("market_value") in ("10000.00", "10000"),
             f"got {holdings.get('VTI', {}).get('market_value')}",
+        )
+        check(
+            "NVDA over-concentrated ($20,000, drives the TRIM review finding)",
+            holdings.get("NVDA", {}).get("market_value") in ("20000.00", "20000"),
+            f"got {holdings.get('NVDA', {}).get('market_value')}",
         )
         # The $4,000 cash must land in the dedicated portfolio_balance source
         # (Story 6.5) that the dashboard reads for "Ready to trade" — checked BEFORE
@@ -196,6 +201,34 @@ def main() -> int:
         decisions = r.json()
         n = len(decisions.get("decisions", decisions)) if isinstance(decisions, dict) else len(decisions)
         check("Decisions tab populated", n >= 2, f"{n} decisions on record")
+
+        # --- 9. Verify "Review my portfolio" has real SELL-side findings ----
+        # The demo portfolio is engineered (over-concentrated NVDA + high-fee
+        # AGTHX) so this beat is never a flat "nothing to fix": the review must
+        # surface a concentration TRIM (NVDA) and a cost SWITCH (AGTHX → VTI).
+        r = c.get("/api/allocation/review", headers=headers)
+        findings = r.json().get("findings", []) if r.status_code == 200 else []
+        kinds = {f.get("kind") for f in findings}
+        symbols_flagged = {f.get("symbol") for f in findings}
+        check(
+            "review finds a concentration TRIM (NVDA)",
+            "concentration" in kinds and "NVDA" in symbols_flagged,
+            f"kinds={sorted(k for k in kinds if k)}, symbols={sorted(s for s in symbols_flagged if s)}",
+        )
+        check(
+            "review finds a cost SWITCH (AGTHX → VTI)",
+            any(
+                f.get("kind") == "cost" and f.get("symbol") == "AGTHX"
+                and f.get("switch_to") == "VTI"
+                for f in findings
+            ),
+            f"findings={[(f.get('kind'), f.get('symbol'), f.get('switch_to')) for f in findings]}",
+        )
+        check(
+            "review leaves the under-ceiling AAPL alone (honest restraint)",
+            "AAPL" not in symbols_flagged,
+            f"flagged={sorted(s for s in symbols_flagged if s)}",
+        )
 
     print(f"\n{'─' * 60}")
     print(f"Dry run: {_ok} passed, {_fail} failed")

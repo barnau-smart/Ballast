@@ -82,6 +82,16 @@ cleanup() {
       kill "$frontend_pid" 2>/dev/null || true
     fi
   fi
+  # If the frontend ran under sudo (real-link https on :443), vite wrote its
+  # node_modules/.vite cache as ROOT. Hand it back to this user so the NEXT
+  # normal-user dev run doesn't crash with EACCES unlinking that cache (bit us
+  # 2026-08-14). Non-interactive (sudo -n) so Ctrl-C never hangs on a password
+  # prompt; if the cached sudo credential has expired, fall back to a clear
+  # one-line remediation (the startup heal below also catches it next run).
+  if [ -n "$REAL_LINK_HTTPS" ] && [ -d "$FRONTEND/node_modules/.vite" ]; then
+    sudo -n chown -R "$(id -un):$(id -gn)" "$FRONTEND/node_modules/.vite" 2>/dev/null \
+      || echo "  note: Vite cache may be left root-owned. If the next dev run fails with EACCES, run: sudo rm -rf '$FRONTEND/node_modules/.vite'"
+  fi
   echo "  (Postgres left running — 'docker compose down' to stop it.)"
 }
 trap cleanup INT TERM EXIT
@@ -117,6 +127,21 @@ if [ ! -d "$FRONTEND/node_modules" ]; then
 fi
 if [ ! -f "$FRONTEND/.env" ] && [ -f "$FRONTEND/.env.example" ]; then
   cp "$FRONTEND/.env.example" "$FRONTEND/.env"
+fi
+# Guard: a prior REAL-BROKER run served vite under sudo, so its node_modules/.vite
+# dep cache got written as ROOT. A later normal-user run then dies with
+# `EACCES: permission denied, unlink .../.vite/deps/_metadata.json` and (in fake
+# mode) silently leaves no frontend. If ANY file in the cache isn't owned by us,
+# remove it so vite regenerates it cleanly under this user. Tries a plain rm
+# first, then a non-interactive sudo rm (uses a cached credential if present),
+# and otherwise prints the exact fix — it never blocks on a password prompt.
+VITE_CACHE="$FRONTEND/node_modules/.vite"
+if [ -d "$VITE_CACHE" ] && [ -n "$(find "$VITE_CACHE" ! -user "$(id -un)" -print -quit 2>/dev/null)" ]; then
+  echo "▶ Healing Vite cache — found files not owned by you (leftover from a prior sudo run)…"
+  rm -rf "$VITE_CACHE" 2>/dev/null \
+    || sudo -n rm -rf "$VITE_CACHE" 2>/dev/null \
+    || { echo "    ⚠️  couldn't remove it automatically. Run this, then restart dev.sh:"; \
+         echo "        sudo rm -rf '$VITE_CACHE'"; }
 fi
 if [ -n "$REAL_LINK_HTTPS" ]; then
   echo "▶ Starting frontend → https://127.0.0.1  (port 443, needs sudo)"
@@ -154,6 +179,21 @@ else
   ( cd "$FRONTEND" && exec npm run dev ) &
   frontend_pid=$!
   FRONTEND_URL="http://localhost:5173"
+  # Probe the http frontend so a crash (e.g. an EACCES on the vite cache, or the
+  # port already in use) is LOUD — not a silent "✅ running" with a page that
+  # never loads (bit us 2026-08-14). Mirrors the https probe above.
+  printf "    waiting for frontend"
+  frontend_ok=""
+  for _ in $(seq 1 30); do
+    if curl -sf http://localhost:5173 >/dev/null 2>&1; then
+      frontend_ok="yes"; printf " ✓\n"; break
+    fi
+    if ! kill -0 "$frontend_pid" 2>/dev/null; then
+      printf " ✗ (frontend exited)\n"; break
+    fi
+    printf "."; sleep 1
+  done
+  [ -n "$frontend_ok" ] || echo "    ⚠️  http://localhost:5173 did not come up — check the vite output above (EACCES on node_modules/.vite? port 5173 already in use?)."
 fi
 
 # --- Up ----------------------------------------------------------------------

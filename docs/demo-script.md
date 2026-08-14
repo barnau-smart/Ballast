@@ -8,10 +8,19 @@ There are **two** ways to demo Ballast:
   on boot (idempotent): 20 years of market history (cloned from your real DB, so
   the Recovery Precedent beat works) plus a seeded account —
   **login `demo@example.com` / `ballast-demo-2026`** — pre-loaded with the demo
-  portfolio (all-US VTI + AAPL/NVDA + $4k cash), a **Balanced** target, and 2
-  co-signed decisions, with the cash reserve left *undecided* so the live
-  set-or-decline beat still works. Add `LLM_ADAPTER=anthropic` for real AI
-  narration. **Played with the data and want it back?** `./scripts/demo_setup.sh
+  portfolio (all-US index core VTI $10k + an over-concentrated NVDA $20k + the
+  high-fee active fund AGTHX $5k + AAPL $2.5k + $4k cash), a **Balanced** target,
+  and 2 co-signed decisions, with the cash reserve left *undecided* so the live
+  set-or-decline beat still works. That portfolio is engineered so **"Review my
+  portfolio" is never a flat "nothing to fix"**: it surfaces a *trim* NVDA (~48%
+  of the account, past the 40% single-position ceiling → de-speculate) and a *cost
+  switch* AGTHX 0.61% → VTI 0.03%, while leaving the under-ceiling AAPL alone
+  (honest restraint). The single stocks + active fund fall in the unclassified
+  sleeve, so they don't disturb the clean "all-US → buy Bonds & International"
+  deploy of the $4k cash. **Add `LLM_ADAPTER=anthropic` for real AI narration** —
+  strongly recommended for the review beat, since the fake LLM returns a canned
+  template instantly (which reads as "no analysis is happening"); the real adapter
+  narrates each finding live, so the coach actually thinks on stage. **Played with the data and want it back?** `./scripts/demo_setup.sh
   reset` restores the clean baseline (portfolio + Balanced target + 2 decisions +
   $4k cash, reserve undecided) in place — the running app keeps working, just
   reload the page. `./scripts/demo_setup.sh fresh` is the full nuke-and-rebuild

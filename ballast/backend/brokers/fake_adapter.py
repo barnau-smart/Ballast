@@ -63,28 +63,46 @@ FAKE_CASH = Decimal("750.25")
 
 # --- Demo portfolio (Story: safe team demo) ---------------------------------
 # A richer, presentation-friendly fake portfolio returned ONLY when
-# ``DEMO_PORTFOLIO`` is set (never in tests / default runs): an all-US position +
-# a couple single stocks (the "not counted toward your target mix" sleeve) + a few
-# thousand cash, so the deploy tells the clean "all-US → buy Bonds & International"
-# story on FAKE data — no real account info. All money is Decimal.
+# ``DEMO_PORTFOLIO`` is set (never in tests / default runs). It is engineered to
+# light up EVERY demo beat on FAKE data — no real account info. All money is
+# Decimal. The classified core is still all-US (only VTI is index-core), so the
+# deploy path tells the same clean "all-US → buy Bonds & International" story with
+# the $4,000 cash; the single stocks + the active fund fall into the unclassified
+# sleeve (excluded from the deploy math), so they DON'T disturb that split but DO
+# drive the SELL-side "Review my portfolio" findings:
+#   • NVDA is deliberately over-concentrated (~48% of the whole portfolio, past the
+#     40% single-position ceiling) → a TRIM SELL finding ("de-speculate").
+#   • AGTHX (American Funds Growth Fund of America, real 0.61% ER) is a high-fee
+#     active US fund → a COST SWITCH finding to the cheaper same-class VTI (0.03%).
+#   • AAPL sits UNDER the ceiling → surfaced but NOT flagged, so the review shows
+#     honest restraint (it doesn't nag about every position).
+# Cost bases sit below market value so the honest "selling may realize a taxable
+# gain" note is truthful. Without these, a plain all-index demo portfolio reviews
+# as "nothing to fix" — accurate, but a flat demo.
 DEMO_HOLDINGS: tuple[Holding, ...] = (
     Holding(
-        symbol="VTI",  # all-US index position (classified: us_equity)
+        symbol="VTI",  # all-US index position (classified: us_equity) — the diversified core
         quantity=Decimal("26"),
         market_value=Decimal("10000.00"),
         cost_basis=Decimal("7800.00"),
     ),
     Holding(
-        symbol="AAPL",  # single stock → unclassified (surfaced, excluded from math)
+        symbol="NVDA",  # over-concentrated single stock → unclassified + TRIM finding
+        quantity=Decimal("100"),
+        market_value=Decimal("20000.00"),
+        cost_basis=Decimal("9500.00"),
+    ),
+    Holding(
+        symbol="AGTHX",  # high-fee active US fund (0.61% ER) → COST SWITCH to VTI (0.03%)
+        quantity=Decimal("100"),
+        market_value=Decimal("5000.00"),
+        cost_basis=Decimal("4200.00"),
+    ),
+    Holding(
+        symbol="AAPL",  # single stock UNDER the ceiling → surfaced, NOT flagged (restraint)
         quantity=Decimal("12"),
         market_value=Decimal("2500.00"),
         cost_basis=Decimal("1800.00"),
-    ),
-    Holding(
-        symbol="NVDA",  # single stock → unclassified
-        quantity=Decimal("8"),
-        market_value=Decimal("1500.00"),
-        cost_basis=Decimal("900.00"),
     ),
 )
 DEMO_CASH = Decimal("4000.00")
