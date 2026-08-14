@@ -1,6 +1,6 @@
 # Story 11.2: Bond-floor / risk-capacity check
 
-Status: ready-for-spec
+Status: ready-for-dev
 
 <!-- Epic 11 (Fiduciary-Grade Portfolio Review), story 2 of 4. MONEY-PATH — proposes a real
      BUY/SELL order the human co-signs. HARD GATE (docs/dev-loop-policy.md): NOT ready-for-dev.
