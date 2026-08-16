@@ -193,12 +193,13 @@ development_status:
   # 10.4's two checks. 11-1 coverage gate (informational, foundation) → 11-2 bond-floor
   # + 11-3 aggregate single-stock (MONEY-PATH: need bmad-spec + independent review) →
   # 11-4 blended expense (informational). Opened 2026-08-14 from a fiduciary consult.
-  epic-11: done
+  epic-11: in-progress  # reopened 2026-08-16 for follow-up 11-5 (co-sign review finding in place); core 11-1..11-4 remain done
   11-1-unclassified-coverage-gate: done  # independent review APPROVE WITH NITS; 1 Medium (non-finite over-report) fixed; backend 900 + frontend 205 green (3e43884)
   11-2-bond-floor-risk-capacity: done  # spec-11-2 approved; built + independent money-path review APPROVE WITH NITS (1 Medium non-finite + 1 Low fixed); backend 912 + frontend 206 green (308c16a)
   11-3-single-stock-aggregate-concentration: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order); 1 Low fixed; backend 917 + frontend 208 green (8eadb2e)
   11-4-blended-expense-summary: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order; math verified); backend 924 + frontend 210 green (51187eb)
-  epic-11-retrospective: done  # epic-11-retro-2026-08-14.md; 4 action items recorded
+  11-5-cosign-review-finding-in-place: ready-for-spec  # MONEY-PATH: fixes review->coach whiplash (co-sign review findings in place via a server-derived review-origin decision). Story written; BLOCKED on bmad-spec + MasterB approval before ready-for-dev (loop must not pick it up)
+  epic-11-retrospective: done  # epic-11-retro-2026-08-14.md; 4 action items recorded (retro covered core 11-1..11-4; 11-5 is a post-retro follow-up)
 
 action_items:
   - epic: 11
