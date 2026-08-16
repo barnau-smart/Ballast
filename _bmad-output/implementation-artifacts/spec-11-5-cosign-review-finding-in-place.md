@@ -2,7 +2,7 @@
 title: 'Story 11.5 — Co-sign a review finding in place (fix the review→coach whiplash)'
 type: 'feature'
 created: '2026-08-16'
-status: 'draft'                 # OPEN QUESTIONS unresolved — NOT approved for dev
+status: 'approved'              # MasterB-approved 2026-08-16 (took the recommendations); ready for dev
 money_path: true
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/11-5-cosign-review-finding-in-place.md'
@@ -18,12 +18,12 @@ context:
 
 **Approach (MasterB decision — Option 1):** co-sign a review finding IN PLACE via a **server-derived review-origin decision**, with NO coach detour. Reuse the existing immutable-proposal writer (`record_proposal`) + the `/approve` spine + the editable Story-8.3 order controls. The finding's own already-gate-validated narration is re-blessed and persisted as the proposal snapshot; the human adjusts (amount / MARKET→LIMIT price / TIF) and co-signs; nothing auto-places.
 
-## ⚠️ OPEN QUESTIONS — MasterB resolves BEFORE dev (do not default)
+## Locked decisions (MasterB-approved 2026-08-16 — took the recommendations)
 
-1. **UI placement:** (a) inline co-sign controls on the review card, vs. (b) "Review & co-sign" focuses/scrolls to the EXISTING shared order controls with the finding pre-filled + its narration shown. (Recommended: b — reuse the proven controls + co-sign step; least new UI.)
-2. **Endpoint shape:** (a) extend `/recommend` with `origin="review"`, vs. (b) a dedicated review-propose mint endpoint (e.g. `POST /api/coach/propose-review`). (Recommended: b — keeps the coach's FR11/narration path untouched; the mint is a distinct, auditable money-path seam.)
-3. **The "ask about this" escape hatch:** (a) keep a context-aware version (deferred Option 2 — pass origin so the coach REINFORCES, not contradicts), vs. (b) simply remove the re-ask invitation for review orders in v1. (Recommended: b for v1; Option 2 is a separate story.)
-4. **Test migration:** the new flow replaces fill→ask for review orders, so the Story 10.4/10.5/11.2 frontend fill→ask tests need rewriting to the co-sign-in-place flow (and the 10.5 linked-buy assertions re-expressed against the review-origin mint). Confirm scope: migrate all in this story vs. split.
+1. **UI placement:** "Review & co-sign" focuses/scrolls to the EXISTING shared order controls with the finding pre-filled + its narration shown — reuse the proven controls + co-sign step; least new UI.
+2. **Endpoint shape:** a DEDICATED review-propose mint endpoint (`POST /api/coach/propose-review`) — keeps the coach's FR11/narration `/recommend` path untouched; the mint is a distinct, auditable money-path seam.
+3. **The "ask about this" escape hatch:** REMOVED for review orders in v1 (no re-ask invitation → no whiplash). The context-aware "ask the coach about this" (Option 2, where the coach reinforces) is a SEPARATE future story, not built here.
+4. **Test migration:** migrate ALL the Story 10.4/10.5/11.2 frontend fill→ask tests to the co-sign-in-place flow IN THIS STORY (re-express the 10.5 linked-buy assertions against the review-origin mint). No fill→ask path remains for review orders.
 
 ## Boundaries & Constraints
 
@@ -35,7 +35,7 @@ context:
 
 **Block If:**
 - Any consumed upstream contract is absent/shaped differently — HALT `blocked`: `allocation.review.build_review` (+ `NarratedFinding` / the finding's `OrderIntent` + `switch_to`); `coach.decision_record.record_proposal`; `coach.validation.validate_recommendation` / `BlessedRecommendation`; `coach.recommendation.Recommendation`; the `/approve` spine + the 10.5 server-side `switch_to` verification pattern; `db.scope.Scope`.
-- The chosen endpoint shape (OQ2) or UI placement (OQ1) is not yet decided — dev does not start on an unresolved money-path contract.
+- (Decisions 1–4 are now locked above; this Block-If is retired.)
 
 **Never:**
 - No co-sign path for a review order that routes through the coach pipeline / FR11 / panic-sell narration (that reintroduces the whiplash). No client-supplied order/amount/side accepted by the mint. No auto-submit, no live-broker call from the mint (it's propose-only). No weakening of FR11 / the panic-sell guard for the NORMAL coach `/recommend` path — this story routes AROUND it for review orders, it does not disable it. No new order types beyond what Story 8.3 already allows at co-sign.
@@ -65,11 +65,11 @@ context:
 
 ## Tasks & Acceptance
 
-**Execution (unchecked — pending OQ resolution + approval):**
-- [ ] Resolve OQ1–OQ4 with MasterB; record decisions here.
-- [ ] Backend mint endpoint (per OQ2) — server-derive + match + re-bless + record_proposal + switch_to; 404 on no match; commit; RecommendResponse shape.
-- [ ] Frontend "Review & co-sign" (per OQ1) — mint → populate editable controls + narration → co-sign; remove/de-emphasize re-ask (per OQ3).
-- [ ] Backend tests (mint / 404 scope-gate / auth / cost-switch) + frontend test migration (OQ4).
+**Execution (decisions locked; ready for dev):**
+- [x] Resolve decisions 1–4 with MasterB (recorded above, 2026-08-16).
+- [ ] Backend `POST /api/coach/propose-review` (decision 2) — server-derive via `build_review` + match kind+symbol + re-bless (`validate_recommendation`) + `replace(order_intent=finding.order_intent)` + `record_proposal(..., switch_to=finding.switch_to)`; 404 on no match; commit; return `RecommendResponse` shape.
+- [ ] Frontend "Review & co-sign" (decision 1) — mint → focus the existing shared controls pre-filled + finding narration → co-sign; REMOVE the re-ask for review orders (decision 3).
+- [ ] Backend tests (mint / 404 scope-gate / auth / cost-switch switch_to) + MIGRATE all 10.4/10.5/11.2 frontend fill→ask tests (decision 4).
 - [ ] Independent adversarial review before merge.
 
 **Acceptance Criteria:**
@@ -92,4 +92,4 @@ context:
 
 ## Auto Run Result
 
-_(pending OQ resolution → MasterB approval → dev → independent review)_
+_(spec approved 2026-08-16; pending dev → independent adversarial review before merge)_

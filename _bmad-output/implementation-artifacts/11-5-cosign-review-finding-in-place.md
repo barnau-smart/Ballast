@@ -1,6 +1,6 @@
 # Story 11.5: Co-sign a review finding in place (fix the review→coach whiplash)
 
-Status: ready-for-spec
+Status: ready-for-dev
 
 <!-- Epic 11 (Fiduciary-Grade Portfolio Review), story 5. MONEY-PATH — mints a co-signable
      SELL decision. HARD GATE (docs/dev-loop-policy.md): NOT ready-for-dev. Needs an approved

@@ -198,7 +198,7 @@ development_status:
   11-2-bond-floor-risk-capacity: done  # spec-11-2 approved; built + independent money-path review APPROVE WITH NITS (1 Medium non-finite + 1 Low fixed); backend 912 + frontend 206 green (308c16a)
   11-3-single-stock-aggregate-concentration: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order); 1 Low fixed; backend 917 + frontend 208 green (8eadb2e)
   11-4-blended-expense-summary: done  # informational-only; independent review APPROVE WITH NITS (cannot place any order; math verified); backend 924 + frontend 210 green (51187eb)
-  11-5-cosign-review-finding-in-place: ready-for-spec  # MONEY-PATH: fixes review->coach whiplash (co-sign review findings in place via a server-derived review-origin decision). Story written; BLOCKED on bmad-spec + MasterB approval before ready-for-dev (loop must not pick it up)
+  11-5-cosign-review-finding-in-place: ready-for-dev  # MONEY-PATH: spec-11-5 APPROVED by MasterB 2026-08-16 (4 decisions locked: reuse controls / dedicated propose-review endpoint / remove re-ask v1 / migrate 10.4-10.5-11.2 fill-ask tests). Independent review still required before merge
   epic-11-retrospective: done  # epic-11-retro-2026-08-14.md; 4 action items recorded (retro covered core 11-1..11-4; 11-5 is a post-retro follow-up)
 
 action_items:
